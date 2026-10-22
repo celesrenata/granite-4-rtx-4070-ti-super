@@ -1,0 +1,3 @@
+[submodule "reference/qwen3-27b-5090"]
+	path = reference/qwen3-27b-5090
+	url = https://github.com/mkyt/qwen3-27b-5090.git

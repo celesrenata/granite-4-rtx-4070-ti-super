@@ -1,0 +1,19 @@
+# Granite 4.2 8B on one RTX 4070 Ti Super (scaffold).
+# The API frontend is pure Python 3 stdlib; pytest is a dev-only tool.
+[project]
+name = "granite-4-rtx"
+version = "0.0.1"
+description = "Single-purpose Granite 4.2 8B inference engine for one RTX 4070 Ti Super (SM 8.9) - scaffold"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

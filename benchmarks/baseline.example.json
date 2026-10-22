@@ -1,0 +1,37 @@
+{
+  "schema": "granite4.baseline-manifest.v1",
+  "description": "Illustrative Phase-0 baseline manifest (example only). It is intentionally NOT a runnable baseline: required_checkpoint_path is a placeholder, one required entry points at a path that may not exist, and every command is disabled. scripts/run_baseline.py must refuse this manifest and write a record stating measurements were not run.",
+  "required_checkpoint_path": "checkpoints/PLACEHOLDER_granite4.2-8b",
+  "required_entries": [
+    "checkpoints/PLACEHOLDER_granite4.2-8b/config.json",
+    "checkpoints/PLACEHOLDER_granite4.2-8b/tokenizer_config.json"
+  ],
+  "record_path": "benchmarks/baseline.example.record.json",
+  "timeout_seconds": 300,
+  "environment_to_record": [
+    "CUDA_VISIBLE_DEVICES"
+  ],
+  "commands": [
+    {
+      "name": "decode-latency-measurement",
+      "enabled": false,
+      "argv": [
+        "python",
+        "scripts/PLACEHOLDER_bench_decode.py",
+        "--checkpoint",
+        "checkpoints/PLACEHOLDER_granite4.2-8b"
+      ],
+      "note": "Disabled placeholder. When re-enabled, argv must point at a real local script and checkpoint; the runner records argv, exit code, duration, and bounded output tail only, and never derives performance claims."
+    },
+    {
+      "name": "checkpoint-structural-inspection",
+      "enabled": false,
+      "argv": [
+        "python",
+        "scripts/inspect_checkpoint.py",
+        "checkpoints/PLACEHOLDER_granite4.2-8b"
+      ],
+      "note": "Disabled placeholder. Structural inspection is safe to run standalone via scripts/inspect_checkpoint.py once a real checkpoint directory exists."
+    }
+  ]
+}
