@@ -94,14 +94,26 @@ Exit criteria: parity gate passes; the API flips to serving; `/health`
 reports `inference: available` only after the gate.
 
 **In progress:** the paged KV memory manager + prefix cache
-(`engine/src/kv_pool.{h,cc}`) is done and host-verified (7/7 ctest on a
-host-only build): a paged pool sized from the [memory.md](memory.md) budget,
-token-major byte layout, page-aligned prefix sharing (ref-counted,
-content-addressable with a token-verified collision guard), and LRU eviction
-of retained (unreferenced, still-cached) pages. The GPU KV write/compaction
-kernel, the prefill/decode loop, and the concurrent-sequence scheduler build
-on top of this and are not yet implemented; no part of P3 runs end-to-end on
-the GPU yet, and the API still reports `unavailable`.
+(`engine/src/kv_pool.{h,cc}`) and the GPU paged KV compaction kernel
+(`engine/src/kernels_phase3.cu`) are done and verified:
+
+- The host manager (7/7 ctest, host-only build) is a paged pool sized from
+  the [memory.md](memory.md) budget, token-major byte layout, page-aligned
+  prefix sharing (ref-counted, content-addressable with a token-verified
+  collision guard), and LRU eviction of retained (unreferenced, still-cached)
+  pages.
+- The device kernel gathers one layer's K/V out of the paged FP8 pool into
+  the contiguous `[Hk, kv_len, d]` BF16 the P2 attention kernels consume
+  (FP8→BF16 dequant folded in). It is checked bit-exactly against the host
+  reference `paged_kv_compact_bf16` — device-verified on gremlin-1
+  (`granite4-kernel-test`), and the paged pool's byte layout is pinned by the
+  host test.
+
+Not yet done (the bulk of P3): loading the real FP8 weights onto the GPU,
+running a full forward pass (all 40 layers) with the paged KV, the
+prefill/decode loop, and the concurrent-sequence scheduler; the golden parity
+gate. No part of P3 runs end-to-end yet, and the API still reports
+`unavailable`.
 
 ## P4 — Performance
 
