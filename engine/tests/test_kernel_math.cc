@@ -218,6 +218,90 @@ static void test_attention() {
   }
 }
 
+static void test_paged_kv_compact() {
+  // One layer's KV from the paged FP8 pool -> contiguous [Hk, kv_len, d] BF16
+  // (the layout gqa_attention_bf16 consumes). Hk=2, d=4, B=2, layers=3.
+  const int Hk = 2, d = 4, B = 2, L = 3, kv_len = 5;  // 5 tokens -> 3 pages
+  const std::size_t per_token = (std::size_t)L * 2 * Hk * d;
+  const std::size_t page_bytes = (std::size_t)B * per_token;
+  const std::size_t num_pages = (kv_len + B - 1) / B;  // 3
+
+  // A permuting block table so "use page id instead of block_table[t]" fails:
+  // token t's page is bt[t/B].
+  const std::vector<std::size_t> bt = {2, 0, 1};
+  Xorshift64 rng(0x0512);
+  std::vector<std::uint8_t> paged(num_pages * page_bytes, 0);
+  for (auto& b : paged) b = static_cast<std::uint8_t>(rng.next());
+
+  // Fill the paged buffer with a contiguous logical KV, permuted by bt, so
+  // that the compaction output is exactly contiguous KV decoded to BF16.
+  std::vector<std::uint16_t> k_ref((std::size_t)Hk * kv_len * d), v_ref((std::size_t)Hk * kv_len * d);
+  for (int token = 0; token < kv_len; ++token) {
+    const std::size_t page = bt[token / B];
+    const std::size_t tl = token % B;
+    for (int w = 0; w < 2; ++w)  // K=0, V=1
+      for (int head = 0; head < Hk; ++head)
+        for (int i = 0; i < d; ++i) {
+          const std::uint8_t byte = paged[page * page_bytes +
+                                            tl * per_token +
+                                            (static_cast<std::size_t>(w) * Hk + head) * d + i];
+          const std::uint16_t bf = fp8_e4m3_to_bf16(byte);
+          const std::size_t idx = (std::size_t)(head * kv_len + token) * d + i;
+          if (w == 0) k_ref[idx] = bf;
+          else v_ref[idx] = bf;
+        }
+  }
+
+  std::vector<std::uint16_t> k_out, v_out;
+  paged_kv_compact_bf16(paged.data(), bt, kv_len, B, L, Hk, d, /*layer=*/0, /*which=*/0, &k_out);
+  paged_kv_compact_bf16(paged.data(), bt, kv_len, B, L, Hk, d, 0, 1, &v_out);
+  expect(k_out.size() == (std::size_t)Hk * kv_len * d, "compact K size");
+  expect(v_out.size() == (std::size_t)Hk * kv_len * d, "compact V size");
+  int bad = 0;
+  for (std::size_t i = 0; i < k_out.size(); ++i)
+    if (k_out[i] != k_ref[i]) ++bad;
+  expect(bad == 0, "paged K compaction matches the paged layout (bit-exact)");
+  bad = 0;
+  for (std::size_t i = 0; i < v_out.size(); ++i)
+    if (v_out[i] != v_ref[i]) ++bad;
+  expect(bad == 0, "paged V compaction matches the paged layout (bit-exact)");
+
+  // A different layer must read its own per-layer slice, not layer 0's.
+  std::vector<std::uint16_t> k2;
+  paged_kv_compact_bf16(paged.data(), bt, kv_len, B, L, Hk, d, /*layer=*/2, 0, &k2);
+  int bad2 = 0;
+  for (int head = 0; head < Hk; ++head)
+    for (int token = 0; token < kv_len; ++token)
+      for (int i = 0; i < d; ++i) {
+        const std::size_t page = bt[token / B];
+        const std::size_t tl = token % B;
+        const std::uint8_t byte = paged[page * page_bytes + tl * per_token +
+                                          (static_cast<std::size_t>(2 * 2 + 0)) * Hk * d +
+                                          (head * d + i)];
+        const std::size_t idx = (std::size_t)(head * kv_len + token) * d + i;
+        if (k2[idx] != fp8_e4m3_to_bf16(byte)) ++bad2;
+      }
+  expect(bad2 == 0, "compact layer 2 reads layer 2's slice");
+
+  // Identity block table: page == token page, so the compaction of a
+  // contiguous buffer equals a plain copy of the per-layer slice.
+  std::vector<std::uint8_t> flat((std::size_t)kv_len * per_token);
+  for (auto& b : flat) b = static_cast<std::uint8_t>(rng.next());
+  const std::vector<std::size_t> ident = {0, 1, 2};
+  std::vector<std::uint16_t> k3;
+  paged_kv_compact_bf16(flat.data(), ident, kv_len, B, L, Hk, d, 0, 0, &k3);
+  int bad3 = 0;
+  for (int head = 0; head < Hk; ++head)
+    for (int token = 0; token < kv_len; ++token)
+      for (int i = 0; i < d; ++i) {
+        const std::size_t idx = (std::size_t)(head * kv_len + token) * d + i;
+        const std::size_t src =
+            (std::size_t)token * per_token + head * d + i;
+        if (k3[idx] != fp8_e4m3_to_bf16(flat[src])) ++bad3;
+      }
+  expect(bad3 == 0, "identity block table == plain per-layer copy");
+}
+
 static void test_silu_gate_up() {
   const int N = 2, K = 2;
   // Wg row 0 = [1, 1], Wu row 0 = [1, -1], x = [1, 2]
@@ -311,6 +395,7 @@ int main() {
   test_softmax();
   test_silu();
   test_attention();
+  test_paged_kv_compact();
   test_silu_gate_up();
   test_sampling();
   test_gemm_dequant();

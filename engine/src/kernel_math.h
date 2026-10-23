@@ -220,6 +220,45 @@ inline void gqa_attention_bf16(const std::uint16_t* q, const std::uint16_t* k,
 }
 
 // ---------------------------------------------------------------------------
+// Paged KV compaction (P3): gather one layer's KV from the paged FP8 pool
+// into the contiguous [Hk, kv_len, d] BF16 layout the P2 attention kernels
+// consume (see kv_pool.h KvLayout). The paged layout is token-major:
+//   page = [token_local][layer][k|v][kv_head][head_dim]  (FP8 e4m3, 1 B/elt)
+//   page_bytes = tokens_per_page * 2 * num_layers * Hk * d
+// and a token's page is block_table[token / tokens_per_page]. FP8->BF16 is
+// exact (every finite e4m3 value is representable in BF16), so the device
+// compaction kernel is checked against this reference ULP-exactly.
+// `which` selects K (0) or V (1) within a token's per-layer KV.
+// ---------------------------------------------------------------------------
+inline void paged_kv_compact_bf16(const std::uint8_t* paged,
+                                  const std::vector<std::size_t>& block_table,
+                                  int kv_len, int tokens_per_page, int num_layers,
+                                  int Hk, int d, int layer, int which,
+                                  std::vector<std::uint16_t>* out) {
+  const std::size_t B = tokens_per_page;
+  const std::size_t per_token = num_layers * 2ull * Hk * d;
+  const std::size_t page_bytes = B * per_token;
+  out->assign(static_cast<std::size_t>(Hk) * kv_len * d, 0);
+  for (int token = 0; token < kv_len; ++token) {
+    const std::size_t page_id = block_table[token / B];
+    const std::size_t token_local = token % B;
+    // Base of this token's per-layer KV within the page.
+    const std::size_t base =
+        page_id * page_bytes +
+        token_local * per_token +
+        (static_cast<std::size_t>(layer) * 2 + static_cast<std::size_t>(which)) *
+            Hk * d;
+    for (int head = 0; head < Hk; ++head) {
+      for (int i = 0; i < d; ++i) {
+        const std::uint16_t bits =
+            fp8_e4m3_to_bf16(paged[base + head * d + i]);
+        (*out)[(static_cast<std::size_t>(head) * kv_len + token) * d + i] = bits;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // FFN gate/up (SwiGLU): y[r] = silu(scale_g * Wg[r] . x) * (scale_u * Wu[r] . x)
 // Wg/Wu are FP8 e4m3 rows (Phase-1 storage), x is BF16, y is BF16.
 // ---------------------------------------------------------------------------

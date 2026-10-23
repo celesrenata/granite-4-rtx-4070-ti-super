@@ -43,6 +43,11 @@ extern "C" int granite4_kernel_sample_top_p(const std::uint16_t* d_p, float nucl
                                             const float* d_u, int rows, int n, int* d_out);
 extern "C" int granite4_rope_tables_build(double theta, int head_dim, int max_pos,
                                           float** d_cos, float** d_sin);
+// P3 paged KV compaction (kernels_phase3.cu).
+extern "C" int granite4_kernel_paged_kv_compact(
+    const std::uint8_t* d_paged, const std::size_t* d_block_table, int kv_len,
+    int tokens_per_page, int num_layers, int Hk, int d, int layer, int which,
+    std::uint16_t* d_out);
 
 namespace {
 
@@ -281,6 +286,53 @@ static void test_attention_device() {
   cudaFree(dout);
 }
 
+static void test_paged_kv_compact_device() {
+  // P3: gather one layer's K/V out of the paged FP8 pool into contiguous
+  // [Hk, kv_len, d] BF16 and check it bit-exactly against the host reference
+  // (FP8->BF16 is exact). Hk=2, d=8, B=2, layers=3, kv_len=6 (3 pages).
+  const int Hk = 2, d = 8, B = 2, L = 3, kv_len = 6;
+  const std::size_t per_token = (std::size_t)L * 2 * Hk * d;
+  const std::size_t page_bytes = (std::size_t)B * per_token;
+  const std::size_t num_pages = (kv_len + B - 1) / B;  // 3
+  // A permuting block table so "use page id instead of block_table[t]" fails.
+  const std::vector<std::size_t> bt = {1, 2, 0};
+  Xorshift64 rng(0x0512);
+  std::vector<std::uint8_t> paged(num_pages * page_bytes, 0);
+  for (auto& b : paged) b = static_cast<std::uint8_t>(rng.next());
+
+  std::uint8_t* d_paged;
+  std::size_t* d_bt;
+  std::uint16_t* d_out;
+  const std::size_t out_elems = (std::size_t)Hk * kv_len * d;
+  if (cudaMalloc(&d_paged, paged.size()) ||
+      cudaMalloc(&d_bt, bt.size() * sizeof(std::size_t)) ||
+      cudaMalloc(&d_out, out_elems * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(d_paged, paged.data(), paged.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_bt, bt.data(), bt.size() * sizeof(std::size_t), cudaMemcpyHostToDevice));
+
+  for (int which = 0; which < 2; ++which) {
+    expect(granite4_kernel_paged_kv_compact(d_paged, d_bt, kv_len, B, L, Hk, d, 0, which,
+                                            d_out) == 0,
+           "paged kv compact launch");
+    std::vector<std::uint16_t> got(out_elems);
+    CUDA_CHECK(cudaMemcpy(got.data(), d_out, out_elems * 2, cudaMemcpyDeviceToHost));
+
+    std::vector<std::uint16_t> ref;
+    paged_kv_compact_bf16(paged.data(), bt, kv_len, B, L, Hk, d, 0, which, &ref);
+    int bad = 0;
+    for (std::size_t i = 0; i < out_elems; ++i)
+      if (got[i] != ref[i]) ++bad;
+    expect(bad == 0, "paged kv compact: device matches host reference (bit-exact)");
+  }
+
+  cudaFree(d_paged);
+  cudaFree(d_bt);
+  cudaFree(d_out);
+}
+
 static void test_silu_gate_up_device() {
   const int N = 64, K = 256;
   Xorshift64 rng(0x9c3b);
@@ -402,6 +454,7 @@ int main() {
   test_softmax_device();
   test_gemm_device();
   test_attention_device();
+  test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();
   cudaDeviceSynchronize();
