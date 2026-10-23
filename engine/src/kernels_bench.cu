@@ -24,14 +24,14 @@
 // Device kernels (timed).
 // ---------------------------------------------------------------------------
 
-// Pure read: each thread streams a contiguous slice, xor-reduces, writes one
-// sentinel so the compiler cannot elide the read.
+// Pure read: each thread streams a contiguous slice, accumulates, and the
+// block writes one sentinel so the compiler cannot elide the read.
 __global__ void read_bench(const float4* buf, size_t n4, float* sink) {
   float acc = 0.0f;
   const size_t stride = (size_t)gridDim.x * blockDim.x;
   for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += stride) {
     const float4 v = buf[i];
-    acc ^= __int_as_float(v.x) + __int_as_float(v.y);
+    acc += v.x + v.y + v.z + v.w;
   }
   // One write per block, so the kernel is overwhelmingly read-bound.
   if (threadIdx.x == 0) sink[blockIdx.x] = acc;

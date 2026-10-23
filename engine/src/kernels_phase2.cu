@@ -155,8 +155,6 @@ __global__ void gemm_dequant_kernel(const std::uint16_t* A, const std::uint8_t* 
   C[idx] = f32_to_bf16(scale * acc);
 }
 
-}  // namespace granite4
-
 // ---------------------------------------------------------------------------
 // GQA attention (decode, batch 1): logits = scale * Q K^T with the K-head
 // for Q-head hq being hq/gh (gh = Hq/Hk); value accumulation over p * V.
@@ -283,6 +281,8 @@ __global__ void sample_top_p_kernel(const std::uint16_t* p, float nucleus,
     out[row] = pick;
   }
 }
+
+}  // namespace granite4
 
 // ---------------------------------------------------------------------------
 // Host launchers (C ABI surface for the P3 scheduler). 0 on success, -1 on
