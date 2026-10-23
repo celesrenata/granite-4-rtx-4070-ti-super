@@ -70,7 +70,13 @@ add_test(NAME kernel_math COMMAND granite4-kernel-math-test)
 
 if(GRANITE_ENABLE_CUDA)
   add_executable(granite4-kernel-test tests/test_kernels.cu)
-  target_link_libraries(granite4-kernel-test PRIVATE granite4_static)
+  # Link the *shared* CUDA runtime so the installed binary carries the CUDA
+  # runpath (the shared libcudart points at the host driver lib directory,
+  # e.g. /run/opengl-driver/lib on NixOS). Without it, nvcc's default
+  # static cudart leaves the binary without a CUDA/driver runpath, so on the
+  # GPU host cudaGetDeviceCount() cannot resolve libcuda.so.1 and the test
+  # fails with "no CUDA device" even though the GPU is present.
+  target_link_libraries(granite4-kernel-test PRIVATE granite4_static CUDA::cudart)
   add_test(NAME kernels_device COMMAND granite4-kernel-test)
 
   # Micro-benchmark / roofline baseline (P2 exit criterion): measures the
