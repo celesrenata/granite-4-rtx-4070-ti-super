@@ -297,6 +297,236 @@ static void test_forward_passthrough() {
   expect(true, "forward passthrough: 3 tokens x vocab match hand reference");
 }
 
+static void test_forward_reference_tiny() {
+  // Independent float64 reference (plain nested loops, separate weight
+  // arrays, no bf16) vs forward_logits_f32 on a tiny 2-token model.
+  //
+  // Regression test for the QKV row mapping: the q/k/v weight matrices are
+  // [Hq*d][H] row-major, so the row for head hq, dim i is (hq*d+i). The
+  // historical bug read row (hq*H+i) instead, which is out of bounds for
+  // hq >= 1 - silent at 1 token (attention is then trivially p=1) but wrong
+  // from the second token on, so the sequence here is 2 tokens.
+  const int H = 8, I = 12, V = 10, d = 2, Hq = 4, Hk = 2, L = 1, KV = Hk * d;
+  const int gh = Hq / Hk;
+  ModelConfig cfg;
+  cfg.hidden_size = H;
+  cfg.head_dim = d;
+  cfg.num_attention_heads = Hq;
+  cfg.num_key_value_heads = Hk;
+  cfg.intermediate_size = I;
+  cfg.vocab_size = V;
+  cfg.num_layers = L;
+  const ForwardSpec spec = kForwardSpec;
+
+  Xorshift64 rng(0x414556);
+  auto rnd = [&](std::size_t n) {
+    std::vector<double> a(n);
+    for (auto& v : a) v = rng.next_float_range(0.5);
+    return a;
+  };
+  const std::vector<double>
+      ref_embed = rnd((std::size_t)V * H),
+      ref_ln_in = rnd(H), ref_ln_post = rnd(H),
+      ref_q = rnd((std::size_t)Hq * d * H),
+      ref_k = rnd((std::size_t)KV * H),
+      ref_v = rnd((std::size_t)KV * H),
+      ref_o = rnd((std::size_t)H * H),
+      ref_gate = rnd((std::size_t)I * H),
+      ref_up = rnd((std::size_t)I * H),
+      ref_down = rnd((std::size_t)H * I),
+      ref_final_ln = rnd(H), ref_lm = rnd((std::size_t)V * H);
+
+  // Pack the engine layout (same per-layer offsets as forward_logits_f32).
+  const std::size_t q_size = (std::size_t)Hq * d * H;
+  const std::size_t kv_size = (std::size_t)KV * H;
+  const std::size_t io_size = (std::size_t)I * H;
+  const std::size_t o_size = (std::size_t)H * H;
+  const std::size_t down_size = (std::size_t)H * I;
+  const std::size_t off_q = 2 * (std::size_t)H;
+  const std::size_t off_k = off_q + q_size;
+  const std::size_t off_v = off_k + kv_size;
+  const std::size_t off_o = off_v + kv_size;
+  const std::size_t off_gate = off_o + o_size;
+  const std::size_t off_up = off_gate + io_size;
+  const std::size_t off_down = off_up + io_size;
+  const std::size_t layer_bytes = off_down + down_size;
+  std::vector<float> embed((std::size_t)V * H),
+      layers((std::size_t)L * layer_bytes), final_norm(H), lm((std::size_t)V * H);
+  for (std::size_t i = 0; i < (std::size_t)V * H; ++i)
+    embed[i] = (float)ref_embed[i];
+  for (int j = 0; j < H; ++j) final_norm[j] = (float)ref_final_ln[j];
+  for (std::size_t i = 0; i < (std::size_t)V * H; ++i) lm[i] = (float)ref_lm[i];
+  float* lb = layers.data();
+  auto put = [&](std::size_t off, const std::vector<double>& src) {
+    for (std::size_t i = 0; i < src.size(); ++i) lb[off + i] = (float)src[i];
+  };
+  put(0, ref_ln_in);
+  put((std::size_t)H, ref_ln_post);
+  put(off_q, ref_q);
+  put(off_k, ref_k);
+  put(off_v, ref_v);
+  put(off_o, ref_o);
+  put(off_gate, ref_gate);
+  put(off_up, ref_up);
+  put(off_down, ref_down);
+
+  const std::vector<std::int32_t> tokens = {3, 7};
+  const int n = 2;
+
+  // ---- independent float64 forward, one token at a time ----
+  auto rms = [](const std::vector<double>& x, const std::vector<double>& w,
+                double eps, int H_) {
+    double s = 0;
+    for (int j = 0; j < H_; ++j) s += x[j] * x[j];
+    const double r = 1.0 / std::sqrt(s / H_ + eps);
+    std::vector<double> y(H_);
+    for (int j = 0; j < H_; ++j) y[j] = x[j] * r * w[j];
+    return y;
+  };
+  auto rope = [&](std::vector<double>& A, int heads, int pos) {
+    const int half = d / 2;
+    for (int h = 0; h < heads; ++h)
+      for (int p = 0; p < half; ++p) {
+        const double f = 1.0 / std::pow(spec.rope_theta, 2.0 * p / d);
+        const double ang = (double)pos * f;
+        const double c = std::cos(ang), s = std::sin(ang);
+        const double a = A[h * d + p], b = A[h * d + half + p];
+        A[h * d + p] = a * c - b * s;
+        A[h * d + half + p] = b * c + a * s;
+      }
+  };
+  // Position p's K/V (RoPE'd K, raw V) at this layer: L=1, so the
+  // pre-attention hidden state is just the embedding. The embedding row is
+  // selected by the TOKEN at that position (tokens[p]), not by p itself.
+  auto kv_at = [&](int p, std::vector<double>* k, std::vector<double>* v) {
+    std::vector<double> h(H);
+    for (int j = 0; j < H; ++j)
+      h[j] = spec.embedding_multiplier *
+             ref_embed[(std::size_t)tokens[p] * H + j];
+    std::vector<double> xn = rms(h, ref_ln_in, spec.rms_norm_eps, H);
+    k->assign((std::size_t)KV * d, 0.0);
+    v->assign((std::size_t)KV * d, 0.0);
+    for (int hkv = 0; hkv < Hk; ++hkv)
+      for (int i = 0; i < d; ++i) {
+        double a = 0, a2 = 0;
+        for (int j = 0; j < H; ++j) {
+          a += ref_k[(std::size_t)(hkv * d + i) * H + j] * xn[j];
+          a2 += ref_v[(std::size_t)(hkv * d + i) * H + j] * xn[j];
+        }
+        (*k)[hkv * d + i] = a;
+        (*v)[hkv * d + i] = a2;
+      }
+    rope(*k, Hk, p);
+  };
+  auto ref_logits_at = [&](int pos) {
+    std::vector<double> h(H);
+    for (int j = 0; j < H; ++j)
+      h[j] = spec.embedding_multiplier *
+             ref_embed[(std::size_t)tokens[pos] * H + j];
+    // Attention block (history: positions 0..pos).
+    std::vector<double> xn = rms(h, ref_ln_in, spec.rms_norm_eps, H);
+    std::vector<double> q((std::size_t)Hq * d, 0.0);
+    for (int hq = 0; hq < Hq; ++hq)
+      for (int i = 0; i < d; ++i) {
+        double acc = 0;
+        for (int j = 0; j < H; ++j)
+          acc += ref_q[(std::size_t)(hq * d + i) * H + j] * xn[j];
+        q[hq * d + i] = acc;
+      }
+    rope(q, Hq, pos);
+    std::vector<double> attn((std::size_t)Hq * d, 0.0);
+    for (int hq = 0; hq < Hq; ++hq) {
+      const int hkv = hq / gh;
+      std::vector<double> pl((std::size_t)(pos + 1));
+      double mx = -1e300;
+      for (int p2 = 0; p2 <= pos; ++p2) {
+        std::vector<double> k2, v2;
+        kv_at(p2, &k2, &v2);
+        double dot = 0;
+        for (int i = 0; i < d; ++i)
+          dot += q[hq * d + i] * k2[hkv * d + i];
+        pl[p2] = spec.attention_multiplier * dot;
+        if (pl[p2] > mx) mx = pl[p2];
+      }
+      double sum = 0;
+      for (int p2 = 0; p2 <= pos; ++p2) {
+        pl[p2] = std::exp(pl[p2] - mx);
+        sum += pl[p2];
+      }
+      for (int i = 0; i < d; ++i) {
+        double acc = 0;
+        for (int p2 = 0; p2 <= pos; ++p2) {
+          std::vector<double> k2, v2;
+          kv_at(p2, &k2, &v2);
+          acc += (pl[p2] / sum) * v2[hkv * d + i];
+        }
+        attn[hq * d + i] = acc;
+      }
+    }
+    for (int r = 0; r < H; ++r) {
+      double acc = 0;
+      for (int j = 0; j < H; ++j) acc += ref_o[(std::size_t)r * H + j] * attn[j];
+      h[r] += spec.residual_multiplier * acc;
+    }
+    // FFN block.
+    std::vector<double> xn2 = rms(h, ref_ln_post, spec.rms_norm_eps, H);
+    std::vector<double> gate(I), up(I);
+    for (int r = 0; r < I; ++r) {
+      double ag = 0, au = 0;
+      for (int j = 0; j < H; ++j) {
+        ag += ref_gate[(std::size_t)r * H + j] * xn2[j];
+        au += ref_up[(std::size_t)r * H + j] * xn2[j];
+      }
+      gate[r] = ag;
+      up[r] = au;
+    }
+    for (int r = 0; r < I; ++r)
+      gate[r] = gate[r] / (1.0 + std::exp(-gate[r])) * up[r];
+    for (int r = 0; r < H; ++r) {
+      double acc = 0;
+      for (int j = 0; j < I; ++j) acc += ref_down[(std::size_t)r * I + j] * gate[j];
+      h[r] += spec.residual_multiplier * acc;
+    }
+    // Final norm + lm_head.
+    std::vector<double> nh = rms(h, ref_final_ln, spec.rms_norm_eps, H);
+    std::vector<double> out(V);
+    for (int i = 0; i < V; ++i) {
+      double acc = 0;
+      for (int j = 0; j < H; ++j) acc += ref_lm[(std::size_t)i * H + j] * nh[j];
+      out[i] = spec.logits_scaling * acc;
+    }
+    return out;
+  };
+
+  std::vector<std::vector<double>> reflog(n);
+  for (int t = 0; t < n; ++t) reflog[t] = ref_logits_at(t);
+
+  // ---- engine (float32 with bf16 attention intermediates) ----
+  std::vector<float> engine_log;
+  forward_logits_f32(tokens, embed, layers, final_norm.data(), lm.data(), cfg,
+                     spec, &engine_log);
+  expect(engine_log.size() == (std::size_t)n * V,
+         "ref tiny: engine logits size");
+  bool close = true;
+  int arg_bad = 0;
+  for (int t = 0; t < n; ++t) {
+    int am = 0, ar = 0;
+    for (int i = 1; i < V; ++i) {
+      if (engine_log[(std::size_t)t * V + i] >
+          engine_log[(std::size_t)t * V + am])
+        am = i;
+      if (reflog[t][i] > reflog[t][ar]) ar = i;
+      if (std::fabs(engine_log[(std::size_t)t * V + i] - reflog[t][i]) > 0.1)
+        close = false;  // bf16 intermediates only; a row bug is O(10s)
+    }
+    if (am != ar) ++arg_bad;
+  }
+  expect(close,
+         "ref tiny: engine logits within bf16 tolerance of float64 reference");
+  expect(arg_bad == 0,
+         "ref tiny: engine argmax matches reference at every position");
+}
+
 static void test_forward_causality() {
   // Two runs that differ only at the LAST token must agree at every earlier
   // position (causal attention) but may differ at the last. Nonzero weights
@@ -521,6 +751,7 @@ int main() {
   test_silu();
   test_attention();
   test_forward_passthrough();
+  test_forward_reference_tiny();
   test_forward_causality();
   test_paged_kv_compact();
   test_silu_gate_up();

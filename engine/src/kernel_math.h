@@ -348,20 +348,21 @@ inline void forward_logits_f32(const std::vector<std::int32_t>& tokens,
 
       // ---- attention block (causal over positions 0..t) ----
       rmsnorm_f32(residual.data(), lb, spec.rms_norm_eps, H, normed.data());
-      // q = Q @ normed: Q is [Hq][d][H] (row hq, d-slice, H cols).
+      // q = Q @ normed: Q is [Hq*d][H] row-major; row for head hq, dim i is
+      // at (hq * d + i).
       for (int hq = 0; hq < Hq; ++hq)
         for (int i = 0; i < d; ++i) {
           float acc = 0.0f;
-          const float* w = lb + off_q + (std::size_t)hq * H + i;
+          const float* w = lb + off_q + (std::size_t)(hq * d + i) * H;
           for (int j = 0; j < H; ++j) acc += w[j] * normed[j];
           qf[(std::size_t)hq * d + i] = acc;
         }
-      // k/v for this position = K/V @ normed: [Hk][d][H].
+      // k/v for this position: K/V are [Hk*d][H]; row (hkv * d + i).
       for (int hkv = 0; hkv < Hk; ++hkv)
         for (int i = 0; i < d; ++i) {
           float a = 0.0f, a2 = 0.0f;
-          const float* wk = lb + off_k + (std::size_t)hkv * H + i;
-          const float* wv = lb + off_v + (std::size_t)hkv * H + i;
+          const float* wk = lb + off_k + (std::size_t)(hkv * d + i) * H;
+          const float* wv = lb + off_v + (std::size_t)(hkv * d + i) * H;
           for (int j = 0; j < H; ++j) {
             a += wk[j] * normed[j];
             a2 += wv[j] * normed[j];
