@@ -23,6 +23,7 @@
 
 #include "checkpoint.h"  // Bf16ToFloat, fp8_e4m3_to_bf16
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -147,6 +148,139 @@ inline void gemm_dequant_f32(const std::uint16_t* A, const std::uint8_t* B,
       (*C_f32)[i * N + j] = scale * acc;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// GQA attention, decode step (batch 1), Llama half-split RoPE applied before
+// the call. q/k/v are BF16:
+//   logits[hq, kv] = scale * dot(q[hq], k[hq/gh, kv]),  gh = Hq / Hk
+//   p = softmax(logits)                  (scale is applied to the logits)
+//   out[hq, i] = sum_kv p[hq, kv] * v[hq/gh, kv, i]
+// The reference mirrors the 3-kernel pipeline exactly: logits are rounded
+// to BF16 before the softmax, and p is rounded to BF16 before the value
+// accumulation (matching what the device kernels store).
+// ---------------------------------------------------------------------------
+
+// logits[hq, kv] = scale * dot(q[hq], k[hq/gh, kv]), rounded to BF16.
+inline void attention_logits_bf16(const std::uint16_t* q, const std::uint16_t* k,
+                                  float scale, int Hq, int Hk, int d, int kv_len,
+                                  std::vector<std::uint16_t>* logits) {
+  const int gh = Hq / Hk;
+  logits->assign(static_cast<std::size_t>(Hq) * kv_len, 0);
+  for (int hq = 0; hq < Hq; ++hq) {
+    const int hkv = hq / gh;
+    for (int kv = 0; kv < kv_len; ++kv) {
+      float acc = 0.0f;
+      for (int i = 0; i < d; ++i)
+        acc += bf16_to_f32_host(k[(hkv * kv_len + kv) * d + i]) *
+               bf16_to_f32_host(q[hq * d + i]);
+      (*logits)[hq * kv_len + kv] = f32_to_bf16_host(scale * acc);
+    }
+  }
+}
+
+// out[hq, i] = sum_kv p[hq, kv] * v[hq/gh, kv, i] (p is BF16, per kernel).
+inline void attention_value_bf16(const std::uint16_t* p, const std::uint16_t* v,
+                                 int Hq, int Hk, int d, int kv_len,
+                                 std::vector<std::uint16_t>* out) {
+  const int gh = Hq / Hk;
+  out->assign(static_cast<std::size_t>(Hq) * d, 0);
+  for (int hq = 0; hq < Hq; ++hq) {
+    const int hkv = hq / gh;
+    for (int i = 0; i < d; ++i) {
+      float acc = 0.0f;
+      for (int kv = 0; kv < kv_len; ++kv)
+        acc += bf16_to_f32_host(p[hq * kv_len + kv]) *
+               bf16_to_f32_host(v[(hkv * kv_len + kv) * d + i]);
+      (*out)[hq * d + i] = f32_to_bf16_host(acc);
+    }
+  }
+}
+
+// Full attention: logits -> (BF16) -> softmax -> (BF16) -> value accumulation.
+inline void gqa_attention_bf16(const std::uint16_t* q, const std::uint16_t* k,
+                               const std::uint16_t* v, float scale, int Hq, int Hk,
+                               int d, int kv_len, std::vector<std::uint16_t>* out) {
+  std::vector<std::uint16_t> logits;
+  attention_logits_bf16(q, k, scale, Hq, Hk, d, kv_len, &logits);
+  std::vector<float> pf(static_cast<std::size_t>(Hq) * kv_len);
+  for (int hq = 0; hq < Hq; ++hq) {
+    std::vector<float> lf(kv_len);
+    for (int kv = 0; kv < kv_len; ++kv)
+      lf[kv] = bf16_to_f32_host(logits[static_cast<std::size_t>(hq) * kv_len + kv]);
+    std::vector<float> sf(kv_len);
+    softmax_f32(lf.data(), 1.0f, kv_len, sf.data());
+    for (int kv = 0; kv < kv_len; ++kv)
+      pf[static_cast<std::size_t>(hq) * kv_len + kv] = bf16_to_f32_host(f32_to_bf16_host(sf[kv]));
+  }
+  std::vector<std::uint16_t> pbf;
+  pbf.reserve(pf.size());
+  for (float f : pf) pbf.push_back(f32_to_bf16_host(f));
+  attention_value_bf16(pbf.data(), v, Hq, Hk, d, kv_len, out);
+}
+
+// ---------------------------------------------------------------------------
+// FFN gate/up (SwiGLU): y[r] = silu(scale_g * Wg[r] . x) * (scale_u * Wu[r] . x)
+// Wg/Wu are FP8 e4m3 rows (Phase-1 storage), x is BF16, y is BF16.
+// ---------------------------------------------------------------------------
+
+inline void silu_gate_up_bf16(const std::uint8_t* Wg, const std::uint8_t* Wu,
+                             const std::uint16_t* x, float scale_g, float scale_u,
+                             int N, int K, std::vector<std::uint16_t>* out) {
+  out->assign(N, 0);
+  for (int r = 0; r < N; ++r) {
+    float g = 0.0f, u = 0.0f;
+    for (int i = 0; i < K; ++i) {
+      const float xv = bf16_to_f32_host(x[i]);
+      g += fp8_to_f32_host(Wg[r * K + i]) * xv;
+      u += fp8_to_f32_host(Wu[r * K + i]) * xv;
+    }
+    (*out)[r] = f32_to_bf16_host(silu_f32(scale_g * g) * (scale_u * u));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sampling (deterministic in (p, u); the RNG only produces u).
+// p is a normalized probability row (sums to 1), n tokens.
+// ---------------------------------------------------------------------------
+
+// Greedy: argmax, ties go to the smallest token id.
+inline int sample_greedy_f32(const float* p, int n) {
+  int best = 0;
+  float bv = p[0];
+  for (int i = 1; i < n; ++i)
+    if (p[i] > bv) {
+      bv = p[i];
+      best = i;
+    }
+  return best;
+}
+
+// Nucleus (top-p): the nucleus is the smallest prefix of tokens sorted by
+// probability descending (ties by ascending token id) whose cumulative mass
+// reaches `nucleus`. Sampling picks the first prefix position whose running
+// sum reaches u * nucleus_mass, so a fixed u is fully deterministic.
+inline int sample_top_p_f32(const float* p, float nucleus, float u, int n) {
+  std::vector<int> idx(n);
+  for (int i = 0; i < n; ++i) idx[i] = i;
+  std::stable_sort(idx.begin(), idx.end(), [p](int a, int b) {
+    if (p[a] != p[b]) return p[a] > p[b];
+    return a < b;
+  });
+  double acc = 0.0;
+  int cut = n;
+  for (int j = 0; j < n; ++j) {
+    acc += p[idx[j]];
+    cut = j + 1;
+    if (acc >= nucleus) break;
+  }
+  const double target = u * acc;
+  double cum = 0.0;
+  for (int j = 0; j < cut; ++j) {
+    cum += p[idx[j]];
+    if (cum >= target) return idx[j];
+  }
+  return idx[cut - 1];
 }
 
 // ---------------------------------------------------------------------------

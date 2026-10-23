@@ -72,6 +72,11 @@ if(GRANITE_ENABLE_CUDA)
   add_executable(granite4-kernel-test tests/test_kernels.cu)
   target_link_libraries(granite4-kernel-test PRIVATE granite4_static)
   add_test(NAME kernels_device COMMAND granite4-kernel-test)
+
+  # Micro-benchmark / roofline baseline (P2 exit criterion): measures the
+  # card's real bandwidth rather than assuming the spec.
+  add_executable(granite4-kernel-bench src/kernels_bench.cu)
+  target_link_libraries(granite4-kernel-bench PRIVATE CUDA::cudart)
 endif()
 
 # Phase 1 checkpoint CLI (host-only: verify + FP8 export). Linked statically

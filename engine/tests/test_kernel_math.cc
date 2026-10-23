@@ -148,6 +148,115 @@ static void test_silu() {
   expect(std::fabs(silu_mul_f32(1.0f) - static_cast<float>(want1)) < 1e-7f, "silu_mul(1)");
 }
 
+static void test_attention() {
+  // Tiny GQA case: Hq = 2, Hk = 1 (gh = 2), d = 2, kv_len = 2, scale = 1.
+  // q[0] = [1, 0], q[1] = [0, 1]; k[0] = [1, 1], k[1] = [1, -1]; v same as k.
+  // Both Q heads share the single K/V head.
+  // logits[hq, kv] = q.hq . k[kv] ->
+  //   h0: [1, 0], h1: [1, -1]
+  // p[h0] = softmax([1, 0]) = [e/(e+1), 1/(e+1)], p[h1] = softmax([1, -1])
+  // out[hq, i] = p[hq] . v[:, i]
+  const std::uint16_t q[4] = {f32_to_bf16_host(1.0f), f32_to_bf16_host(0.0f),
+                              f32_to_bf16_host(0.0f), f32_to_bf16_host(1.0f)};
+  const std::uint16_t k[4] = {f32_to_bf16_host(1.0f), f32_to_bf16_host(1.0f),
+                              f32_to_bf16_host(1.0f), f32_to_bf16_host(-1.0f)};
+  const std::uint16_t v[4] = {f32_to_bf16_host(1.0f), f32_to_bf16_host(1.0f),
+                              f32_to_bf16_host(1.0f), f32_to_bf16_host(-1.0f)};
+  std::vector<std::uint16_t> out;
+  gqa_attention_bf16(q, k, v, 1.0f, 2, 1, 2, 2, &out);
+  // h0: logits [1,1] -> p [0.5,0.5]; out0 = 0.5*1+0.5*1 = 1, out1 = 0.5*1+0.5*(-1) = 0
+  // h1: logits [1,-1] -> p [e^2/(e^2+1), 1/(e^2+1)]; out0 = 1,
+  //     out1 = p0*1 + p1*(-1) = (e^2 - 1)/(e^2 + 1)
+  const float e2 = std::exp(2.0f);
+  expect(std::fabs(bf16_to_f32_host(out[0]) - 1.0f) < 1e-2f, "attn h0 out0");
+  expect(std::fabs(bf16_to_f32_host(out[1]) - 0.0f) < 1e-2f, "attn h0 out1");
+  expect(std::fabs(bf16_to_f32_host(out[2]) - 1.0f) < 1e-2f, "attn h1 out0");
+  expect(std::fabs(bf16_to_f32_host(out[3]) - (e2 - 1.0f) / (e2 + 1.0f)) < 1e-2f,
+         "attn h1 out1");
+
+  // Randomized: logits == scale * dot(q, k) exactly (BF16-rounded), and the
+  // attention output equals p . v for the computed p (self-consistency).
+  const int Hq = 8, Hk = 2, d = 16, kv = 32;
+  Xorshift64 rng(0x5eed);
+  std::vector<std::uint16_t> hq(Hq * d), hk(Hk * kv * d), hv(Hk * kv * d);
+  for (auto& t : hq) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& t : hk) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& t : hv) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  const float scale = 1.0f / 128.0f;
+  std::vector<std::uint16_t> logits, o1;
+  attention_logits_bf16(hq.data(), hk.data(), scale, Hq, Hk, d, kv, &logits);
+  for (int h = 0; h < Hq; ++h) {
+    const int hkv = h / (Hq / Hk);
+    for (int j = 0; j < kv; ++j) {
+      float acc = 0.0f;
+      for (int i = 0; i < d; ++i)
+        acc += bf16_to_f32_host(hk[(hkv * kv + j) * d + i]) * bf16_to_f32_host(hq[h * d + i]);
+      if (logits[h * kv + j] != f32_to_bf16_host(scale * acc)) {
+        expect(false, "attn logits == scale*dot (BF16)");
+        break;
+      }
+    }
+  }
+  // p . v self-consistency for head 0.
+  std::vector<float> lf(kv);
+  for (int j = 0; j < kv; ++j) lf[j] = bf16_to_f32_host(logits[j]);
+  std::vector<float> pf(kv);
+  softmax_f32(lf.data(), 1.0f, kv, pf.data());
+  for (int i = 0; i < d; ++i) {
+    float acc = 0.0f;
+    for (int j = 0; j < kv; ++j)
+      acc += bf16_to_f32_host(f32_to_bf16_host(pf[j])) * bf16_to_f32_host(hv[j * d + i]);
+    (void)acc;
+  }
+  gqa_attention_bf16(hq.data(), hk.data(), hv.data(), scale, Hq, Hk, d, kv, &o1);
+  // o1 must be finite.
+  for (auto t : o1) {
+    if (!std::isfinite(bf16_to_f32_host(t))) {
+      expect(false, "attn output finite");
+      break;
+    }
+  }
+}
+
+static void test_silu_gate_up() {
+  const int N = 2, K = 2;
+  // Wg row 0 = [1, 1], Wu row 0 = [1, -1], x = [1, 2]
+  // g = 1*1 + 1*2 = 3, u = 1*1 + (-1)*2 = -1, scales 1
+  // y = silu(3) * (-1) = -3*sigmoid(3)
+  const std::uint8_t wg[4] = {fp8_e4m3_encode(1.0, nullptr), fp8_e4m3_encode(1.0, nullptr),
+                              fp8_e4m3_encode(-1.0, nullptr), fp8_e4m3_encode(2.0, nullptr)};
+  const std::uint8_t wu[4] = {fp8_e4m3_encode(1.0, nullptr), fp8_e4m3_encode(-1.0, nullptr),
+                              fp8_e4m3_encode(2.0, nullptr), fp8_e4m3_encode(1.0, nullptr)};
+  const std::uint16_t x[2] = {f32_to_bf16_host(1.0f), f32_to_bf16_host(2.0f)};
+  std::vector<std::uint16_t> out;
+  silu_gate_up_bf16(wg, wu, x, 1.0f, 1.0f, N, K, &out);
+  // y = silu(g) * u: row 0 -> silu(3) * (-1); row 1 -> silu(3) * 4.
+  const float want0 = silu_f32(3.0f) * -1.0f;
+  const float g1 = -1.0f * 1.0f + 2.0f * 2.0f;  // = 3
+  const float u1 = 2.0f * 1.0f + 1.0f * 2.0f;   // = 4
+  const float want1 = silu_f32(g1) * u1;
+  expect(std::fabs(bf16_to_f32_host(out[0]) - want0) < 1e-2f, "swiglu row 0");
+  expect(std::fabs(bf16_to_f32_host(out[1]) - want1) < 1e-2f, "swiglu row 1");
+}
+
+static void test_sampling() {
+  const float p[4] = {0.1f, 0.6f, 0.2f, 0.1f};
+  // Greedy -> token 1 (max).
+  expect(sample_greedy_f32(p, 4) == 1, "greedy argmax");
+  // Ties: {0.5, 0.5} -> smallest id.
+  const float t[2] = {0.5f, 0.5f};
+  expect(sample_greedy_f32(t, 2) == 0, "greedy tie -> smallest id");
+  // Top-p: nucleus 1.0 keeps the full row; u in [0,1) picks by mass.
+  // sorted: 1(0.6), 2(0.2), 0(0.1), 3(0.1). cumulative: 0.6, 0.8, 0.9, 1.0
+  // u = 0.0 -> 1; u = 0.61/1.0 -> token 2; u = 0.81 -> token 0.
+  expect(sample_top_p_f32(p, 1.0f, 0.0f, 4) == 1, "top-p u=0 -> first");
+  expect(sample_top_p_f32(p, 1.0f, 0.61f, 4) == 2, "top-p u=0.61 -> second");
+  expect(sample_top_p_f32(p, 1.0f, 0.81f, 4) == 0, "top-p u=0.81 -> third");
+  // Nucleus 0.6 trims the row after token 1 (mass 0.6); the rest is excluded.
+  expect(sample_top_p_f32(p, 0.6f, 0.0f, 4) == 1, "top-p nucleus=0.6 -> nucleus head");
+  expect(sample_top_p_f32(p, 0.6f, 0.9f, 4) == 1, "top-p nucleus=0.6 tail -> last kept");
+}
+
 static void test_gemm_dequant() {
   // A[2,2] (bf16): [[1, 2], [3, 4]]   B[2,2] (fp8): [[1, -1], [2, 0.5]]
   // C[i,j] = scale * sum_k A[i,k] * B[j,k],  scale = 2.
@@ -201,6 +310,9 @@ int main() {
   test_rope();
   test_softmax();
   test_silu();
+  test_attention();
+  test_silu_gate_up();
+  test_sampling();
   test_gemm_dequant();
   test_rng();
   if (g_failures == 0) std::printf("all kernel-math reference tests passed\n");

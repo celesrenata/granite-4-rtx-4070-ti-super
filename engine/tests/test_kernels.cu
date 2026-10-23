@@ -30,6 +30,17 @@ extern "C" int granite4_kernel_softmax(const std::uint16_t* d_x, float scale, in
                                        int seq_len, std::uint16_t* d_out);
 extern "C" int granite4_kernel_gemm_dequant(const std::uint16_t* d_a, const std::uint8_t* d_b,
                                             float scale, int M, int N, int K, std::uint16_t* d_c);
+extern "C" int granite4_kernel_gqa_logits(const std::uint16_t* d_q, const std::uint16_t* d_k,
+                                          float scale, int Hq, int Hk, int d, int kv_len,
+                                          std::uint16_t* d_logits);
+extern "C" int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v,
+                                         int Hq, int Hk, int d, int kv_len, std::uint16_t* d_out);
+extern "C" int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
+                                           const std::uint16_t* d_x, float scale_g, float scale_u,
+                                           int N, int K, std::uint16_t* d_out);
+extern "C" int granite4_kernel_sample_greedy(const std::uint16_t* d_p, int rows, int n, int* d_out);
+extern "C" int granite4_kernel_sample_top_p(const std::uint16_t* d_p, float nucleus,
+                                            const float* d_u, int rows, int n, int* d_out);
 extern "C" int granite4_rope_tables_build(double theta, int head_dim, int max_pos,
                                           float** d_cos, float** d_sin);
 
@@ -227,6 +238,132 @@ static void test_gemm_device() {
   cudaFree(dC);
 }
 
+static void test_attention_device() {
+  // GQA decode: 8 Q heads, 2 KV heads (gh = 4), head_dim 16, kv_len 32.
+  const int Hq = 8, Hk = 2, d = 16, kv = 32;
+  Xorshift64 rng(0x4a7c);
+  std::vector<std::uint16_t> hq(Hq * d), hk(Hk * kv * d), hv(Hk * kv * d);
+  for (auto& t : hq) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& t : hk) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& t : hv) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  const float scale = 1.0f / 128.0f;
+
+  std::uint16_t *dq, *dk, *dv, *dlog, *dp, *dout;
+  if (cudaMalloc(&dq, hq.size() * 2) || cudaMalloc(&dk, hk.size() * 2) ||
+      cudaMalloc(&dv, hv.size() * 2) || cudaMalloc(&dlog, Hq * kv * 2) ||
+      cudaMalloc(&dp, Hq * kv * 2) || cudaMalloc(&dout, Hq * d * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, hq.data(), hq.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, hk.data(), hk.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, hv.data(), hv.size() * 2, cudaMemcpyHostToDevice));
+
+  expect(granite4_kernel_gqa_logits(dq, dk, scale, Hq, Hk, d, kv, dlog) == 0, "attn logits launch");
+  // softmax over the logits (rows = Hq, seq = kv), scale already in the logits.
+  expect(granite4_kernel_softmax(dlog, 1.0f, Hq, kv, dp) == 0, "attn softmax launch");
+  expect(granite4_kernel_gqa_value(dp, dv, Hq, Hk, d, kv, dout) == 0, "attn value launch");
+
+  std::vector<std::uint16_t> hout(Hq * d);
+  CUDA_CHECK(cudaMemcpy(hout.data(), dout, hout.size() * 2, cudaMemcpyDeviceToHost));
+
+  std::vector<std::uint16_t> ref;
+  gqa_attention_bf16(hq.data(), hk.data(), hv.data(), scale, Hq, Hk, d, kv, &ref);
+  int bad = 0;
+  for (std::size_t i = 0; i < ref.size(); ++i)
+    if (!bf16_close(hout[i], ref[i], 4)) ++bad;
+  expect(bad == 0, "attention: device pipeline matches host reference (4 ULP)");
+  cudaFree(dq);
+  cudaFree(dk);
+  cudaFree(dv);
+  cudaFree(dlog);
+  cudaFree(dp);
+  cudaFree(dout);
+}
+
+static void test_silu_gate_up_device() {
+  const int N = 64, K = 256;
+  Xorshift64 rng(0x9c3b);
+  std::vector<std::uint8_t> hg(N * K), hu(N * K);
+  std::vector<std::uint16_t> hx(K), hout(N);
+  for (auto& t : hg) t = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  for (auto& t : hu) t = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  for (auto& t : hx) t = f32_to_bf16_host(rng.next_float_range(2.0));
+
+  std::uint8_t *dg, *du;
+  std::uint16_t *dx, *dout;
+  if (cudaMalloc(&dg, hg.size()) || cudaMalloc(&du, hu.size()) ||
+      cudaMalloc(&dx, hx.size() * 2) || cudaMalloc(&dout, hout.size() * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dg, hg.data(), hg.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(du, hu.data(), hu.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dx, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
+  expect(granite4_kernel_silu_gate_up(dg, du, dx, 1.0f, 1.0f, N, K, dout) == 0, "swiglu launch");
+  CUDA_CHECK(cudaMemcpy(hout.data(), dout, hout.size() * 2, cudaMemcpyDeviceToHost));
+
+  std::vector<std::uint16_t> ref;
+  silu_gate_up_bf16(hg.data(), hu.data(), hx.data(), 1.0f, 1.0f, N, K, &ref);
+  int bad = 0;
+  for (int i = 0; i < N; ++i)
+    // 1 ULP: the device computes x*(1/sigmoid denom) while the reference
+    // divides; the two differ by at most one rounding step.
+    if (!bf16_close(hout[i], ref[i], 1)) ++bad;
+  expect(bad == 0, "swiglu: device matches host reference (1 ULP)");
+  cudaFree(dg);
+  cudaFree(du);
+  cudaFree(dx);
+  cudaFree(dout);
+}
+
+static void test_sampling_device() {
+  const int rows = 32, n = 512;
+  Xorshift64 rng(0xa11ce);
+  // Softmax-ish probability rows (BF16, sums ~ 1): build, normalize, round.
+  std::vector<std::uint16_t> hp(rows * n);
+  std::vector<float> u(rows);
+  for (int r = 0; r < rows; ++r) {
+    std::vector<float> w(n);
+    double s = 0.0;
+    for (int i = 0; i < n; ++i) {
+      w[i] = std::exp(rng.next_float_range(2.0));
+      s += w[i];
+    }
+    for (int i = 0; i < n; ++i) hp[r * n + i] = f32_to_bf16_host(static_cast<float>(w[i] / s));
+    u[r] = rng.next_float();
+  }
+  std::uint16_t* dp;
+  int* dg;
+  int* dtp;
+  float* du;
+  if (cudaMalloc(&dp, hp.size() * 2) || cudaMalloc(&dg, rows * 4) ||
+      cudaMalloc(&dtp, rows * 4) || cudaMalloc(&du, rows * 4)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dp, hp.data(), hp.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(du, u.data(), u.size() * 4, cudaMemcpyHostToDevice));
+  expect(granite4_kernel_sample_greedy(dp, rows, n, dg) == 0, "greedy launch");
+  expect(granite4_kernel_sample_top_p(dp, 0.9f, du, rows, n, dtp) == 0, "top-p launch");
+  std::vector<int> gre(rows), tpo(rows);
+  CUDA_CHECK(cudaMemcpy(gre.data(), dg, rows * 4, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(tpo.data(), dtp, rows * 4, cudaMemcpyDeviceToHost));
+
+  int bad = 0;
+  for (int r = 0; r < rows; ++r) {
+    std::vector<float> pr(n);
+    for (int i = 0; i < n; ++i) pr[i] = bf16_to_f32_host(hp[r * n + i]);
+    if (gre[r] != sample_greedy_f32(pr.data(), n)) ++bad;
+    if (tpo[r] != sample_top_p_f32(pr.data(), 0.9f, u[r], n)) ++bad;
+  }
+  expect(bad == 0, "sampling: device greedy + top-p match host reference");
+  cudaFree(dp);
+  cudaFree(dg);
+  cudaFree(dtp);
+  cudaFree(du);
+}
+
 int main() {
   int n = 0;
   if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -238,6 +375,9 @@ int main() {
   test_rope_device();
   test_softmax_device();
   test_gemm_device();
+  test_attention_device();
+  test_silu_gate_up_device();
+  test_sampling_device();
   cudaDeviceSynchronize();
   if (g_failures == 0) std::printf("all device kernel tests passed\n");
   return g_failures == 0 ? 0 : 1;
