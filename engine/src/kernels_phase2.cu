@@ -107,9 +107,10 @@ __global__ void rope_kernel(const std::uint16_t* x, const float* cos_table,
     const float b = bf16_to_f32(x[base + col + half]);
     y = a * c - b * s;
   } else {
+    // Back half: out[col] = x[col]*c + x[col-half]*s (Llama convention).
     const float a = bf16_to_f32(x[base + col]);
     const float b = bf16_to_f32(x[base + col - half]);
-    y = b * c + a * s;
+    y = a * c + b * s;
   }
   out[idx] = f32_to_bf16(y);
 }
