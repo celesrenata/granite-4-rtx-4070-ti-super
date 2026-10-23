@@ -260,6 +260,8 @@ inline int sample_greedy_f32(const float* p, int n) {
 // probability descending (ties by ascending token id) whose cumulative mass
 // reaches `nucleus`. Sampling picks the first prefix position whose running
 // sum reaches u * nucleus_mass, so a fixed u is fully deterministic.
+// Double arithmetic: at 100352-vocab rows a float cumulative sum drifts
+// enough to flip the picked prefix position.
 inline int sample_top_p_f32(const float* p, float nucleus, float u, int n) {
   std::vector<int> idx(n);
   for (int i = 0; i < n; ++i) idx[i] = i;
@@ -270,14 +272,14 @@ inline int sample_top_p_f32(const float* p, float nucleus, float u, int n) {
   double acc = 0.0;
   int cut = n;
   for (int j = 0; j < n; ++j) {
-    acc += p[idx[j]];
+    acc += static_cast<double>(p[idx[j]]);
     cut = j + 1;
-    if (acc >= nucleus) break;
+    if (acc >= static_cast<double>(nucleus)) break;
   }
-  const double target = u * acc;
+  const double target = static_cast<double>(u) * acc;
   double cum = 0.0;
   for (int j = 0; j < cut; ++j) {
-    cum += p[idx[j]];
+    cum += static_cast<double>(p[idx[j]]);
     if (cum >= target) return idx[j];
   }
   return idx[cut - 1];

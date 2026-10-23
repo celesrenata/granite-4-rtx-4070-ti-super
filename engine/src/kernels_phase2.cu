@@ -212,7 +212,7 @@ __global__ void silu_gate_up_kernel(const std::uint8_t* Wg, const std::uint8_t* 
 }
 
 // ---------------------------------------------------------------------------
-// Sampling. Greedy: one thread per row (any vocab size). Top-p: one thread
+// Sampling. Greedy: one thread per row (any vocab size). Top-p: one block
 // per row with a shared-memory stable sort; vocab <= 4096 (the production
 // 100352 path uses the same per-row loop with a chunked argsort - a P3
 // concern; the math is identical).
@@ -237,18 +237,19 @@ __global__ void sample_greedy_kernel(const std::uint16_t* p, int rows, int n,
 constexpr int kTopPVocabMax = 4096;
 
 __global__ void sample_top_p_kernel(const std::uint16_t* p, float nucleus,
-                                    const float* u_in, int rows, int n, int* out) {
-  const int row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= rows || n > kTopPVocabMax) return;
+                                    const float* u_in, int n, int* out) {
+  // One block per row: the shared arrays hold the row being sorted.
+  const int row = blockIdx.x;
+  if (n > kTopPVocabMax) return;
   __shared__ float sp[kTopPVocabMax];
   __shared__ int st[kTopPVocabMax];
-  if (threadIdx.x < n) {
-    sp[threadIdx.x] = bf16_to_f32(p[row * n + threadIdx.x]);
-    st[threadIdx.x] = threadIdx.x;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    sp[i] = bf16_to_f32(p[row * n + i]);
+    st[i] = i;
   }
   __syncthreads();
-  // One thread per row: stable insertion sort (probability descending, token
-  // id ascending on ties), then nucleus truncation and prefix-sum pick.
+  // One thread: stable insertion sort (probability descending, token id
+  // ascending on ties), then nucleus truncation and prefix-sum pick.
   // Single-threaded because the sort is in-place over the shared arrays;
   // O(n^2) is fine at the tested sizes (a faster argsort is a P3 concern).
   if (threadIdx.x == 0) {
@@ -384,8 +385,8 @@ int granite4_kernel_sample_greedy(const std::uint16_t* d_p, int rows, int n, int
 int granite4_kernel_sample_top_p(const std::uint16_t* d_p, float nucleus,
                                  const float* d_u, int rows, int n, int* d_out) {
   if (n > granite4::kTopPVocabMax) return -1;
-  granite4::sample_top_p_kernel<<<(rows + 255) / 256, 256>>>(
-      d_p, nucleus, d_u, rows, n, d_out);
+  // One block per row: the shared-memory arrays hold the row being sorted.
+  granite4::sample_top_p_kernel<<<rows, 256>>>(d_p, nucleus, d_u, n, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
