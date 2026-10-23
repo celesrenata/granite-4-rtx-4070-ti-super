@@ -105,24 +105,52 @@ reports `inference: available` only after the gate.
 - The device kernel gathers one layer's K/V out of the paged FP8 pool into
   the contiguous `[Hk, kv_len, d]` BF16 the P2 attention kernels consume
   (FP8→BF16 dequant folded in). It is checked bit-exactly against the host
-  reference `paged_kv_compact_bf16` — device-verified on gremlin-1
+  reference `paged_kv_compact_bf16` - device-verified on gremlin-1
   (`granite4-kernel-test`), and the paged pool's byte layout is pinned by the
   host test.
 - The deterministic **forward pass** `forward_logits_f32` (all 40 layers,
   float) is implemented and host-verified as the parity oracle. It composes
   only the device-verified primitives (RMSNorm, Llama-half-split RoPE,
   `gqa_attention_bf16`, SwiGLU), takes the dequantized FP8 weights, and runs
-  causal attention over the whole history at each position. Two tests pin
+  causal attention over the whole history at each position. Three tests pin
   it: a zero-projection passthrough (output must equal
   `lm_head @ rmsnorm(embedding)` computed by hand, proving the full 40-layer
-  loop + residual + final norm + head are wired correctly) and a causality
-  test (a later token must not change any earlier position's logits).
+  loop + residual + final norm + head are wired correctly), a causality test
+  (a later token must not change any earlier position's logits), and an
+  independent float64 reference on a tiny model (catches weight-row mapping
+  bugs that trivial 1-token cases hide).
+- The **weight loader** (`engine/src/weights.{h,cc}`) reads the original BF16
+  checkpoint and the P1 FP8 export (per-tensor and per-channel `__scale`
+  dequant), and `granite4-infer forward|generate` exposes the host oracle.
+  `granite4-weights-test` pins BF16 decode and both FP8 dequant paths against
+  hand-computed values.
 
-Not yet done (the bulk of P3): loading the real FP8 weights onto the GPU,
-running the forward pass on the GPU with the paged KV, the prefill/decode
-loop, and the concurrent-sequence scheduler; the golden parity gate (needs a
-transformers reference on a box with a real checkpoint). No part of P3 runs
-end-to-end yet, and the API still reports `unavailable`.
+**Parity gate (token-for-token, P3 exit criterion):**
+`scripts/parity_gate.py` compares `granite4-infer generate` (greedy) against
+a float32 transformers reference on a fixed prompt, token-for-token. On the
+real checkpoint the engine matches the float32 oracle
+**24/24 tokens** for "The capital of France is" (greedy next-token
+decisions identical at every step), so `--min-match 1.0` passes. The gate
+writes `.gt/parity_gate.json` on PASS; the API loads that artifact and only
+then reports `inference: available` (docs: `frontend/api.py`,
+`frontend/engine_service.py`).
+
+**Storage path, end to end:** the P1 FP8 export (`granite4-checkpoint
+export`) produces the 8.2GB `granite4.fp8.v1` file, and `granite4-infer`
+loads it (per-tensor `__scale` dequant) and runs the forward from it -
+argmax on a real prompt matches the BF16-checkpoint run, so the FP8
+storage format is a first-class serving input, not just a P1 artifact.
+The tiny-model regression test (`test_forward_reference_tiny`) now also
+pins the QKV row mapping against an independent float64 reference - it
+caught a reference bug on first run (the reference indexed embeddings by
+position instead of token id) and verifies the fix.
+
+Not yet done (the GPU inference half of P3): loading the FP8 weights onto
+the GPU, running the forward pass on the GPU with the paged KV pool, the
+prefill/decode loop, and the concurrent-sequence scheduler. The host oracle
+and the parity gate stand in for it; on a real sm_89 machine the gate must
+pass there too before P3 exits (the API flips to serving off the gate
+artifact either way). P4 (benchmarking) then tunes the GPU path.
 
 ## P4 — Performance
 

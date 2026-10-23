@@ -17,7 +17,9 @@ set(GRANITE_ENGINE_SOURCES
   src/checkpoint_sha256.cc
   src/checkpoint_main.cc
   src/kv_pool.h
-  src/kv_pool.cc)
+  src/kv_pool.cc
+  src/weights.h
+  src/weights.cc)
 
 if(GRANITE_ENABLE_CUDA)
   enable_language(CUDA)
@@ -99,3 +101,13 @@ endif()
 # so the installed binary does not depend on the in-tree build directory.
 add_executable(granite4-checkpoint src/checkpoint_cli.cc)
 target_link_libraries(granite4-checkpoint PRIVATE granite4_static)
+
+# Phase 3 inference CLI (host-only forward pass + generate). Linked
+# statically; loads original BF16 or FP8-export checkpoints.
+add_executable(granite4-infer src/infer_main.cc)
+target_link_libraries(granite4-infer PRIVATE granite4_static)
+
+# Phase 3 weight loading (BF16 + FP8 dequant) - host-only.
+add_executable(granite4-weights-test tests/test_weights.cc)
+target_link_libraries(granite4-weights-test PRIVATE granite4_static)
+add_test(NAME weights COMMAND granite4-weights-test)
