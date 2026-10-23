@@ -7,3 +7,6 @@ __pycache__/
 *.so
 *.dylib
 dist/
+
+# Local Granite checkpoint download (17 GB) + its venv. Never stage this.
+.gt/

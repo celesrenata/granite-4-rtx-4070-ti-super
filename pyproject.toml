@@ -5,7 +5,9 @@ name = "granite-4-rtx"
 version = "0.0.1"
 description = "Single-purpose Granite 4.2 8B inference engine for one RTX 4070 Ti Super (SM 8.9) - scaffold"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "regex>=2024.0.0",
+]
 
 [dependency-groups]
 dev = [
