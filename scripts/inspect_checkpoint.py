@@ -45,6 +45,12 @@ REQUIRED_FIELDS: dict[str, int] = {
     "vocab_size": 100352,
 }
 
+# Fields not present in the checkpoint's config.json: derived from other
+# planning fields, matching the C++ parser (checkpoint_main.cc).
+DERIVED_FIELDS: dict[str, tuple[str, str]] = {
+    "head_dim": ("hidden_size", "num_attention_heads"),
+}
+
 # Key names whose *presence* is reported in tokenizer_config.json.
 # Values are never reported.
 TOKENIZER_SELECTED_KEYS = (
@@ -112,6 +118,8 @@ def _safe_scalar(value: object) -> str:
 def _check_field(config: dict[str, Any], name: str) -> tuple[dict[str, Any], str | None]:
     """Compare one planning field against the required spec value."""
     expected = REQUIRED_FIELDS[name]
+    if name in DERIVED_FIELDS and name not in config:
+        return _check_derived_field(config, name)
     if name not in config:
         return (
             {"expected": expected, "actual": None, "ok": False},
@@ -129,6 +137,50 @@ def _check_field(config: dict[str, Any], name: str) -> tuple[dict[str, Any], str
             f"{name}: expected {expected}, got {got}",
         )
     return {"expected": expected, "actual": got, "ok": True}, None
+
+
+def _check_derived_field(
+    config: dict[str, Any], name: str
+) -> tuple[dict[str, Any], str | None]:
+    """Check a field derived from other planning fields (absent in config).
+
+    head_dim = hidden_size / num_attention_heads when the config omits it.
+    """
+    expected = REQUIRED_FIELDS[name]
+    num_name, den_name = DERIVED_FIELDS[name]
+    if num_name not in config or den_name not in config:
+        return (
+            {"expected": expected, "actual": None, "derived_from": [num_name, den_name], "ok": False},
+            f"{name}: cannot derive ({num_name} and/or {den_name} missing)",
+        )
+    num = config[num_name]
+    den = config[den_name]
+    if (
+        isinstance(num, bool)
+        or not isinstance(num, int)
+        or isinstance(den, bool)
+        or not isinstance(den, int)
+        or den == 0
+    ):
+        return (
+            {"expected": expected, "actual": None, "derived_from": [num_name, den_name], "ok": False},
+            f"{name}: cannot derive ({num_name}={_safe_scalar(num)}, {den_name}={_safe_scalar(den)})",
+        )
+    if num % den != 0:
+        return (
+            {"expected": expected, "actual": None, "derived_from": [num_name, den_name], "ok": False},
+            f"{name}: {num_name} not divisible by {den_name}",
+        )
+    got = num // den
+    if got != expected:
+        return (
+            {"expected": expected, "actual": got, "derived_from": [num_name, den_name], "ok": False},
+            f"{name}: expected {expected}, got {got} (derived from {num_name}/{den_name})",
+        )
+    return (
+        {"expected": expected, "actual": got, "derived_from": [num_name, den_name], "ok": True},
+        None,
+    )
 
 
 def inspect_checkpoint(checkpoint_dir: Path) -> tuple[int, dict[str, Any]]:

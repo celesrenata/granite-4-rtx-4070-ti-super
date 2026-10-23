@@ -11,7 +11,11 @@ set(GRANITE_ENGINE_SOURCES
   src/config_validation.cc
   src/safetensors.h
   src/safetensors.cc
-  src/capi.cc)
+  src/capi.cc
+  src/checkpoint.h
+  src/fp8_convert.cc
+  src/checkpoint_sha256.cc
+  src/checkpoint_main.cc)
 
 if(GRANITE_ENABLE_CUDA)
   enable_language(CUDA)
@@ -44,3 +48,15 @@ add_test(NAME safetensors_metadata COMMAND granite4-safetensors-test)
 add_executable(granite4-json-test tests/test_json.cc)
 target_link_libraries(granite4-json-test PRIVATE granite4)
 add_test(NAME json_parser COMMAND granite4-json-test)
+
+add_executable(granite4-fp8-test tests/test_fp8_convert.cc)
+target_link_libraries(granite4-fp8-test PRIVATE granite4)
+add_test(NAME fp8_e4m3 COMMAND granite4-fp8-test)
+
+add_executable(granite4-checkpoint-test tests/test_checkpoint.cc)
+target_link_libraries(granite4-checkpoint-test PRIVATE granite4)
+add_test(NAME checkpoint_verify COMMAND granite4-checkpoint-test)
+
+# Phase 1 checkpoint CLI (host-only: verify + FP8 export).
+add_executable(granite4-checkpoint src/checkpoint_cli.cc)
+target_link_libraries(granite4-checkpoint PRIVATE granite4)

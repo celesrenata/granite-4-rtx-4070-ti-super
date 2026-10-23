@@ -21,7 +21,13 @@ Per layer (GQA: 32 Q heads, 8 KV heads, head dim 128 ⇒ KV width 1024):
 | token embedding 100352×4096 (tied with LM head, assumed) | 411,041,792 |
 | **total (tied)** | **8,380,219,392** |
 
-Untied adds another 411,041,792 — P1 confirms tie-ness from the checkpoint.
+Untied adds another 411,041,792. **P1 confirms untied:** the checkpoint has
+363 tensors with both `model.embed_tokens.weight` and `lm_head.weight`
+present, `tie_word_embeddings: false`. Layernorms add
+`40 × (4096 + 4096) + 4096 = 331,776` elements the per-layer table above
+omits. The measured checkpoint total is **17,583,185,920 bytes**
+(= 8,791,592,960 elements × 2; verified byte-for-byte by
+`granite4-checkpoint verify`).
 
 ## Weights by precision
 

@@ -103,7 +103,9 @@ def test_inspector_successful_synthetic_inspection(tmp_path: Path) -> None:
     assert selected["chat_template"] is True
     for name, expected in INSPECT.REQUIRED_FIELDS.items():
         entry = report["planning_fields"][name]
-        assert entry == {"expected": expected, "actual": expected, "ok": True}
+        assert entry["expected"] == expected
+        assert entry["actual"] == expected
+        assert entry["ok"] is True
 
 
 def test_inspector_report_never_echoes_raw_contents(tmp_path: Path) -> None:
@@ -135,14 +137,30 @@ def test_inspector_reports_wrong_planning_value(tmp_path: Path) -> None:
             assert report["planning_fields"][name]["ok"] is True
 
 
-def test_inspector_reports_missing_planning_field(tmp_path: Path) -> None:
+def test_inspector_derives_missing_head_dim(tmp_path: Path) -> None:
+    # head_dim is absent from the real checkpoint's config.json: it must be
+    # derived as hidden_size / num_attention_heads (4096 / 32 = 128), matching
+    # the C++ parser, rather than reported as a missing field.
     ckpt = _write_checkpoint(tmp_path / "ckpt", {"head_dim": _ABSENT})
+    code, report = INSPECT.inspect_checkpoint(ckpt)
+    assert code == 0
+    assert report["verdict"] == "ok"
+    entry = report["planning_fields"]["head_dim"]
+    assert entry["actual"] == 128
+    assert entry["derived_from"] == ["hidden_size", "num_attention_heads"]
+    assert entry["ok"] is True
+
+
+def test_inspector_reports_head_dim_derivation_mismatch(tmp_path: Path) -> None:
+    # hidden_size 2048 -> derived head_dim 2048/32 = 64, which is off-spec.
+    ckpt = _write_checkpoint(tmp_path / "ckpt", {"head_dim": _ABSENT, "hidden_size": 2048})
     code, report = INSPECT.inspect_checkpoint(ckpt)
     assert code == 1
     assert report["verdict"] == "mismatch"
-    assert any("head_dim" in issue and "missing" in issue for issue in report["issues"])
+    assert any("head_dim" in issue for issue in report["issues"])
     entry = report["planning_fields"]["head_dim"]
-    assert entry["actual"] is None
+    assert entry["expected"] == 128
+    assert entry["actual"] == 64
     assert entry["ok"] is False
 
 

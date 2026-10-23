@@ -14,7 +14,7 @@ on a real sm_89 machine. Until P3 exits, the API keeps answering
 
 Exit criteria: `pytest` and `ctest` (host-only) pass on a machine without CUDA.
 
-## P1 — Weights
+## P1 — Weights (host side complete)
 
 - Safetensors loader; parse checkpoint `config.json` and reject on any
   deviation from the spec (hard fail, listed field-by-field).
@@ -25,6 +25,21 @@ Exit criteria: `pytest` and `ctest` (host-only) pass on a machine without CUDA.
 Exit criteria: full checkpoint loaded and checksummed; `nvidia-smi` memory
 matches the plan within 5%; config mismatch on a perturbed checkpoint fails
 fast with the exact field list.
+
+**Done (host, no CUDA):** `granite4-checkpoint verify <dir>` streams the
+whole checkpoint with bounded memory and reports per-shard and per-tensor
+SHA-256, exact tensor count / shapes / dtypes against the derived expected
+set, and a strict config.json check (field-by-field deviations, non-fatal —
+a wrong config is reported, it does not abort the checksum pass). The real
+8B checkpoint verifies clean: 4 shards, 363 tensors, 17,583,185,920 bytes,
+config_ok, zero issues. `granite4-checkpoint export <dir> <out.safetensors>
+[--per-channel]` writes a self-describing FP8 e4m3 checkpoint (weights +
+per-tensor or per-channel F32 scales) that parses back through the
+safetensors manifest. Both are covered by `ctest` (5 suites) and cross-checked
+against `python hashlib`. `head_dim` is derived (`hidden_size / heads`) in
+both the C++ parser and `scripts/inspect_checkpoint.py`, matching the real
+config.json which omits it. The remaining exit criterion — `nvidia-smi`
+residency within 5% of the plan — is deferred to the first sm_89 run.
 
 ## P2 — Kernels (sm_89)
 
