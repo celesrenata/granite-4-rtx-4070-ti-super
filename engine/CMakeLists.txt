@@ -26,7 +26,7 @@ if(GRANITE_ENABLE_CUDA)
   set(CMAKE_CUDA_ARCHITECTURES 89)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo --expt-relaxed-constexpr")
   find_package(CUDAToolkit REQUIRED)
-  list(APPEND GRANITE_ENGINE_SOURCES src/kernels.cu)
+  list(APPEND GRANITE_ENGINE_SOURCES src/kernels.cu src/kernels_phase2.cu)
 endif()
 
 add_library(granite4 SHARED ${GRANITE_ENGINE_SOURCES})
@@ -62,6 +62,17 @@ add_test(NAME fp8_e4m3 COMMAND granite4-fp8-test)
 add_executable(granite4-checkpoint-test tests/test_checkpoint.cc)
 target_link_libraries(granite4-checkpoint-test PRIVATE granite4)
 add_test(NAME checkpoint_verify COMMAND granite4-checkpoint-test)
+
+# Phase 2 (Kernels): host reference math - always buildable, no CUDA.
+add_executable(granite4-kernel-math-test tests/test_kernel_math.cc)
+target_link_libraries(granite4-kernel-math-test PRIVATE granite4_static)
+add_test(NAME kernel_math COMMAND granite4-kernel-math-test)
+
+if(GRANITE_ENABLE_CUDA)
+  add_executable(granite4-kernel-test tests/test_kernels.cu)
+  target_link_libraries(granite4-kernel-test PRIVATE granite4_static)
+  add_test(NAME kernels_device COMMAND granite4-kernel-test)
+endif()
 
 # Phase 1 checkpoint CLI (host-only: verify + FP8 export). Linked statically
 # so the installed binary does not depend on the in-tree build directory.
