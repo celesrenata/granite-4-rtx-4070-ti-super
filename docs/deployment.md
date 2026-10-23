@@ -147,3 +147,21 @@ git revert <commit>
 
 Rollback relies on NixOS generations; it must never require hand-editing
 `/etc/nixos/flake.nix` back.
+
+## P2 — GPU re-verification (gremlin-1)
+
+The flake's `packages.x86_64-linux.engine-cuda` compiles the full sm_89
+engine (kernels, `granite4-kernel-test`, `granite4-kernel-bench`) and runs
+every ctest suite *except* `kernels_device` — the device *run* needs the host
+driver's `libcuda` and a live GPU, which a build sandbox cannot reach. On the
+GPU box it is one command each (binaries ship in the package's `bin/`):
+
+```sh
+ssh root@10.1.1.12 "granite4-kernel-test"     # "all device kernel tests passed"
+ssh root@10.1.1.12 "granite4-kernel-bench"    # JSON: measured read/copy GB/s + roofline note
+```
+
+`granite4-kernel-bench` prints the measured bandwidth baseline (the P2 exit
+criterion: measured, not assumed). Per the cross-phase rule, the numbers are
+not committed to this repo before P4; they are reproducible from the binary
+with the commands above.

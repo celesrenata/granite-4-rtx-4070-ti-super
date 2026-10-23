@@ -1,17 +1,23 @@
 # Flake: Granite 4.2 8B on one RTX 4070 Ti Super (sm_89) scaffold.
 #
 # Outputs per system (see the `outputs` attribute below):
-#   packages.<system>.engine   host-side C++ library (C ABI, safetensors
-#                              metadata, JSON parser, config validation);
-#                              built host-only - CUDA objects target sm_89
-#                              and are enabled on the GPU host, not here
-#   packages.<system>.api      Python stdlib API frontend (Phase 0:
-#                              validates requests, no inference)
-#   packages.<system>.default  = api
-#   devShell.<system>          cmake + ninja + clang + git + uv + python3
-#                              (regex, pytest), GRANITE4_LIB preset
-#   checks.<system>            engine (runs ctest) and api (runs pytest)
-#   nixosModules.granite4Rtx   NixOS systemd service for the api process
+#   packages.<system>.engine     host-side C++ library (C ABI, safetensors
+#                                metadata, JSON parser, config validation);
+#                                built host-only - CUDA objects target sm_89
+#                                and are enabled on the GPU host, not here
+#   packages.<system>.api        Python stdlib API frontend (Phase 0:
+#                                validates requests, no inference)
+#   packages.<system>.default    = api
+#   packages.<system>.engine-cuda  CUDA engine (x86_64-linux only): compiles
+#                                the sm_89 kernels, device test and micro-
+#                                benchmark; doCheck runs all ctest suites
+#                                except the GPU-only kernels_device, which
+#                                needs the host driver's libcuda + a live
+#                                device and is re-run on gremlin-1
+#   devShell.<system>            cmake + ninja + clang + git + uv + python3
+#                                (regex, pytest), GRANITE4_LIB preset
+#   checks.<system>              engine (runs ctest) and api (runs pytest)
+#   nixosModules.granite4Rtx     NixOS systemd service for the api process
 #
 # The 18 GB local checkpoint under .gt/ and the build trees never enter any
 # derivation: the source filter below keeps only the files the derivations
@@ -109,6 +115,65 @@
           meta.description = "Granite 4.2 8B host-side engine library (C ABI; CUDA off, sm_89 on the GPU host)";
         };
 
+      # The CUDA-enabled engine (sm_89). Linux-only: it needs the CUDA toolkit
+      # to compile the device kernels. doCheck compiles the whole sm_89 build
+      # (kernels, device test, micro-benchmark) and runs every ctest suite
+      # except kernels_device - that suite needs the GPU host driver's
+      # libcuda plus a live sm_89 device, which a build sandbox cannot reach;
+      # it is re-verified on the GPU box with one command:
+      #   granite4-kernel-test      (device correctness)
+      #   granite4-kernel-bench     (measured bandwidth / roofline baseline;
+      #                              JSON to stdout - the measured numbers are
+      #                              recorded outside the repo per the P4 rule)
+      mkEngineCuda =
+        pkgs:
+        let
+          # allowUnfree only for this derivation's stdenv: the CUDA components
+          # are unfree-licensed; nothing else in the repo needs it. Same
+          # nixpkgs input, so shared inputs (cmake/ninja/clang, libc) are the
+          # identical store paths as in the host-only engine.
+          p = import nixpkgs {
+            inherit (pkgs.stdenv.hostPlatform) system;
+            config.allowUnfree = true;
+          };
+        in
+        p.stdenv.mkDerivation {
+          pname = "granite4-engine-cuda";
+          version = "0.0.1";
+          src = repo;
+          doCheck = true;
+          nativeBuildInputs = [ p.cmake p.ninja p.clang p.cudatoolkit ];
+          configurePhase = ''
+            # CMAKE_CXX_SCAN_FOR_MODULES=OFF: same CMake 4 clang-scan-deps
+            # workaround as the host-only engine.
+            cmake -B build -S . -G Ninja \
+              -DGRANITE_ENABLE_CUDA=ON \
+              -DCMAKE_CXX_SCAN_FOR_MODULES=OFF
+          '';
+          buildPhase = ''
+            # Override stdenv's default buildPhase (which would run a bare
+            # `make`); the Ninja build is driven through CMake instead.
+            cmake --build build
+          '';
+          # Full sm_89 compile, including the device-test and bench binaries;
+          # run every ctest suite except the GPU-only kernels_device run.
+          checkPhase = ''
+            ctest --test-dir build --output-on-failure \
+              --exclude-regex kernels_device
+          '';
+          installPhase = ''
+            mkdir -p $out/lib $out/bin $out/include/granite4
+            install -m 0755 build/engine/libgranite4.${libext pkgs} $out/lib/
+            install -m 0755 build/engine/granite4-checkpoint $out/bin/
+            # CUDA-only artifacts: the device-correctness test (one-command
+            # re-verification on the GPU box) and the micro-benchmark.
+            install -m 0755 build/engine/granite4-kernel-test $out/bin/
+            install -m 0755 build/engine/granite4-kernel-bench $out/bin/
+            install -m 0644 engine/src/*.h $out/include/granite4/
+          '';
+          meta.description = "Granite 4.2 8B engine with sm_89 CUDA kernels (CUDA on); device test re-run on the GPU box";
+        };
+
       # Pure-stdlib frontend. format = "other" skips the setuptools path; we
       # install the frontend/ and reference/ packages into site-packages and
       # expose a thin granite4-api launcher. The launcher must run in a clean
@@ -175,6 +240,11 @@
             api = mkApi pkgs;
             default = mkApi pkgs;
           }
+          # CUDA engine, Linux only. `optionalAttrs` keeps the attribute absent
+          # (rather than null) on other systems, so `nix flake check` still
+          # passes there; the GPU host references it on x86_64-linux only.
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux
+            { engine-cuda = mkEngineCuda pkgs; }
         );
 
       devShell =

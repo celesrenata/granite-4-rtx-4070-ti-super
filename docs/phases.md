@@ -41,7 +41,7 @@ both the C++ parser and `scripts/inspect_checkpoint.py`, matching the real
 config.json which omits it. The remaining exit criterion — `nvidia-smi`
 residency within 5% of the plan — is deferred to the first sm_89 run.
 
-## P2 — Kernels (sm_89) — in progress
+## P2 — Kernels (sm_89) ✅
 
 - GEMM (FP8 e4m3 weights; Ada has no Blackwell-style block-scaled MMA, so
   scales are per-tensor/channel — decided here), attention with GQA
@@ -51,18 +51,36 @@ residency within 5% of the plan — is deferred to the first sm_89 run.
 Exit criteria: per-kernel correctness on randomized inputs; micro-benchmark
 script with the bandwidth/roofline baseline measured (not assumed).
 
-**Done (verified on gremlin-1, RTX 4070 Ti Super / sm_89, CUDA 13.3):**
-the portable reference math (`engine/src/kernel_math.h`) and the device
-kernels (`engine/src/kernels_phase2.cu`) for **RMSNorm, RoPE (half-split),
-scaled softmax (attention-multiplier logits), and FP8-e4m3 × BF16 GEMM with
-per-tensor dequant** — each checked against the reference with seeded
-randomized inputs (2–4 ULP tolerance), plus the sm_89 arch probe.
-Host reference: `kernel_math` ctest (runs everywhere). Device:
-`kernels_device` ctest (`GRANITE_ENABLE_CUDA=ON`).
+**Done (verified on gremlin-1, RTX 4070 Ti Super / sm_89, CUDA 13.3):** the
+portable reference math (`engine/src/kernel_math.h`) and the device kernels
+(`engine/src/kernels_phase2.cu`) for the full P2 set — **RMSNorm, RoPE
+(half-split), scaled softmax (attention-multiplier logits), FP8-e4m3 × BF16
+GEMM with per-tensor dequant, GQA attention (Q·Kᵀ + value accumulation, gh =
+Hq/Hk), fused SwiGLU gate/up, and sampling (deterministic greedy + top-p)** —
+each checked against the reference with seeded randomized inputs (1–4 ULP
+tolerance; sampling is an exact discrete match), plus the sm_89 arch probe.
+Greedy is additionally verified at the full 100352-vocab size. Host reference:
+`kernel_math` ctest (runs everywhere). Device: `kernels_device` ctest
+(`GRANITE_ENABLE_CUDA=ON`).
 
-**Remaining:** GQA attention (Q·Kᵀ via the GEMM path + GQA head tiling),
-silu-FFN fused kernel, sampling; the micro-benchmark/roofline baseline; and
-folding `kernels_device` into the GPU host's flake checks.
+**Micro-benchmark / roofline baseline:** `granite4-kernel-bench`
+(`engine/src/kernels_bench.cu`) measures the card's *actual* streaming read
+and copy bandwidth with CUDA events and prints the roofline note (decode is
+read-bound; tokens/s = read_gbps / fp8 weight bytes per token) as JSON. The
+baseline is measured on the card, not assumed. Per the cross-phase rule, the
+measured numbers are kept out of the repo until P4; they are reproducible
+from the binary (below).
+
+**Folded into the GPU host's flake:** `packages.x86_64-linux.engine-cuda`
+compiles the whole sm_89 build — kernels, the device-test binary, and the
+micro-benchmark — and `doCheck` runs every ctest suite *except* the GPU-only
+`kernels_device` run (that needs the host driver's `libcuda` plus a live
+device, which a build sandbox cannot reach). The GPU host re-verifies the
+device kernels with one command:
+```
+granite4-kernel-test     # device correctness (== the kernels_device ctest)
+granite4-kernel-bench    # measured bandwidth / roofline baseline (JSON)
+```
 
 ## P3 — Integration
 
