@@ -350,14 +350,40 @@ static void test_sampling_device() {
   CUDA_CHECK(cudaMemcpy(gre.data(), dg, rows * 4, cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(tpo.data(), dtp, rows * 4, cudaMemcpyDeviceToHost));
 
-  int bad = 0;
+  int bad_greedy = 0, bad_topp = 0;
   for (int r = 0; r < rows; ++r) {
     std::vector<float> pr(n);
     for (int i = 0; i < n; ++i) pr[i] = bf16_to_f32_host(hp[r * n + i]);
-    if (gre[r] != sample_greedy_f32(pr.data(), n)) ++bad;
-    if (tpo[r] != sample_top_p_f32(pr.data(), 0.9f, u[r], n)) ++bad;
+    if (gre[r] != sample_greedy_f32(pr.data(), n)) ++bad_greedy;
+    if (tpo[r] != sample_top_p_f32(pr.data(), 0.9f, u[r], n)) ++bad_topp;
   }
-  expect(bad == 0, "sampling: device greedy + top-p match host reference");
+  expect(bad_greedy == 0, "sampling: device greedy matches host reference");
+  expect(bad_topp == 0, "sampling: device top-p matches host reference");
+
+  // Full production vocabulary (100352): greedy must scale to any size
+  // (top-p is bounded by kTopPVocabMax in this phase).
+  const int full = 100352;
+  std::vector<std::uint16_t> hpf(2 * full);
+  for (auto& t : hpf) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  std::uint16_t* dpf;
+  int* dfg;
+  if (cudaMalloc(&dpf, hpf.size() * 2) || cudaMalloc(&dfg, 2 * 4)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dpf, hpf.data(), hpf.size() * 2, cudaMemcpyHostToDevice));
+  expect(granite4_kernel_sample_greedy(dpf, 2, full, dfg) == 0, "greedy full-vocab launch");
+  std::vector<int> gref(2);
+  CUDA_CHECK(cudaMemcpy(gref.data(), dfg, 2 * 4, cudaMemcpyDeviceToHost));
+  int bad_full = 0;
+  for (int r = 0; r < 2; ++r) {
+    std::vector<float> pr(full);
+    for (int i = 0; i < full; ++i) pr[i] = bf16_to_f32_host(hpf[r * full + i]);
+    if (gref[r] != sample_greedy_f32(pr.data(), full)) ++bad_full;
+  }
+  expect(bad_full == 0, "greedy: full 100352-vocab rows match host reference");
+  cudaFree(dpf);
+  cudaFree(dfg);
   cudaFree(dp);
   cudaFree(dg);
   cudaFree(dtp);

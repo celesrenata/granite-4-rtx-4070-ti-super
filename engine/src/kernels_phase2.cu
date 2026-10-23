@@ -246,21 +246,24 @@ __global__ void sample_top_p_kernel(const std::uint16_t* p, float nucleus,
     sp[threadIdx.x] = bf16_to_f32(p[row * n + threadIdx.x]);
     st[threadIdx.x] = threadIdx.x;
   }
-  // Stable sort: probability descending, token id ascending on ties.
-  for (int i = 0; i < n; ++i) {
-    float v = sp[i];
-    int id = st[i];
-    int j = i - 1;
-    while (j >= 0 && (sp[j] < v || (sp[j] == v && st[j] > id))) {
-      sp[j + 1] = sp[j];
-      st[j + 1] = st[j];
-      --j;
-    }
-    sp[j + 1] = v;
-    st[j + 1] = id;
-  }
   __syncthreads();
+  // One thread per row: stable insertion sort (probability descending, token
+  // id ascending on ties), then nucleus truncation and prefix-sum pick.
+  // Single-threaded because the sort is in-place over the shared arrays;
+  // O(n^2) is fine at the tested sizes (a faster argsort is a P3 concern).
   if (threadIdx.x == 0) {
+    for (int i = 0; i < n; ++i) {
+      float v = sp[i];
+      int id = st[i];
+      int j = i - 1;
+      while (j >= 0 && (sp[j] < v || (sp[j] == v && st[j] > id))) {
+        sp[j + 1] = sp[j];
+        st[j + 1] = st[j];
+        --j;
+      }
+      sp[j + 1] = v;
+      st[j + 1] = id;
+    }
     double acc = 0.0;
     int cut = n;
     for (int j = 0; j < n; ++j) {
