@@ -93,6 +93,16 @@ granite4-kernel-bench    # measured bandwidth / roofline baseline (JSON)
 Exit criteria: parity gate passes; the API flips to serving; `/health`
 reports `inference: available` only after the gate.
 
+**In progress:** the paged KV memory manager + prefix cache
+(`engine/src/kv_pool.{h,cc}`) is done and host-verified (7/7 ctest on a
+host-only build): a paged pool sized from the [memory.md](memory.md) budget,
+token-major byte layout, page-aligned prefix sharing (ref-counted,
+content-addressable with a token-verified collision guard), and LRU eviction
+of retained (unreferenced, still-cached) pages. The GPU KV write/compaction
+kernel, the prefill/decode loop, and the concurrent-sequence scheduler build
+on top of this and are not yet implemented; no part of P3 runs end-to-end on
+the GPU yet, and the API still reports `unavailable`.
+
 ## P4 — Performance
 
 - Kernel and scheduling tuning at a fixed power limit.

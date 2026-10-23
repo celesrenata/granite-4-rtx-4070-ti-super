@@ -50,6 +50,37 @@ Per token, K+V: `2 × 40 layers × 8 KV heads × 128 head dim = 81,920` elements
 | BF16 | 160 KiB | 2.5 GiB | 5.0 GiB | 20.0 GiB |
 | FP8 | 80 KiB | 1.25 GiB | 2.5 GiB | 10.0 GiB |
 
+### Paged KV management (P3)
+
+The runtime allocates KV as a **paged pool** (`engine/src/kv_pool.{h,cc}`,
+host-only, no CUDA). A page holds `tokens_per_page` consecutive tokens of KV
+for *all* layers and KV heads (FP8 e4m3, one byte per element); a page's bytes
+are laid out token-major — `[token][layer][k|v][kv_head][head_dim]` — so a
+token's KV is contiguous and a full page is one contiguous region. A
+sequence's KV is an ordered block table of page ids; `KvPoolConfig::
+from_budget` sizes the pool from the KV byte budget above
+(`num_pages = floor(budget / page_bytes)`).
+
+Two sharing rules:
+
+- **Prefix cache** — only *complete* pages are shared. A page is
+  content-addressable (a chained hash over its page-aligned token prefix,
+  re-checked token-by-token on lookup, so a hash collision can never wrongly
+  share pages). A new sequence whose prompt shares a cached page-aligned
+  prefix reuses those physical pages (ref-counted) instead of allocating.
+- **Eviction** — LRU over the *retained* pages: a page that no live sequence
+  references but that is still cached (`ref_count == 0`) is evictable; when
+  the free pool is empty the allocator evicts the least-recently-used one. A
+  page a live sequence references is never evicted, so an allocation that
+  cannot be satisfied fails rather than clobbering. This retains prompts
+  across *sequential* requests (the common long-system-prompt case) as well
+  as *concurrent* ones.
+
+The GPU writes KV into a (page, token) slot and, at attention time, compacts a
+sequence's pages into the contiguous `[Hk, kv_len, d]` layout the P2 attention
+kernel consumes; the byte placement it compacts from is exactly the
+`KvLayout::offset` layout above.
+
 ## Budget (FP8 weights + FP8 KV), ~14.9 GiB usable
 
 | Item | Budget |

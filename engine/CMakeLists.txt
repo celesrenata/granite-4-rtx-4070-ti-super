@@ -15,7 +15,9 @@ set(GRANITE_ENGINE_SOURCES
   src/checkpoint.h
   src/fp8_convert.cc
   src/checkpoint_sha256.cc
-  src/checkpoint_main.cc)
+  src/checkpoint_main.cc
+  src/kv_pool.h
+  src/kv_pool.cc)
 
 if(GRANITE_ENABLE_CUDA)
   enable_language(CUDA)
@@ -67,6 +69,13 @@ add_test(NAME checkpoint_verify COMMAND granite4-checkpoint-test)
 add_executable(granite4-kernel-math-test tests/test_kernel_math.cc)
 target_link_libraries(granite4-kernel-math-test PRIVATE granite4_static)
 add_test(NAME kernel_math COMMAND granite4-kernel-math-test)
+
+# Phase 3 (Integration): paged KV memory manager + prefix cache. Host-only,
+# no CUDA; exercises allocation, prefix reuse (ref counting), and LRU
+# eviction against a byte budget derived from docs/memory.md.
+add_executable(granite4-kv-pool-test tests/test_kv_pool.cc)
+target_link_libraries(granite4-kv-pool-test PRIVATE granite4_static)
+add_test(NAME kv_pool COMMAND granite4-kv-pool-test)
 
 if(GRANITE_ENABLE_CUDA)
   add_executable(granite4-kernel-test tests/test_kernels.cu)
