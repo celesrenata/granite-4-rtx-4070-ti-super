@@ -108,12 +108,21 @@ reports `inference: available` only after the gate.
   reference `paged_kv_compact_bf16` — device-verified on gremlin-1
   (`granite4-kernel-test`), and the paged pool's byte layout is pinned by the
   host test.
+- The deterministic **forward pass** `forward_logits_f32` (all 40 layers,
+  float) is implemented and host-verified as the parity oracle. It composes
+  only the device-verified primitives (RMSNorm, Llama-half-split RoPE,
+  `gqa_attention_bf16`, SwiGLU), takes the dequantized FP8 weights, and runs
+  causal attention over the whole history at each position. Two tests pin
+  it: a zero-projection passthrough (output must equal
+  `lm_head @ rmsnorm(embedding)` computed by hand, proving the full 40-layer
+  loop + residual + final norm + head are wired correctly) and a causality
+  test (a later token must not change any earlier position's logits).
 
 Not yet done (the bulk of P3): loading the real FP8 weights onto the GPU,
-running a full forward pass (all 40 layers) with the paged KV, the
-prefill/decode loop, and the concurrent-sequence scheduler; the golden parity
-gate. No part of P3 runs end-to-end yet, and the API still reports
-`unavailable`.
+running the forward pass on the GPU with the paged KV, the prefill/decode
+loop, and the concurrent-sequence scheduler; the golden parity gate (needs a
+transformers reference on a box with a real checkpoint). No part of P3 runs
+end-to-end yet, and the API still reports `unavailable`.
 
 ## P4 — Performance
 

@@ -27,6 +27,21 @@ struct ModelConfig {
 
 inline constexpr ModelConfig kModelConfig{};
 
+// Non-structural constants of the Granite 4.2 8B spec. These are validated
+// field-by-field against the checkpoint's config.json (see
+// checkpoint_main.cc parse_checkpoint_config); the defaults here are the
+// spec values. Kept separate from ModelConfig because the Python cross-check
+// (frontend/config.py) only covers the structural dimensions.
+struct ForwardSpec {
+  float rms_norm_eps = 1.0e-5f;
+  float attention_multiplier = 1.0f / 128.0f;  // replaces 1/sqrt(head_dim)
+  float residual_multiplier = 1.0f;  // scales each residual-branch add
+  float embedding_multiplier = 1.0f;  // scales the embedding lookup
+  float logits_scaling = 1.0f;  // scales the final logits
+  double rope_theta = 1.0e7;
+};
+inline constexpr ForwardSpec kForwardSpec{};
+
 inline constexpr char kModelId[] = "granite-4.2-8b";
 inline constexpr int kCudaArchMajor = 8;   // compute capability 8.9
 inline constexpr int kCudaArchMinor = 9;  // RTX 4070 Ti Super (Ada)

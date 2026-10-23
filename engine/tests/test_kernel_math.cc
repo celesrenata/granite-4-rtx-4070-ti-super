@@ -218,6 +218,131 @@ static void test_attention() {
   }
 }
 
+static void test_forward_passthrough() {
+  // With every layer projection zeroed and layer norms == 1, each block is a
+  // no-op: the hidden state is the embedding throughout, so logits[t] must
+  // equal logits_scaling * lm_head @ rmsnorm(embedding[t]). This is computed
+  // by hand (not via rmsnorm_f32), independently proving the whole 40-layer
+  // loop, residual accumulation, causal-attention path, and final norm+head.
+  ModelConfig cfg;
+  cfg.hidden_size = 8;      // H
+  cfg.head_dim = 2;         // d
+  cfg.num_attention_heads = 4;  // Hq (Hq*d == H)
+  cfg.num_key_value_heads = 2;  // Hk
+  cfg.intermediate_size = 12;   // I
+  cfg.vocab_size = 10;          // V
+  cfg.num_layers = 3;           // L
+  const int H = cfg.hidden_size, I = cfg.intermediate_size, V = cfg.vocab_size;
+  const int d = cfg.head_dim, Hq = cfg.num_attention_heads, Hk = cfg.num_key_value_heads;
+  const int KV = Hk * d, L = cfg.num_layers;
+  ForwardSpec spec;
+
+  // Layer block layout (must match forward_logits_f32's offsets).
+  const std::size_t q_size = (std::size_t)H * H;
+  const std::size_t kv_size = (std::size_t)KV * H;
+  const std::size_t io_size = (std::size_t)I * H;
+  const std::size_t o_size = (std::size_t)H * H;
+  const std::size_t down_size = (std::size_t)H * I;
+  const std::size_t off_q = 2 * (std::size_t)H;
+  const std::size_t off_k = off_q + q_size;
+  const std::size_t off_v = off_k + kv_size;
+  const std::size_t off_o = off_v + kv_size;
+  const std::size_t off_gate = off_o + o_size;
+  const std::size_t off_up = off_gate + io_size;
+  const std::size_t off_down = off_up + io_size;
+  const std::size_t layer_bytes = off_down + down_size;
+
+  // Layer 0 layernorms == 1, all projections == 0.
+  std::vector<float> layers((std::size_t)L * layer_bytes, 0.0f);
+  for (int layer = 0; layer < L; ++layer) {
+    float* lb = layers.data() + (std::size_t)layer * layer_bytes;
+    for (int j = 0; j < H; ++j) {
+      lb[0 * H + j] = 1.0f;   // input_layernorm
+      lb[1 * H + j] = 1.0f;   // post_attention_layernorm
+    }
+  }
+
+  // Embeddings (row-major [V][H]) and lm_head, nonzero.
+  Xorshift64 rng(0x5eed);
+  const int n = 3;
+  const std::vector<std::int32_t> tokens = {1, 5, 7};
+  std::vector<float> embed((std::size_t)V * H), lm_head((std::size_t)V * H);
+  for (auto& v : embed) v = rng.next_float_range(1.0);
+  for (auto& v : lm_head) v = rng.next_float_range(1.0);
+  std::vector<float> final_norm(H, 1.0f);
+
+  std::vector<float> logits;
+  forward_logits_f32(tokens, embed, layers, final_norm.data(), lm_head.data(),
+                     cfg, spec, &logits);
+  expect(logits.size() == (std::size_t)n * V, "forward: logits size n*V");
+
+  // Hand reference: logits[t][i] = lm_head[i] @ rmsnorm(emb_row[t]),
+  // rmsnorm replicating rmsnorm_f32 exactly (double sum, float r).
+  for (int t = 0; t < n; ++t) {
+    const float* x = embed.data() + (std::size_t)tokens[t] * H;
+    double s = 0.0;
+    for (int j = 0; j < H; ++j) s += (double)x[j] * x[j];
+    const float r = 1.0f / std::sqrt((float)(s / H) + spec.rms_norm_eps);
+    for (int i = 0; i < V; ++i) {
+      float acc = 0.0f;
+      for (int j = 0; j < H; ++j)
+        acc += lm_head[(std::size_t)i * H + j] * (x[j] * r * final_norm[j]);
+      const float want = spec.logits_scaling * acc;
+      if (std::fabs(logits[(std::size_t)t * V + i] - want) > 1e-4f) {
+        expect(false, "forward passthrough: logits match hand reference");
+        return;
+      }
+    }
+  }
+  expect(true, "forward passthrough: 3 tokens x vocab match hand reference");
+}
+
+static void test_forward_causality() {
+  // Two runs that differ only at the LAST token must agree at every earlier
+  // position (causal attention) but may differ at the last. Nonzero weights
+  // throughout, so any leak of a future token into an earlier position is
+  // detected.
+  ModelConfig cfg;
+  cfg.hidden_size = 8;
+  cfg.head_dim = 2;
+  cfg.num_attention_heads = 4;
+  cfg.num_key_value_heads = 2;
+  cfg.intermediate_size = 12;
+  cfg.vocab_size = 10;
+  cfg.num_layers = 2;
+  const int H = cfg.hidden_size, V = cfg.vocab_size;
+  const int KV = cfg.num_key_value_heads * cfg.head_dim;
+  const std::size_t layer_bytes =
+      2 * (std::size_t)H +
+      (std::size_t)H * H + 2 * (std::size_t)KV * H +
+      (std::size_t)H * H + 2 * (std::size_t)12 * H + (std::size_t)H * 12;
+
+  ForwardSpec spec;
+  Xorshift64 rng(0x0c47);
+  std::vector<float> layers((std::size_t)cfg.num_layers * layer_bytes, 0.0f);
+  for (auto& v : layers) v = rng.next_float_range(0.25f);  // small, no overflow
+  std::vector<float> embed((std::size_t)V * H), lm_head((std::size_t)V * H);
+  for (auto& v : embed) v = rng.next_float_range(1.0);
+  for (auto& v : lm_head) v = rng.next_float_range(1.0);
+  std::vector<float> final_norm(H, 1.0f);
+
+  const std::vector<std::int32_t> A = {2, 4, 6};
+  const std::vector<std::int32_t> B = {2, 4, 9};  // differs only at t=2
+  std::vector<float> la, lb;
+  forward_logits_f32(A, embed, layers, final_norm.data(), lm_head.data(), cfg, spec, &la);
+  forward_logits_f32(B, embed, layers, final_norm.data(), lm_head.data(), cfg, spec, &lb);
+  expect(la.size() == lb.size(), "forward causality: same logits size");
+
+  int bad_early = 0, same_last = 0;
+  for (int t = 0; t < 2; ++t)  // positions 0 and 1 must be identical
+    for (int i = 0; i < V; ++i)
+      if (la[(std::size_t)t * V + i] != lb[(std::size_t)t * V + i]) ++bad_early;
+  expect(bad_early == 0, "forward causality: earlier positions unaffected by later token");
+  for (int i = 0; i < V; ++i)
+    if (la[2 * V + i] == lb[2 * V + i]) ++same_last;
+  expect(same_last < V, "forward causality: last position actually differs");
+}
+
 static void test_paged_kv_compact() {
   // One layer's KV from the paged FP8 pool -> contiguous [Hk, kv_len, d] BF16
   // (the layout gqa_attention_bf16 consumes). Hk=2, d=4, B=2, layers=3.
@@ -395,6 +520,8 @@ int main() {
   test_softmax();
   test_silu();
   test_attention();
+  test_forward_passthrough();
+  test_forward_causality();
   test_paged_kv_compact();
   test_silu_gate_up();
   test_sampling();
