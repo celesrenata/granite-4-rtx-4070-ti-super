@@ -8,14 +8,22 @@
 //     --iters <n>       timed iterations (default 100)
 //
 // Prints one JSON object to stdout:
-//   { "schema": "granite4.kbench.v1", "device": "...",
-//     "read_gbps": ..., "copy_gbps": ..., "tokens_s_at_read": ... ,
-//     "roofline": { "mem_gb": ..., "ops_flops": ... } }
+//   { "schema": "granite4.kbench.v1", "device": "...", "sm": "8.9",
+//     "driver_version": 13040, "runtime_version": 13030,
+//     "mem_total_mib": ..., "mem_free_mib": ...,
+//     "read_gbps": ..., "copy_gbps": ...,
+//     "roofline": { "mem_gbps": ... } }
 //
 // tokens_s_at_read = (measured read bandwidth) / (bytes read per token).
 // For decode, each token reads every weight once; with FP8 e4m3 weights the
 // per-token footprint is ~total_numel bytes. We report bandwidth, not a
 // token figure, but expose the division so a caller can plug in a footprint.
+//
+// Also reports the CUDA-runtime memory view (cudaMemGetInfo) and the
+// driver/runtime versions. On gremlin-1 `nvidia-smi` segfaults (a store-
+// glibc loader issue, not the GPU), so this is the working source for the
+// measured memory / residency baseline.
+#include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -118,10 +126,22 @@ int main(int argc, char** argv) {
   cudaFree(d_b);
   cudaFree(d_sink);
 
+  // Measured memory view (works where `nvidia-smi` does not) + the
+  // driver/runtime versions the card actually ran under.
+  size_t mem_free = 0, mem_total = 0;
+  cudaMemGetInfo(&mem_free, &mem_total);
+  int driver_version = 0, runtime_version = 0;
+  cudaDriverGetVersion(&driver_version);
+  cudaRuntimeGetVersion(&runtime_version);
+
   std::printf(
       "{\"schema\":\"granite4.kbench.v1\","
       "\"device\":\"%s\","
       "\"sm\":\"%d.%d\","
+      "\"driver_version\":%d,"
+      "\"runtime_version\":%d,"
+      "\"mem_total_mib\":%lu,"
+      "\"mem_free_mib\":%lu,"
       "\"bytes_mib\":%ld,"
       "\"iters\":%ld,"
       "\"read_gbps\":%.2f,"
@@ -129,6 +149,9 @@ int main(int argc, char** argv) {
       "\"roofline\":{\"mem_gbps\":%.2f,"
       "\"note\":\"weights-per-token decode is read-bound; tokens/s = read_gbps "
       "/ (fp8 weight bytes per token)\"}}\n",
-      p.name, p.major, p.minor, bytes_mib, iters, read_gbps, copy_gbps, read_gbps);
+      p.name, p.major, p.minor, driver_version, runtime_version,
+      (unsigned long)(mem_total / (1024u * 1024u)),
+      (unsigned long)(mem_free / (1024u * 1024u)),
+      bytes_mib, iters, read_gbps, copy_gbps, read_gbps);
   return 0;
 }

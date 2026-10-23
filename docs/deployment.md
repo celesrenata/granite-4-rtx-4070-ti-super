@@ -148,6 +148,30 @@ git revert <commit>
 Rollback relies on NixOS generations; it must never require hand-editing
 `/etc/nixos/flake.nix` back.
 
+## Known box issue: `nvidia-smi` segfaults (not an NVIDIA problem)
+
+`nvidia-smi` (from `nix/store/…-nvidia-x11-615.78.08-bin`) crashes with
+SIGSEGV *inside `ld-linux-x86-64.so.2` during loader init* (fault at the
+binary's ELF program-header region, before any library is loaded). Diagnosis
+on gremlin-1 (2026-10-23): the CPU has Intel **PKU** (`pku`/`ospke`), the
+box runs a bleeding-edge **7.2.11** kernel, and the loader is the store's
+**glibc 2.44-57** dynamic linker — a loader/kernel interaction, *not* the
+GPU. The store's glibc 2.42 loader runs fine, the CUDA runtime talks to the
+615 driver cleanly (`cudaGetDeviceCount()` → RTX 4070 Ti SUPER, sm 8.9,
+driver 13.4), and the device tests + benchmark pass. Until the box's kernel
+or the nixpkgs glibc changes (re-evaluate after either), use these instead:
+
+```sh
+granite4-kernel-test    # exercises the driver + GPU
+granite4-kernel-bench   # bandwidth + memory baseline (JSON below)
+cat /proc/driver/nvidia/version   # kernel module version (615.78.08)
+```
+The P1 residency criterion (measured memory) is read from
+`granite4-kernel-bench`'s `mem_total_mib` / `mem_free_mib` fields — the
+CUDA runtime's `cudaMemGetInfo` view, which works where `nvidia-smi` does
+not. Run it after the model is loaded (P3) and the difference from the
+pre-load free memory is the residency figure.
+
 ## P2 — GPU re-verification (gremlin-1)
 
 The flake's `packages.x86_64-linux.engine-cuda` compiles the full sm_89
