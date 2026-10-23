@@ -41,7 +41,7 @@ both the C++ parser and `scripts/inspect_checkpoint.py`, matching the real
 config.json which omits it. The remaining exit criterion — `nvidia-smi`
 residency within 5% of the plan — is deferred to the first sm_89 run.
 
-## P2 — Kernels (sm_89)
+## P2 — Kernels (sm_89) — in progress
 
 - GEMM (FP8 e4m3 weights; Ada has no Blackwell-style block-scaled MMA, so
   scales are per-tensor/channel — decided here), attention with GQA
@@ -50,6 +50,19 @@ residency within 5% of the plan — is deferred to the first sm_89 run.
 
 Exit criteria: per-kernel correctness on randomized inputs; micro-benchmark
 script with the bandwidth/roofline baseline measured (not assumed).
+
+**Done (verified on gremlin-1, RTX 4070 Ti Super / sm_89, CUDA 13.3):**
+the portable reference math (`engine/src/kernel_math.h`) and the device
+kernels (`engine/src/kernels_phase2.cu`) for **RMSNorm, RoPE (half-split),
+scaled softmax (attention-multiplier logits), and FP8-e4m3 × BF16 GEMM with
+per-tensor dequant** — each checked against the reference with seeded
+randomized inputs (2–4 ULP tolerance), plus the sm_89 arch probe.
+Host reference: `kernel_math` ctest (runs everywhere). Device:
+`kernels_device` ctest (`GRANITE_ENABLE_CUDA=ON`).
+
+**Remaining:** GQA attention (Q·Kᵀ via the GEMM path + GQA head tiling),
+silu-FFN fused kernel, sampling; the micro-benchmark/roofline baseline; and
+folding `kernels_device` into the GPU host's flake checks.
 
 ## P3 — Integration
 
