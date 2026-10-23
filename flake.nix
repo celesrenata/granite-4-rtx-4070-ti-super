@@ -98,8 +98,12 @@
           # Runs config_validation, safetensors_metadata and json_parser.
           checkPhase = "ctest --test-dir build --output-on-failure";
           installPhase = ''
-            mkdir -p $out/lib $out/include/granite4
+            mkdir -p $out/lib $out/bin $out/include/granite4
             install -m 0755 build/engine/libgranite4.${libext pkgs} $out/lib/
+            # granite4-checkpoint is linked against the static library
+            # (granite4_static), so it carries no rpath into the build tree
+            # and runs from the installed profile as-is.
+            install -m 0755 build/engine/granite4-checkpoint $out/bin/
             install -m 0644 engine/src/*.h $out/include/granite4/
           '';
           meta.description = "Granite 4.2 8B host-side engine library (C ABI; CUDA off, sm_89 on the GPU host)";

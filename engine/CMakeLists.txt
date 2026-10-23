@@ -32,6 +32,13 @@ endif()
 add_library(granite4 SHARED ${GRANITE_ENGINE_SOURCES})
 target_include_directories(granite4 PUBLIC src)
 
+# A static library of the same sources. The shared library is the primary
+# artifact (used by the C ABI and tests); the static one exists so the
+# checkpoint CLI can be linked self-contained - its in-$out RPATH must not
+# point at a build tree that no longer exists after install.
+add_library(granite4_static STATIC ${GRANITE_ENGINE_SOURCES})
+target_include_directories(granite4_static PUBLIC src)
+
 if(GRANITE_ENABLE_CUDA)
   target_link_libraries(granite4 PRIVATE CUDA::cudart)
 endif()
@@ -40,7 +47,6 @@ endif()
 add_executable(granite4-config-test tests/test_config_validation.cc)
 target_link_libraries(granite4-config-test PRIVATE granite4)
 add_test(NAME config_validation COMMAND granite4-config-test)
-
 add_executable(granite4-safetensors-test tests/test_safetensors.cc)
 target_link_libraries(granite4-safetensors-test PRIVATE granite4)
 add_test(NAME safetensors_metadata COMMAND granite4-safetensors-test)
@@ -57,6 +63,7 @@ add_executable(granite4-checkpoint-test tests/test_checkpoint.cc)
 target_link_libraries(granite4-checkpoint-test PRIVATE granite4)
 add_test(NAME checkpoint_verify COMMAND granite4-checkpoint-test)
 
-# Phase 1 checkpoint CLI (host-only: verify + FP8 export).
+# Phase 1 checkpoint CLI (host-only: verify + FP8 export). Linked statically
+# so the installed binary does not depend on the in-tree build directory.
 add_executable(granite4-checkpoint src/checkpoint_cli.cc)
-target_link_libraries(granite4-checkpoint PRIVATE granite4)
+target_link_libraries(granite4-checkpoint PRIVATE granite4_static)
