@@ -6,6 +6,8 @@
 # build (used by CI and by the Python tests).
 set(GRANITE_ENGINE_SOURCES
   src/model_config.h
+  src/json.h
+  src/json.cc
   src/config_validation.cc
   src/safetensors.h
   src/safetensors.cc
@@ -38,3 +40,7 @@ add_test(NAME config_validation COMMAND granite4-config-test)
 add_executable(granite4-safetensors-test tests/test_safetensors.cc)
 target_link_libraries(granite4-safetensors-test PRIVATE granite4)
 add_test(NAME safetensors_metadata COMMAND granite4-safetensors-test)
+
+add_executable(granite4-json-test tests/test_json.cc)
+target_link_libraries(granite4-json-test PRIVATE granite4)
+add_test(NAME json_parser COMMAND granite4-json-test)
