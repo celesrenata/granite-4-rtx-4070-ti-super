@@ -10,3 +10,6 @@ dist/
 
 # Local Granite checkpoint download (17 GB) + its venv. Never stage this.
 .gt/
+
+# Nix build output symlink
+result
