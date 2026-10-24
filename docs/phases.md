@@ -71,6 +71,22 @@ baseline is measured on the card, not assumed. Per the cross-phase rule, the
 measured numbers are kept out of the repo until P4; they are reproducible
 from the binary (below).
 
+**GPU forward pass (sm_89):** `engine/src/forward_gpu.cu` composes the
+device-verified primitives into a full model forward with two speed-critical
+structures — `gpu_weights_load` uploads the ~9.5 GB packed weights
+(`GpuWeightsLayout`: FP8 e4m3 GEMM weights + BF16 embed/norms) once and
+persists them on the device (dequant scales stay in pinned host memory;
+kernels take them by value), and `gpu_forward_range` decodes **incrementally**:
+only positions `[written, end)` run the stack, the KV history persisting in
+the per-sequence ctx caches. `granite4-infer forward/generate --gpu 1` use it;
+`--gpu 0` is the host oracle (the parity reference). Verified on gremlin-1:
+5 positions x 100352-vocab forward matches the host oracle (max |dlogit|
+1.18 BF16, top-1 equal at every position) and 32-token greedy generation is
+token-for-token identical to the host path. Decode speed is ~255 ms/position
+(~4 tps) with the one-thread-per-element GEMMs; the 50 tps target is a P4
+item (tiled GEMM + fused attention), not a P2/P3 gate (per the roofline note
+above).
+
 **Folded into the GPU host's flake:** `packages.x86_64-linux.engine-cuda`
 compiles the whole sm_89 build — kernels, the device-test binary, and the
 micro-benchmark — and `doCheck` runs every ctest suite *except* the GPU-only
