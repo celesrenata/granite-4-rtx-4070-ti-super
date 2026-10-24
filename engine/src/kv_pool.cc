@@ -323,6 +323,17 @@ std::size_t PagedKV::sequence_tokens(int seq) const {
   return seqs_[seq].filled;
 }
 
+// ---------------------------------------------------------------------------
+// Introspection
+// ---------------------------------------------------------------------------
+const std::vector<std::size_t>& PagedKV::block_table(int seq) const {
+  static const std::vector<std::size_t> empty;
+  if (seq < 0 || seq >= static_cast<int>(seqs_.size()) || !seqs_[seq].live) {
+    return empty;
+  }
+  return seqs_[seq].block_table;
+}
+
 std::size_t PagedKV::ref_count(std::size_t page_id) const {
   if (page_id >= pages_.size()) return 0;
   return pages_[page_id].ref_count;

@@ -142,6 +142,10 @@ class PagedKV {
   void clear();
 
   // Introspection (capacity / residency wiring + tests).
+  // The sequence's block table (page id per page), in allocation order.
+  // This is the input the paged_kv_compact kernel consumes (device mirror).
+  const std::vector<std::size_t>& block_table(int seq) const;
+
   const KvPoolConfig& config() const { return config_; }
   std::size_t pool_pages() const { return config_.num_pages; }
   std::size_t capacity_tokens() const { return config_.capacity_tokens(); }

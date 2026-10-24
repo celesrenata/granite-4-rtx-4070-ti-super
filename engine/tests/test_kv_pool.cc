@@ -223,6 +223,26 @@ static void test_eviction_respects_live_refs() {
   expect(pool.sequence_tokens(c) == 0, "C allocated nothing");
 }
 
+static void test_block_table() {
+  PagedKV pool(small_pool());
+  const int s = pool.create_sequence();
+  pool.reserve(s, 8, seq_tokens(100, 8));  // 2 pages
+  pool.mark_written(s, 0);
+  pool.mark_written(s, 1);
+  const auto& bt = pool.block_table(s);
+  expect(bt.size() == 2, "block_table has 2 pages");
+  expect(pool.locate(s, 0)[0] == bt[0], "token 0 on first page from table");
+  expect(pool.locate(s, 4)[0] == bt[1], "token 4 on second page from table");
+  expect(pool.locate(s, 7)[1] == 3, "token 7 offset = 3 on its page");
+  // Released sequence has empty block_table.
+  pool.release(s);
+  const auto& empty = pool.block_table(s);
+  expect(empty.empty(), "released sequence block_table empty");
+  // Out-of-range sequence has empty block_table.
+  expect(pool.block_table(-1).empty(), "negative seq block_table empty");
+  expect(pool.block_table(999).empty(), "invalid seq block_table empty");
+}
+
 static void test_release_frees() {
   PagedKV pool(small_pool());
   const int a = pool.create_sequence();
@@ -279,6 +299,7 @@ int main() {
   test_eviction_respects_live_refs();
   test_release_frees();
   test_clear_and_bounds();
+  test_block_table();
   if (g_failures) {
     std::printf("kv_pool: %d check(s) FAILED\n", g_failures);
     return 1;

@@ -31,7 +31,7 @@ if(GRANITE_ENABLE_CUDA)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo --expt-relaxed-constexpr")
   find_package(CUDAToolkit REQUIRED)
   list(APPEND GRANITE_ENGINE_SOURCES src/kernels.cu src/kernels_phase2.cu
-       src/kernels_phase3.cu)
+       src/kernels_phase3.cu src/forward_gpu.cu)
 endif()
 
 add_library(granite4 SHARED ${GRANITE_ENGINE_SOURCES})
@@ -46,6 +46,12 @@ target_include_directories(granite4_static PUBLIC src)
 
 if(GRANITE_ENABLE_CUDA)
   target_link_libraries(granite4 PRIVATE CUDA::cudart)
+  target_link_libraries(granite4_static PRIVATE CUDA::cudart)
+  # GRANITE_CUDA is the C++-side switch (see capi.cc): it enables the CUDA
+  # device probe there and the GPU forward path in infer_main.cc. The .cu
+  # files self-define it; .cc files get it here.
+  target_compile_definitions(granite4 PRIVATE GRANITE_CUDA=1)
+  target_compile_definitions(granite4_static PUBLIC GRANITE_CUDA=1)
 endif()
 
 # Host-only tests: no CUDA required.
