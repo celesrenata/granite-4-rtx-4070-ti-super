@@ -254,6 +254,12 @@ remains the only lever; further gains would need a fused attention+GEMV
 kernel or split-K reductions (both larger rewrites, see the GEMV notes in
 the forward_gpu.cu header).
 
+Tried and rejected (same-run A/B, `G4_TIMESTEP=1`, token-identical): a
+16-byte-load form of the fused SwiGLU gate/up kernel (`kernels_phase2.cu`)
+read 18.64–18.78 ms/step vs 18.21–18.31 ms for the current build. That block
+already streams two fp8 rows (8 bytes/lane) with a shared activation decode,
+so widening it doubles register pressure for no extra bytes in flight.
+
 ## Rules across phases
 
 - No kernel or code is copied from `reference/qwen3-27b-5090/`; it is kept
