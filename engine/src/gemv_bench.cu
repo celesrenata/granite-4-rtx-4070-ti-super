@@ -186,7 +186,7 @@ int main(int argc, char** argv) {
     cudaMemset(dFlush, 0, flush_elems * sizeof(float));
     cudaDeviceSynchronize();
     // Warmup.
-    granite4::row_gemm_dequant_kernel<<<s.N, 256>>>(dA, dB, 1e-3f, s.N, s.K,
+    granite4::row_gemm_dequant_kernel<<<s.N, 128>>>(dA, dB, 1e-3f, s.N, s.K,
                                                     dOut);
     cudaDeviceSynchronize();
     cudaEvent_t e0, e1;
@@ -197,7 +197,7 @@ int main(int argc, char** argv) {
       l2_flush<<<flush_elems / 256, 256>>>(dFlush, flush_elems);
       cudaDeviceSynchronize();
       cudaEventRecord(e0);
-      granite4::row_gemm_dequant_kernel<<<s.N, 256>>>(dA, dB, 1e-3f, s.N, s.K,
+      granite4::row_gemm_dequant_kernel<<<s.N, 128>>>(dA, dB, 1e-3f, s.N, s.K,
                                                        dOut);
       cudaEventRecord(e1);
       cudaEventSynchronize(e1);

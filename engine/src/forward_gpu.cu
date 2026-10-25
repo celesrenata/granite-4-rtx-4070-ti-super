@@ -204,6 +204,14 @@ __global__ void rope_at_pos_kernel(const std::uint16_t* x, const float* cos_row,
 // alignment tests keep the fast path honest if that ever changes). The
 // 4-element and scalar paths remain as fallbacks for shapes/pointers that
 // fail those tests.
+//
+// P4: 128 threads per block. With 16-byte loads a lane covers one uint4 per
+// iteration at K=4096, so 128 threads (not 256) leave no idle lanes; the
+// small-grid Q/K/V shapes gain most from the shorter ramp. Same-run A/B on
+// the full decode: 18.06-18.08 ms/step vs 18.29-18.33 ms at 256 threads
+// (token-identical).
+constexpr int kRowGemvThreads = 128;
+
 __global__ void row_gemm_dequant_kernel(const std::uint16_t* a, const std::uint8_t* B,
                                         float scale, int N, int K, std::uint16_t* out) {
   const int i = blockIdx.x;  // one output row per block
@@ -585,12 +593,12 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
       if (granite4_kernel_rmsnorm(d_hidden, attn_norm, rms_eps, 1, H, d_normed) != 0)
         return seterr("rmsnorm (attention) failed");
       gstamp(0, layer, 0);
-      row_gemm_dequant_kernel<<<Hq * d, 256>>>(d_normed, wq, sl[0], Hq * d, H, d_qf);
+      row_gemm_dequant_kernel<<<Hq * d, kRowGemvThreads>>>(d_normed, wq, sl[0], Hq * d, H, d_qf);
       G4_CUDA_CHECK(cudaGetLastError());
-      row_gemm_dequant_kernel<<<Hk * d, 256>>>(d_normed, wk, sl[1], Hk * d, H,
+      row_gemm_dequant_kernel<<<Hk * d, kRowGemvThreads>>>(d_normed, wk, sl[1], Hk * d, H,
                                                d_k_new);
       G4_CUDA_CHECK(cudaGetLastError());
-      row_gemm_dequant_kernel<<<Hk * d, 256>>>(d_normed, wv, sl[2], Hk * d, H,
+      row_gemm_dequant_kernel<<<Hk * d, kRowGemvThreads>>>(d_normed, wv, sl[2], Hk * d, H,
                                                d_v_new);
       G4_CUDA_CHECK(cudaGetLastError());
       gstamp(0, layer, 1);
@@ -642,7 +650,7 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
                                     kv_len, d_attn_out) != 0)
         return seterr("gqa_value failed");
       gstamp(1, layer, 0);
-      row_gemm_dequant_kernel<<<H, 256>>>(d_attn_out, wo, sl[3], H, H, d_o_out);
+      row_gemm_dequant_kernel<<<H, kRowGemvThreads>>>(d_attn_out, wo, sl[3], H, H, d_o_out);
       G4_CUDA_CHECK(cudaGetLastError());
       gstamp(1, layer, 1);
       add_resid_kernel<<<(H + 255) / 256, 256>>>(d_hidden, d_o_out, resid_scale,
@@ -662,7 +670,7 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
       stamp(4, layer, 1);
       stamp(5, layer, 0);
       gstamp(3, layer, 0);
-      row_gemm_dequant_kernel<<<H, 256>>>(d_gate_out, wd, sl[6], H, I,
+      row_gemm_dequant_kernel<<<H, kRowGemvThreads>>>(d_gate_out, wd, sl[6], H, I,
                                                         d_ffn_out);
       G4_CUDA_CHECK(cudaGetLastError());
       gstamp(3, layer, 1);
@@ -683,7 +691,7 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
     if (granite4_kernel_rmsnorm(d_hidden, d_final_norm, rms_eps, 1, H, d_normed) != 0)
       return seterr("final rmsnorm failed");
     gstamp(4, 0, 0);
-    row_gemm_dequant_kernel<<<V, 256>>>(
+    row_gemm_dequant_kernel<<<V, kRowGemvThreads>>>(
         d_normed, d_lm_head, lm_scale, V, H,
         d_logits + static_cast<std::size_t>(t) * V);
     G4_CUDA_CHECK(cudaGetLastError());

@@ -185,19 +185,19 @@ commands**; only numbers measured in this phase may be stated anywhere.
 | HBM read bandwidth | 631.9 GB/s | `granite4-kernel-bench`, 256 MB read, 100 iters |
 | HBM copy bandwidth | 602.7 GB/s | `granite4-kernel-bench`, 256 MB copy, 100 iters |
 | Per-token weight traffic | 8.38 GB | FP8 8B: 40 layers x 3.22 GB + lm_head 0.41 GB |
-| Decode step (GPU, steady) | **18.3 ms/step ≈ 55 tps** | 5-token prompt, greedy, `--gpu 1`, steady-state steps 27–28 of a 24-token generate with `G4_TIMESTEP=1` (one event pair per call; the `G4_TIMESTEP=2` bucket breakdown adds ~960 event records and reads ~2.4 ms slower, so use it for attribution only); same-run A/B: 18.5 ms (P4 build) → 18.3 ms (16-byte GEMV build), token-identical |
-| GEMV-only decode | 20.5 ms/token (bench) | `granite4-gemv-bench --iters 120`, L2-flushed, real per-layer shapes |
+| Decode step (GPU, steady) | **18.1 ms/step ≈ 55 tps** | 5-token prompt, greedy, `--gpu 1`, steady-state steps 27–28 of a 24-token generate with `G4_TIMESTEP=1` (one event pair per call; the `G4_TIMESTEP=2` bucket breakdown adds ~960 event records and reads ~2.4 ms slower, so use it for attribution only); same-run A/B: 18.5 ms (P4 build) → 18.3 ms (16-byte GEMV build) → 18.1 ms (128-thread launch policy), token-identical |
+| GEMV-only decode | 20.3 ms/token (bench) | `granite4-gemv-bench --iters 120`, L2-flushed, real per-layer shapes |
 | Roofline ceiling | ≈75 tps | 631.9 GB/s ÷ 8.38 GB/token |
 
 GEMV effective bandwidth by per-layer shape (`granite4-gemv-bench
---iters 120`, GB/s): q 368 / k 251 / v 255 / o 371 / gate 429 / up 425 /
-down 419 / lm_head 542.
+--iters 120`, GB/s): q 381 / k 261 / v 258 / o 374 / gate 433 / up 433 /
+down 417 / lm_head 565.
 
 Per-bucket attribution, `G4_TIMESTEP=2` (ms/step, steady step 28, current
-build; instrumented - the ~960 event records add ~2.4 ms to the 20.7 ms
-total): `attn_g=3.00 attn_a=0.97 attn_o=3.37 ffn_g=7.66 ffn_o=4.01 lm=0.73`
-plus per-GEMV: `gqkv=2.26 go=1.40 ggateup=6.92 gdown=3.74 glm=0.72`. The
-GEMV spans sum to ~15.0 ms (73% of the instrumented total); the rest is
+build; instrumented - the ~960 event records add ~2.4 ms to the 20.5 ms
+total): `attn_g=2.94 attn_a=0.97 attn_o=3.33 ffn_g=7.66 ffn_o=3.90 lm=0.69`
+plus per-GEMV: `gqkv=2.21 go=1.36 ggateup=6.92 gdown=3.63 glm=0.67`. The
+GEMV spans sum to ~14.8 ms (72% of the instrumented total); the rest is
 attention, RMSNorm/residual glue, and KV compaction.
 
 The three decisive P4 fixes (all re-verified by `granite4-kernel-test`; the
@@ -215,15 +215,18 @@ last two are additionally token-identical end-to-end):
    mid shapes from ~330 to ~400 GB/s effective; in the bucket-instrumented
    same-run A/B the step went 24.5 ms → 21.7 ms (−2.75 ms,
    token-identical output).
-3. **16-byte (uint4) GEMV loads** — each lane loads 16 fp8 bytes per
-   iteration instead of one uint32 of 4, so the kernel issues 4x fewer global
-   loads and each lane has 4x the bytes in flight; effective read bandwidth
-   rose from 381 to 409 GB/s per token (q 330→368, k 234→251, gate
-   400→429, lm_head 517→542 GB/s) and the GEMV-only bench from 22.1 to
-   20.5 ms/token. The bf16 outputs are bit-identical to the uint32 form on
-   every decode shape (exhaustive per-shape comparison), and a same-run A/B
-   (uninstrumented step, `G4_TIMESTEP=1`) went 18.5 ms → 18.3 ms with a
-   token-identical 24-token generate.
+3. **16-byte (uint4) GEMV loads + 128-thread blocks** — each lane loads 16
+   fp8 bytes per iteration instead of one uint32 of 4, so the kernel issues
+   4x fewer global loads and each lane has 4x the bytes in flight; effective
+   read bandwidth rose from 381 to 413 GB/s per token (q 330→381, k
+   234→261, gate 400→433, lm_head 517→565 GB/s) and the GEMV-only bench
+   from 22.1 to 20.3 ms/token. With 16-byte loads a lane covers one uint4
+   per iteration at K=4096, so 128 threads (not 256) leave no idle lanes;
+   the small-grid Q/K/V shapes gain most. The bf16 outputs are bit-identical
+   to the uint32 form on every decode shape (exhaustive per-shape
+   comparison), and a same-run A/B (uninstrumented step, `G4_TIMESTEP=1`)
+   went 18.5 ms → 18.3 ms (16-byte loads) → 18.1 ms (128 threads), all
+   token-identical 24-token generates.
 
 Parity: the GPU forward matches the host oracle within bf16 rounding
 (max |Δlogit| ≈ 1.1 bf16, same as P3); greedy `generate --gpu 1` (24
@@ -246,19 +249,20 @@ G4_TIMESTEP=2 ./result/bin/granite4-infer generate \
   --max-tokens 24 --gpu 1        # per-bucket ms/step on stderr (instrumented)
 ```
 
-Remaining headroom (optional): the isolated GEMV bench reports ~409 GB/s
+Remaining headroom (optional): the isolated GEMV bench reports ~413 GB/s
 aggregate (65% of the 631.9 GB/s roofline; the L2-flush writeback inflates
 its per-call times relative to the in-context run). The in-context step is
-18.3 ms (≈55 tps) against the ≈75 tps measured ceiling, so the GEMV path
+18.1 ms (≈55 tps) against the ≈75 tps measured ceiling, so the GEMV path
 remains the only lever; further gains would need a fused attention+GEMV
 kernel or split-K reductions (both larger rewrites, see the GEMV notes in
 the forward_gpu.cu header).
 
 Tried and rejected (same-run A/B, `G4_TIMESTEP=1`, token-identical): a
 16-byte-load form of the fused SwiGLU gate/up kernel (`kernels_phase2.cu`)
-read 18.64–18.78 ms/step vs 18.21–18.31 ms for the current build. That block
-already streams two fp8 rows (8 bytes/lane) with a shared activation decode,
-so widening it doubles register pressure for no extra bytes in flight.
+read 18.64–18.78 ms/step vs 18.29–18.33 ms for the 256-thread baseline it
+was compared against. That block already streams two fp8 rows (8 bytes/lane)
+with a shared activation decode, so widening it doubles register pressure
+for no extra bytes in flight.
 
 ## Rules across phases
 
