@@ -40,25 +40,22 @@ __device__ __forceinline__ float bf16_to_f32(std::uint16_t bits) {
   return f;
 }
 
-// Exact e4m3 decode (matches checkpoint.cc fp8_e4m3_to_bf16, device-side).
+// Exact e4m3 decode, branchless (bit-identical to the arithmetic decode on
+// all 256 codepoints - matches checkpoint.cc fp8_e4m3_to_bf16, device-side).
+// See forward_gpu.cu for the bit-mapping comment.
 __device__ __forceinline__ float fp8_to_f32(std::uint8_t x) {
-  const bool neg = (x & 0x80u) != 0;
-  const unsigned e = (x >> 3) & 0xFu;
-  const unsigned m = x & 0x7u;
-  if (e == 0) {
-    // Subnormal: m * 2^-9 (m == 0 is the zero values).
-    const float v = static_cast<float>(m) * std::ldexp(1.0f, -9);
-    return neg ? -v : v;
-  }
-  if (e == 15) {
-    // Top exponent: (1 + m/8) * 2^8; m == 7 is sNaN (map to 0.0; upstream
-    // saturation never produces it for real weights).
-    if (m == 7) return 0.0f;
-    const float v = (1.0f + static_cast<float>(m) / 8.0f) * std::ldexp(1.0f, 8);
-    return neg ? -v : v;
-  }
-  const float v = (1.0f + static_cast<float>(m) / 8.0f) * std::ldexp(1.0f, static_cast<int>(e) - 7);
-  return neg ? -v : v;
+  const std::uint32_t s = static_cast<std::uint32_t>(x & 0x80u) << 24;
+  const std::uint32_t y = x & 0x7Fu;
+  const std::uint32_t e = y >> 3;
+  const std::uint32_t m = y & 7u;
+  std::uint32_t bits = ((120u + e) << 23) | (m << 20);
+  const std::uint32_t top = (m == 7u) ? 0u : (0x43800000u | (m << 20));
+  bits = (e == 15u) ? top : bits;
+  bits = (e == 0u) ? __float_as_uint(static_cast<float>(m) * 0.001953125f)
+                   : bits;  // 0.001953125f = 2^-9
+  // sNaN (0x7f/0xff): the arithmetic decode returned +0.0 (sign discarded),
+  // so drop the sign here too to stay bit-identical.
+  return ((e == 15u && m == 7u)) ? 0.0f : __uint_as_float(bits | s);
 }
 
 }  // namespace
@@ -71,18 +68,37 @@ __device__ __forceinline__ float fp8_to_f32(std::uint8_t x) {
 __global__ void rmsnorm_kernel(const std::uint16_t* x, const std::uint16_t* w,
                                float eps, int rows, int cols,
                                std::uint16_t* out) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= rows * cols) return;
-  const int row = idx / cols;
-  const int col = idx % cols;
-  const int base = row * cols;
-  double s = 0.0;
-  for (int i = 0; i < cols; ++i) {
-    const float v = bf16_to_f32(x[base + i]);
-    s += static_cast<double>(v) * v;
+  // One block per row: the row is read exactly once (O(cols)), not once per
+  // element. The previous one-thread-per-element form had every thread re-read
+  // the whole row for the sum-of-squares (O(cols^2)); for the decode row
+  // (cols=4096) that is ~33 MB of redundant traffic per call, and it is the
+  // dominant cost of the forward.
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int t = threadIdx.x;
+  const int nt = blockDim.x;
+  const std::size_t base = static_cast<std::size_t>(row) * cols;
+  const std::uint16_t* const xr = x + base;
+  // Each thread owns a strided slice; accumulate its sum-of-squares in
+  // double (matching the host oracle's double accumulation, so the reduced
+  // result rounds to the same bf16).
+  double ps = 0.0;
+  for (int c = t; c < cols; c += nt) {
+    const float v = bf16_to_f32(xr[c]);
+    ps += static_cast<double>(v) * v;
   }
-  const float r = 1.0f / std::sqrt(static_cast<float>(s / cols) + eps);
-  out[idx] = f32_to_bf16(bf16_to_f32(x[base + col]) * r * bf16_to_f32(w[col]));
+  __shared__ double red[320];  // blockDim must be <= 320 (launcher).
+  red[t] = ps;
+  __syncthreads();
+  if (t == 0) {
+    double s = 0.0;
+    for (int i = 0; i < nt; ++i) s += red[i];
+    red[0] = s;
+  }
+  __syncthreads();
+  const float r = 1.0f / std::sqrt(static_cast<float>(red[0] / cols) + eps);
+  for (int c = t; c < cols; c += nt)
+    out[base + c] = f32_to_bf16(bf16_to_f32(xr[c]) * r * bf16_to_f32(w[c]));
 }
 
 // ---------------------------------------------------------------------------
@@ -199,16 +215,66 @@ __global__ void gqa_value_kernel(const std::uint16_t* p, const std::uint16_t* v,
 __global__ void silu_gate_up_kernel(const std::uint8_t* Wg, const std::uint8_t* Wu,
                                     const std::uint16_t* x, float sg, float su,
                                     int N, int K, std::uint16_t* out) {
-  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  const int r = blockIdx.x;  // one output row per block
   if (r >= N) return;
+  const int t = threadIdx.x;
+  const int nt = blockDim.x;
+  const std::uint8_t* const rg = Wg + static_cast<std::size_t>(r) * K;
+  const std::uint8_t* const ru = Wu + static_cast<std::size_t>(r) * K;
   float g = 0.0f, u = 0.0f;
-  for (int i = 0; i < K; ++i) {
-    const float xv = bf16_to_f32(x[i]);
-    g += fp8_to_f32(Wg[r * K + i]) * xv;
-    u += fp8_to_f32(Wu[r * K + i]) * xv;
+  if ((K & 3) == 0) {
+    // 4 k-elements per iteration (2x bytes in flight vs the scalar form):
+    // 4 fp8 per row per matrix + 4 bf16 of the shared activation row.
+    const std::uint32_t* rg4 = reinterpret_cast<const std::uint32_t*>(rg);
+    const std::uint32_t* ru4 = reinterpret_cast<const std::uint32_t*>(ru);
+    const std::uint32_t* x4 = reinterpret_cast<const std::uint32_t*>(x);
+    const int K4 = K >> 2;
+    for (int k4 = t; k4 < K4; k4 += nt) {
+      const std::uint32_t bg = rg4[k4];
+      const std::uint32_t bu = ru4[k4];
+      const std::uint32_t xa = x4[2 * k4];
+      const std::uint32_t xb = x4[2 * k4 + 1];
+      const float x0 = bf16_to_f32(static_cast<std::uint16_t>(xa & 0xffffu));
+      const float x1 = bf16_to_f32(static_cast<std::uint16_t>((xa >> 16) & 0xffffu));
+      const float x2 = bf16_to_f32(static_cast<std::uint16_t>(xb & 0xffffu));
+      const float x3 = bf16_to_f32(static_cast<std::uint16_t>((xb >> 16) & 0xffffu));
+      g += fp8_to_f32(static_cast<std::uint8_t>(bg & 0xffu)) * x0 +
+           fp8_to_f32(static_cast<std::uint8_t>((bg >> 8) & 0xffu)) * x1 +
+           fp8_to_f32(static_cast<std::uint8_t>((bg >> 16) & 0xffu)) * x2 +
+           fp8_to_f32(static_cast<std::uint8_t>((bg >> 24) & 0xffu)) * x3;
+      u += fp8_to_f32(static_cast<std::uint8_t>(bu & 0xffu)) * x0 +
+           fp8_to_f32(static_cast<std::uint8_t>((bu >> 8) & 0xffu)) * x1 +
+           fp8_to_f32(static_cast<std::uint8_t>((bu >> 16) & 0xffu)) * x2 +
+           fp8_to_f32(static_cast<std::uint8_t>((bu >> 24) & 0xffu)) * x3;
+    }
+  } else {
+    for (int i = t; i < K; i += nt) {
+      const float xv = bf16_to_f32(x[i]);
+      g += fp8_to_f32(rg[i]) * xv;
+      u += fp8_to_f32(ru[i]) * xv;
+    }
   }
-  const float sig = 1.0f / (1.0f + std::exp(-(sg * g)));
-  out[r] = f32_to_bf16(sg * g * sig * (su * u));
+  // Block reduce of both partials (warp shuffles + shared tree).
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    g += __shfl_down_sync(0xffffffffu, g, off);
+    u += __shfl_down_sync(0xffffffffu, u, off);
+  }
+  __shared__ float rg_[32], ru_[32];
+  if ((t & 31) == 0) {
+    rg_[t >> 5] = g;
+    ru_[t >> 5] = u;
+  }
+  __syncthreads();
+  if (t == 0) {
+    float s = rg_[0], v = ru_[0];
+    for (int j = 1; j < (nt >> 5); ++j) {
+      s += rg_[j];
+      v += ru_[j];
+    }
+    const float sig = 1.0f / (1.0f + std::exp(-(sg * s)));
+    out[r] = f32_to_bf16(sg * s * sig * (su * v));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +352,14 @@ __global__ void sample_top_p_kernel(const std::uint16_t* p, float nucleus,
   }
 }
 
+// Verification helper: decode all 256 e4m3 codepoints to f32 (one per
+// thread). The exhaustive decode test compares these against the arithmetic
+// reference (checkpoint.h fp8_e4m3_to_bf16) to prove the branchless
+// fp8_to_f32 is bit-exact.
+__global__ void fp8_decode_all_kernel(float* out) {
+  out[threadIdx.x] = fp8_to_f32(static_cast<std::uint8_t>(threadIdx.x));
+}
+
 }  // namespace granite4
 
 // ---------------------------------------------------------------------------
@@ -305,6 +379,17 @@ __global__ void sample_top_p_kernel(const std::uint16_t* p, float nucleus,
 
 extern "C" {
 
+int granite4_fp8_decode_all(float** d_out) {
+  // d_out must hold 256 floats.
+  float* d_out_p = nullptr;
+  G4_CUDA_CHECK(cudaMalloc(&d_out_p, 256 * sizeof(float)));
+  if (d_out_p == nullptr) return -1;
+  granite4::fp8_decode_all_kernel<<<1, 256>>>(d_out_p);
+  G4_CUDA_CHECK(cudaGetLastError());
+  *d_out = d_out_p;
+  return 0;
+}
+
 int granite4_rope_tables_build(double theta, int head_dim, int max_pos,
                                float** d_cos, float** d_sin) {
   std::vector<float> h_cos, h_sin;
@@ -319,8 +404,8 @@ int granite4_rope_tables_build(double theta, int head_dim, int max_pos,
 
 int granite4_kernel_rmsnorm(const std::uint16_t* d_x, const std::uint16_t* d_w,
                             float eps, int rows, int cols, std::uint16_t* d_out) {
-  granite4::rmsnorm_kernel<<<(rows * cols + 255) / 256, 256>>>(d_x, d_w, eps,
-                                                              rows, cols, d_out);
+  // One block per row (block-per-row reduction; blockDim <= 320).
+  granite4::rmsnorm_kernel<<<rows, 256>>>(d_x, d_w, eps, rows, cols, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
@@ -370,8 +455,8 @@ int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out) {
-  granite4::silu_gate_up_kernel<<<(N + 255) / 256, 256>>>(
-      d_wg, d_wu, d_x, scale_g, scale_u, N, K, d_out);
+  granite4::silu_gate_up_kernel<<<N, 256>>>(d_wg, d_wu, d_x, scale_g, scale_u, N, K,
+                                            d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }

@@ -101,6 +101,11 @@ if(GRANITE_ENABLE_CUDA)
   # card's real bandwidth rather than assuming the spec.
   add_executable(granite4-kernel-bench src/kernels_bench.cu)
   target_link_libraries(granite4-kernel-bench PRIVATE CUDA::cudart)
+
+  # P4: GEMV micro-benchmark - achieved bandwidth of the decode GEMM at the
+  # real model shapes, isolates the per-token weight-streaming cost.
+  add_executable(granite4-gemv-bench src/gemv_bench.cu)
+  target_link_libraries(granite4-gemv-bench PRIVATE CUDA::cudart)
 endif()
 
 # Phase 1 checkpoint CLI (host-only: verify + FP8 export). Linked statically

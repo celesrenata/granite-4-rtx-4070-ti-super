@@ -30,22 +30,22 @@ __device__ __forceinline__ std::uint16_t f32_to_bf16(float f) {
   return static_cast<std::uint16_t>(u);
 }
 
-// Exact e4m3 decode to float (matches the P2 device helper); f32_to_bf16 is
-// exact on it, so the composed decode equals fp8->bf16 bit-for-bit.
+// Exact e4m3 decode, branchless (bit-identical to the arithmetic decode on
+// all 256 codepoints; f32_to_bf16 is still exact on it, so the composed
+// decode equals fp8->bf16 bit-for-bit). See forward_gpu.cu for the mapping.
 __device__ __forceinline__ float fp8_to_f32(std::uint8_t x) {
-  const bool neg = (x & 0x80u) != 0;
-  const unsigned e = (x >> 3) & 0xFu;
-  const unsigned m = x & 0x7u;
-  if (e == 0) return neg ? -static_cast<float>(m) * std::ldexp(1.0f, -9)
-                        : static_cast<float>(m) * std::ldexp(1.0f, -9);
-  if (e == 15) {
-    if (m == 7) return 0.0f;  // sNaN -> 0
-    const float v = (1.0f + static_cast<float>(m) / 8.0f) * std::ldexp(1.0f, 8);
-    return neg ? -v : v;
-  }
-  const float v = (1.0f + static_cast<float>(m) / 8.0f) *
-                  std::ldexp(1.0f, static_cast<int>(e) - 7);
-  return neg ? -v : v;
+  const std::uint32_t s = static_cast<std::uint32_t>(x & 0x80u) << 24;
+  const std::uint32_t y = x & 0x7Fu;
+  const std::uint32_t e = y >> 3;
+  const std::uint32_t m = y & 7u;
+  std::uint32_t bits = ((120u + e) << 23) | (m << 20);
+  const std::uint32_t top = (m == 7u) ? 0u : (0x43800000u | (m << 20));
+  bits = (e == 15u) ? top : bits;
+  bits = (e == 0u) ? __float_as_uint(static_cast<float>(m) * 0.001953125f)
+                   : bits;  // 0.001953125f = 2^-9
+  // sNaN (0x7f/0xff): the arithmetic decode returned +0.0 (sign discarded),
+  // so drop the sign here too to stay bit-identical.
+  return ((e == 15u && m == 7u)) ? 0.0f : __uint_as_float(bits | s);
 }
 
 // out[head, token, dim] <- decode(paged[page][token_local][layer][k|v][head][dim])

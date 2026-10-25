@@ -37,6 +37,7 @@
 //                             device twin of the host's exp() math
 //
 // Compiled only with GRANITE_ENABLE_CUDA=ON, targets sm_89.
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -70,26 +71,34 @@ __device__ __forceinline__ float bf16_to_f32(std::uint16_t bits) {
   return f;
 }
 
-// Exact e4m3 decode (matches kernels_phase2.cu).
+// Exact e4m3 decode, branchless (matches the arithmetic decode bit-for-bit on
+// all 256 codepoints - verified by tests/test_kernels.cu against the
+// fp8_to_f32 reference table). The branchy ldexp form cost 14-65% of GEMV
+// throughput on sm_89 (measured per shape: small kernels ~14%, lm_head
+// ~65% - divergent e/m predication + ldexp latency per element), so this maps the 3 mantissa bits and the biased exponent straight
+// into f32 bits:
+//   sign  : bit 7 -> f32 bit 31 (x & 0x80) << 24.
+//   1<=e<=14: value (1+m/8)*2^(e-7) -> f32 exp field 120+e, mantissa m ->
+//             ((120+e) << 23) | (m << 20).
+//   e == 15: value (1+m/8)*2^8 -> 0x43800000 | (m << 20); m == 7 is sNaN
+//            (map to 0.0, exactly as the arithmetic form did - upstream
+//            saturation never produces it for real weights).
+//   e == 0: subnormal m * 2^-9 - all 8 values are exact in f32 (0 and
+//           2^-9, 2^-8, ... 7*2^-9).
 __device__ __forceinline__ float fp8_to_f32(std::uint8_t x) {
-  const bool neg = (x & 0x80u) != 0;
-  const unsigned e = (x >> 3) & 0xFu;
-  const unsigned m = x & 0x7u;
-  if (e == 0) {
-    // Subnormal: m * 2^-9 (m == 0 is the zero values).
-    const float v = static_cast<float>(m) * std::ldexp(1.0f, -9);
-    return neg ? -v : v;
-  }
-  if (e == 15) {
-    // Top exponent: (1 + m/8) * 2^8; m == 7 is sNaN (map to 0.0; upstream
-    // saturation never produces it for real weights).
-    if (m == 7) return 0.0f;
-    const float v = (1.0f + static_cast<float>(m) / 8.0f) * std::ldexp(1.0f, 8);
-    return neg ? -v : v;
-  }
-  const float v = (1.0f + static_cast<float>(m) / 8.0f) *
-                  std::ldexp(1.0f, static_cast<int>(e) - 7);
-  return neg ? -v : v;
+  const std::uint32_t s = static_cast<std::uint32_t>(x & 0x80u) << 24;
+  const std::uint32_t y = x & 0x7Fu;
+  const std::uint32_t e = y >> 3;
+  const std::uint32_t m = y & 7u;
+  std::uint32_t bits = ((120u + e) << 23) | (m << 20);
+  const std::uint32_t top =
+      (m == 7u) ? 0u : (0x43800000u | (m << 20));
+  bits = (e == 15u) ? top : bits;
+  bits = (e == 0u) ? __float_as_uint(static_cast<float>(m) * 0.001953125f)
+                   : bits;  // 0.001953125f = 2^-9
+  // sNaN (0x7f/0xff): the arithmetic decode returned +0.0 (sign discarded),
+  // so drop the sign here too to stay bit-identical.
+  return ((e == 15u && m == 7u)) ? 0.0f : __uint_as_float(bits | s);
 }
 
 // ---------------------------------------------------------------------------
@@ -165,17 +174,69 @@ __global__ void rope_at_pos_kernel(const std::uint16_t* x, const float* cos_row,
   out[idx] = f32_to_bf16(y);
 }
 
-// out[i] = scale * sum_k a[k] * fp8_to_f32(B[i, k]).
-// M=1 form of the P2 gemm_dequant kernel: identical loop order and float
-// accumulation, so results are row-for-row identical.
+// out[i] = scale * sum_k a[k] * fp8_to_f32(B[i, k])  (M=1 GEMV: a is one row).
+//
+// Coalesced block-per-row GEMV. The previous form (one thread per output row,
+// each reading its whole K-byte weight row) made consecutive threads read
+// addresses K bytes apart, so a warp fetched 32 separate 32-byte cache lines
+// while using only 32 bytes - roughly 1/32 of the achievable bandwidth. At
+// this shape that pinned decode at ~3.9 tps against a 76 tps roofline
+// (kernels_bench measured 635 GB/s). Here one block computes one row of out:
+// its threads stride over K so consecutive lanes read consecutive bytes
+// (fully coalesced), every byte of B is read exactly once, and the per-row
+// partials are combined with a warp-shuffle + shared reduce. Same per-k
+// fp8_to_f32 * bf16_to_f32 float arithmetic as the P2 reference (only the
+// summation order differs, within float rounding); parity vs the host oracle
+// is unchanged.
 __global__ void row_gemm_dequant_kernel(const std::uint16_t* a, const std::uint8_t* B,
                                         float scale, int N, int K, std::uint16_t* out) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int i = blockIdx.x;  // one output row per block
   if (i >= N) return;
+  const int t = threadIdx.x;
+  const int nt = blockDim.x;
+  const std::uint8_t* const row = B + static_cast<std::size_t>(i) * K;
   float acc = 0.0f;
-  for (int k = 0; k < K; ++k)
-    acc += fp8_to_f32(B[i * K + k]) * bf16_to_f32(a[k]);
-  out[i] = f32_to_bf16(scale * acc);
+  // Four k-elements per iteration: one uint32 of 4 fp8 bytes and two uint32
+  // of 4 bf16 per lane, so each lane's memory stream moves 2x the bytes in
+  // flight versus the scalar form (which capped the card at ~300 GB/s
+  // against the 635 GB/s roofline). The vector path needs K 4-aligned (the
+  // row stride is K bytes); all decode shapes have K in {4096, 12800}.
+  if ((K & 3) == 0) {
+    const std::uint32_t* row4 =
+        reinterpret_cast<const std::uint32_t*>(row);
+    const std::uint32_t* a4 = reinterpret_cast<const std::uint32_t*>(a);
+    const int K4 = K >> 2;
+    for (int k4 = t; k4 < K4; k4 += nt) {
+      const std::uint32_t b = row4[k4];
+      const std::uint32_t x0 = a4[2 * k4];
+      const std::uint32_t x1 = a4[2 * k4 + 1];
+      // Little-endian: byte j of b = element 4*k4+j.
+      const float b0 = fp8_to_f32(static_cast<std::uint8_t>(b & 0xffu));
+      const float b1 = fp8_to_f32(static_cast<std::uint8_t>((b >> 8) & 0xffu));
+      const float b2 = fp8_to_f32(static_cast<std::uint8_t>((b >> 16) & 0xffu));
+      const float b3 = fp8_to_f32(static_cast<std::uint8_t>((b >> 24) & 0xffu));
+      const std::uint16_t a0 = static_cast<std::uint16_t>(x0 & 0xffffu);
+      const std::uint16_t a1 = static_cast<std::uint16_t>((x0 >> 16) & 0xffffu);
+      const std::uint16_t a2 = static_cast<std::uint16_t>(x1 & 0xffffu);
+      const std::uint16_t a3 = static_cast<std::uint16_t>((x1 >> 16) & 0xffffu);
+      acc += b0 * bf16_to_f32(a0) + b1 * bf16_to_f32(a1) +
+             b2 * bf16_to_f32(a2) + b3 * bf16_to_f32(a3);
+    }
+  } else {
+    for (int k = t; k < K; k += nt)
+      acc += fp8_to_f32(row[k]) * bf16_to_f32(a[k]);
+  }
+  // Reduce the block: warp shuffle, then a small shared tree over warps.
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  __shared__ float red[32];
+  if ((t & 31) == 0) red[t >> 5] = acc;
+  __syncthreads();
+  if (t == 0) {
+    float s = red[0];
+    for (int j = 1; j < (nt >> 5); ++j) s += red[j];
+    out[i] = f32_to_bf16(scale * s);
+  }
 }
 
 // P2 device-verified primitives (kernels_phase2.cu; no header, declared the
@@ -375,14 +436,55 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
   // prefix (KV appends are idempotent), so start = 0 then.
   const int start = (end > g->written) ? g->written : 0;
 
-  // Optional per-call GPU timing (G4_TIMESTEP=1): prints the device-side
-  // duration of this call to stderr.
-  const bool timed = std::getenv("G4_TIMESTEP") != nullptr;
+  // Optional per-call GPU timing: G4_TIMESTEP=1 prints the device-side
+  // duration of this call; G4_TIMESTEP=2 additionally prints a per-bucket
+  // breakdown (embed / attention / FFN / lm_head, summed over layers).
+  const char* const ts_env = std::getenv("G4_TIMESTEP");
+  const bool timed = ts_env != nullptr;
+  const bool bucket = timed && ts_env[0] == '2';
   if (timed) {
     if (cudaEventCreate(&ev0) != cudaSuccess ||
         cudaEventCreate(&ev1) != cudaSuccess)
       return seterr("cudaEventCreate failed");
     G4_CUDA_CHECK(cudaEventRecord(ev0));
+  }
+
+  // Per-bucket events (G4_TIMESTEP=2): [bucket][layer] start/end pairs.
+  constexpr int kBuckets = 7;  // 0 embed, 1 attn-gemm, 2 attn-attn, 3 attn-out,
+                               // 4 ffn-gemm, 5 ffn-out, 6 lm_head
+  constexpr int kMaxLayers = 64;
+  std::vector<cudaEvent_t> bevs;
+  auto stamp = [&](int b, int i, int which) {
+    if (!bucket) return;
+    cudaError_t e = cudaEventRecord(
+        bevs[(b * kMaxLayers + i) * 2 + which]);
+    if (e != cudaSuccess)
+      std::fprintf(stderr, "granite4: stamp cudaEventRecord: %s\n",
+                   cudaGetErrorString(e));
+  };
+  if (bucket) {
+    bevs.resize(2 * kBuckets * kMaxLayers);
+    for (auto& e : bevs)
+      if (cudaEventCreate(&e) != cudaSuccess)
+        return seterr("cudaEventCreate failed");
+  }
+
+  // Per-GEMV in-context timing (G4_TIMESTEP=3): [gemv][layer] start/end.
+  // kGemvs: 0 qkv, 1 o, 2 gateup, 3 down, 4 lm_head.
+  constexpr int kGemvs = 5;
+  std::vector<cudaEvent_t> gevs;
+  auto gstamp = [&](int g, int i, int which) {
+    if (!bucket) return;
+    cudaError_t e = cudaEventRecord(gevs[(g * kMaxLayers + i) * 2 + which]);
+    if (e != cudaSuccess)
+      std::fprintf(stderr, "granite4: gstamp cudaEventRecord: %s\n",
+                   cudaGetErrorString(e));
+  };
+  if (bucket) {
+    gevs.resize(2 * kGemvs * kMaxLayers);
+    for (auto& e : gevs)
+      if (cudaEventCreate(&e) != cudaSuccess)
+        return seterr("cudaEventCreate failed");
   }
 
   std::uint16_t* const d_hidden = g->scratch;
@@ -404,11 +506,20 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
   const std::uint16_t* const d_embed_tbl =
       reinterpret_cast<const std::uint16_t*>(g->weights);
 
+  // Host wall-clock of the whole launch+sync span (G4_TIMESTEP=2): the
+  // decisive launch-bound vs GPU-bound test. If wall >> GPU timeline, the
+  // ~680 small kernel launches per step are stalling on the CPU, not the
+  // card - the fix is then CUDA graphs, not a faster kernel.
+  std::chrono::steady_clock::time_point wall_start;
+  if (bucket) wall_start = std::chrono::steady_clock::now();
+
   for (int t = start; t < end; ++t) {
     // ---------- embedding lookup (token id from device memory) ----------
+    stamp(0, 0, 0);
     embed_kernel<<<(H + 255) / 256, 256>>>(d_tokens, d_embed_tbl, t, emb_scale,
                                            d_hidden, H);
     G4_CUDA_CHECK(cudaGetLastError());
+    stamp(0, 0, 1);
 
     for (int layer = 0; layer < L; ++layer) {
       const std::size_t lay_off =
@@ -432,18 +543,22 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
       // ---- attention block (causal over positions 0..t) ----
       // P2 public launchers (device-verified in test_kernels.cu; same
       // arithmetic as the host oracle).
+      stamp(1, layer, 0);
       if (granite4_kernel_rmsnorm(d_hidden, attn_norm, rms_eps, 1, H, d_normed) != 0)
         return seterr("rmsnorm (attention) failed");
-      row_gemm_dequant_kernel<<<(Hq * d + 255) / 256, 256>>>(d_normed, wq, sl[0],
-                                                             Hq * d, H, d_qf);
+      gstamp(0, layer, 0);
+      row_gemm_dequant_kernel<<<Hq * d, 256>>>(d_normed, wq, sl[0], Hq * d, H, d_qf);
       G4_CUDA_CHECK(cudaGetLastError());
-      row_gemm_dequant_kernel<<<(Hk * d + 255) / 256, 256>>>(d_normed, wk, sl[1],
-                                                             Hk * d, H, d_k_new);
+      row_gemm_dequant_kernel<<<Hk * d, 256>>>(d_normed, wk, sl[1], Hk * d, H,
+                                               d_k_new);
       G4_CUDA_CHECK(cudaGetLastError());
-      row_gemm_dequant_kernel<<<(Hk * d + 255) / 256, 256>>>(d_normed, wv, sl[2],
-                                                             Hk * d, H, d_v_new);
+      row_gemm_dequant_kernel<<<Hk * d, 256>>>(d_normed, wv, sl[2], Hk * d, H,
+                                               d_v_new);
       G4_CUDA_CHECK(cudaGetLastError());
+      gstamp(0, layer, 1);
 
+      stamp(1, layer, 1);
+      stamp(2, layer, 0);
       const float* const cos_t = g->cos_tbl + static_cast<std::size_t>(t) * half;
       const float* const sin_t = g->sin_tbl + static_cast<std::size_t>(t) * half;
       rope_at_pos_kernel<<<(Hq * d + 255) / 256, 256>>>(d_qf, cos_t, sin_t, Hq, d,
@@ -473,6 +588,8 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
                                                        max_pos, Hk, d);
       G4_CUDA_CHECK(cudaGetLastError());
 
+      stamp(2, layer, 1);
+      stamp(3, layer, 0);
       if (granite4_kernel_gqa_logits(d_qf_rot, g->compact_k, att_scale, Hq, Hk, d,
                                      kv_len, g->logits_scratch) != 0)
         return seterr("gqa_logits failed");
@@ -486,26 +603,37 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
       if (granite4_kernel_gqa_value(g->probs_scratch, g->compact_v, Hq, Hk, d,
                                     kv_len, d_attn_out) != 0)
         return seterr("gqa_value failed");
-      row_gemm_dequant_kernel<<<(H + 255) / 256, 256>>>(d_attn_out, wo, sl[3], H, H,
-                                                        d_o_out);
+      gstamp(1, layer, 0);
+      row_gemm_dequant_kernel<<<H, 256>>>(d_attn_out, wo, sl[3], H, H, d_o_out);
       G4_CUDA_CHECK(cudaGetLastError());
+      gstamp(1, layer, 1);
       add_resid_kernel<<<(H + 255) / 256, 256>>>(d_hidden, d_o_out, resid_scale,
                                                  d_hidden, H);
       G4_CUDA_CHECK(cudaGetLastError());
 
+      stamp(3, layer, 1);
       // ---- FFN block ----
+      stamp(4, layer, 0);
       if (granite4_kernel_rmsnorm(d_hidden, ffn_norm, rms_eps, 1, H, d_normed2) != 0)
         return seterr("rmsnorm (ffn) failed");
+      gstamp(2, layer, 0);
       if (granite4_kernel_silu_gate_up(wg, wu, d_normed2, sl[4], sl[5], I, H,
                                        d_gate_out) != 0)
         return seterr("silu_gate_up failed");
-      row_gemm_dequant_kernel<<<(H + 255) / 256, 256>>>(d_gate_out, wd, sl[6], H, I,
+      gstamp(2, layer, 1);
+      stamp(4, layer, 1);
+      stamp(5, layer, 0);
+      gstamp(3, layer, 0);
+      row_gemm_dequant_kernel<<<H, 256>>>(d_gate_out, wd, sl[6], H, I,
                                                         d_ffn_out);
       G4_CUDA_CHECK(cudaGetLastError());
+      gstamp(3, layer, 1);
       add_resid_kernel<<<(H + 255) / 256, 256>>>(d_hidden, d_ffn_out, resid_scale,
                                                  d_hidden, H);
       G4_CUDA_CHECK(cudaGetLastError());
+      stamp(5, layer, 1);
     }
+    stamp(6, 0, 0);
 
     // ---------- final RMSNorm + lm_head ----------
     const std::uint16_t* const d_final_norm =
@@ -516,10 +644,13 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
     const float lm_scale = g->scales[L * kGpuScalesPerLayer] * logits_scale;
     if (granite4_kernel_rmsnorm(d_hidden, d_final_norm, rms_eps, 1, H, d_normed) != 0)
       return seterr("final rmsnorm failed");
-    row_gemm_dequant_kernel<<<(V + 255) / 256, 256>>>(
+    gstamp(4, 0, 0);
+    row_gemm_dequant_kernel<<<V, 256>>>(
         d_normed, d_lm_head, lm_scale, V, H,
         d_logits + static_cast<std::size_t>(t) * V);
     G4_CUDA_CHECK(cudaGetLastError());
+    gstamp(4, 0, 1);
+    stamp(6, 0, 1);
   }
 
   if (timed) {
@@ -529,8 +660,48 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
     cudaEventElapsedTime(&ms, ev0, ev1);
     cudaEventDestroy(ev0);
     cudaEventDestroy(ev1);
-    std::fprintf(stderr, "G4_TIMESTEP end=%d start=%d gpu_ms=%.2f\n", end,
-                 start, ms);
+    if (bucket) {
+      const double wall_ms =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - wall_start)
+              .count();
+      std::fprintf(stderr,
+                   "G4_BUCKET end=%d start=%d gpu=%.2fms wall=%.2fms ", end,
+                   start, ms, wall_ms);
+      const char* names[kBuckets] = {"embed", "attn_g", "attn_a", "attn_o",
+                                     "ffn_g", "ffn_o", "lm"};
+      std::fprintf(stderr, "total=%.2fms ", ms);
+      for (int b = 0; b < kBuckets; ++b) {
+        float sum = 0.0f;
+        const int n = (b == 0 || b == 6) ? 1 : L;
+        for (int i = 0; i < n; ++i) {
+          float d = 0.0f;
+          G4_CUDA_CHECK(cudaEventElapsedTime(&d,
+                                             bevs[(b * kMaxLayers + i) * 2],
+                                             bevs[(b * kMaxLayers + i) * 2 + 1]));
+          sum += d;
+        }
+        std::fprintf(stderr, "%s=%.2f ", names[b], sum);
+      }
+      const char* gnames[kGemvs] = {"qkv", "o", "gateup", "down", "lm"};
+      for (int gv = 0; gv < kGemvs; ++gv) {
+        float sum = 0.0f;
+        const int n = (gv == 4) ? 1 : L;
+        for (int i = 0; i < n; ++i) {
+          float d = 0.0f;
+          G4_CUDA_CHECK(cudaEventElapsedTime(&d,
+                                             gevs[(gv * kMaxLayers + i) * 2],
+                                             gevs[(gv * kMaxLayers + i) * 2 + 1]));
+          sum += d;
+        }
+        std::fprintf(stderr, "g%s=%.2f ", gnames[gv], sum);
+      }
+      std::fprintf(stderr, "\n");
+      for (auto& e : gevs) cudaEventDestroy(e);
+    } else {
+      std::fprintf(stderr, "G4_TIMESTEP end=%d start=%d gpu_ms=%.2f\n", end,
+                   start, ms);
+    }
   }
 
   if (end > g->written) g->written = end;
@@ -602,5 +773,16 @@ int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
 }
 
 int gpu_ctx_written(GpuCtx* ctx) { return ctx != nullptr ? ctx->written : 0; }
+
+// Test launcher for the coalesced GEMV (consumed by tests/test_kernels.cu):
+// one block per output row, 256 threads - the launch the forward uses.
+extern "C" int granite4_kernel_row_gemm_dequant(const std::uint16_t* d_a,
+                                                const std::uint8_t* d_B,
+                                                float scale, int N, int K,
+                                                std::uint16_t* d_out) {
+  row_gemm_dequant_kernel<<<N, 256>>>(d_a, d_B, scale, N, K, d_out);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
 
 }  // namespace granite4

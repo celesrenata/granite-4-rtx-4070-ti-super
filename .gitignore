@@ -13,3 +13,6 @@ dist/
 
 # Nix build output symlink
 result
+
+# ctest artifacts from running ctest --test-dir engine
+Testing/

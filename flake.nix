@@ -10,12 +10,12 @@
 #   packages.<system>.default    = api
 #   packages.<system>.engine-cuda  CUDA engine (x86_64-linux only): compiles
 #                                the sm_89 kernels, device test, micro-
-#                                benchmark, and the inference CLI (--gpu 1
-#                                runs the device forward); doCheck runs all
-#                                ctest suites except the GPU-only
-#                                kernels_device, which needs the host
-#                                driver's libcuda + a live device and is
-#                                re-run on gremlin-1
+#                                benchmarks (bandwidth + GEMV), and the
+#                                inference CLI (--gpu 1 runs the device
+#                                forward); doCheck runs all ctest suites
+#                                except the GPU-only kernels_device, which
+#                                needs the host driver's libcuda + a live
+#                                device and is re-run on gremlin-1
 #   devShell.<system>            cmake + ninja + clang + git + uv + python3
 #                                (regex, pytest), GRANITE4_LIB preset
 #   checks.<system>              engine (runs ctest) and api (runs pytest)
@@ -172,6 +172,7 @@
             # inference CLI whose --gpu 1 path runs the sm_89 forward pass.
             install -m 0755 build/engine/granite4-kernel-test $out/bin/
             install -m 0755 build/engine/granite4-kernel-bench $out/bin/
+            install -m 0755 build/engine/granite4-gemv-bench $out/bin/
             install -m 0755 build/engine/granite4-infer $out/bin/
             install -m 0644 engine/src/*.h $out/include/granite4/
           '';

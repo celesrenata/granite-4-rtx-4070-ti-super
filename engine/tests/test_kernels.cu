@@ -21,6 +21,7 @@ using namespace granite4;
 
 // Declared in kernels.cu (the arch probe) and kernels_phase2.cu (launchers).
 extern "C" void granite4_cuda_arch_probe(int* out);
+extern "C" int granite4_fp8_decode_all(float** d_out);
 extern "C" int granite4_kernel_rmsnorm(const std::uint16_t* d_x, const std::uint16_t* d_w,
                                        float eps, int rows, int cols, std::uint16_t* d_out);
 extern "C" int granite4_kernel_rope(const std::uint16_t* d_x, const float* d_cos,
@@ -38,6 +39,9 @@ extern "C" int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::ui
 extern "C" int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                            const std::uint16_t* d_x, float scale_g, float scale_u,
                                            int N, int K, std::uint16_t* d_out);
+extern "C" int granite4_kernel_row_gemm_dequant(const std::uint16_t* d_a,
+                                                const std::uint8_t* d_B, float scale, int N,
+                                                int K, std::uint16_t* d_out);
 extern "C" int granite4_kernel_sample_greedy(const std::uint16_t* d_p, int rows, int n, int* d_out);
 extern "C" int granite4_kernel_sample_top_p(const std::uint16_t* d_p, float nucleus,
                                             const float* d_u, int rows, int n, int* d_out);
@@ -103,6 +107,49 @@ static void test_arch_probe() {
   CUDA_CHECK(cudaMemcpy(&got, d_out, sizeof(int), cudaMemcpyDeviceToHost));
   expect(got == 1, "arch probe: compiled and running on sm_89");
   CUDA_CHECK(cudaFree(d_out));
+}
+
+// Exhaustive e4m3 decode: the branchless fp8_to_f32 must be bit-exact against
+// the arithmetic reference on all 256 codepoints (subnormals, the e==15
+// top-exponent + sNaN, and both sign bits included). The reference mirrors the
+// pre-existing arithmetic decode exactly (sNaN 0x7f/0xff -> +0.0, as the old
+// device code did), which is the P2 ground truth the kernels are verified
+// against - NOT fp8_to_f32_host, whose fp8_e4m3_to_bf16 maps sNaN to the max
+// value instead.
+static float fp8_ref(std::uint8_t x) {
+  const bool neg = (x & 0x80u) != 0;
+  const unsigned e = (x >> 3) & 0xFu, m = x & 0x7u;
+  if (e == 15 && m == 7) return 0.0f;  // sNaN -> +0.0 (old behavior)
+  float v;
+  if (e == 0) v = static_cast<float>(m) * std::ldexp(1.0f, -9);
+  else if (e == 15) v = (1.0f + static_cast<float>(m) / 8.0f) * std::ldexp(1.0f, 8);
+  else v = (1.0f + static_cast<float>(m) / 8.0f) * std::ldexp(1.0f, static_cast<int>(e) - 7);
+  return neg ? -v : v;
+}
+
+static void test_fp8_decode_all() {
+  float* d_out = nullptr;
+  if (granite4_fp8_decode_all(&d_out) != 0) {
+    ++g_failures;
+    return;
+  }
+  std::vector<float> h(256);
+  CUDA_CHECK(cudaMemcpy(h.data(), d_out, 256 * sizeof(float),
+                       cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaFree(d_out));
+  int bad = 0;
+  for (int x = 0; x < 256; ++x) {
+    std::uint32_t a, b;
+    const float ref = fp8_ref(static_cast<std::uint8_t>(x));
+    std::memcpy(&a, &h[x], 4);
+    std::memcpy(&b, &ref, 4);
+    if (a != b) {
+      if (bad < 8)
+        std::printf("  fp8 decode mismatch x=%d got=%08x ref=%08x\n", x, a, b);
+      ++bad;
+    }
+  }
+  expect(bad == 0, "fp8_to_f32 branchless decode bit-exact on all 256 codepoints");
 }
 
 static void test_rmsnorm_device() {
@@ -238,6 +285,42 @@ static void test_gemm_device() {
     if (!bf16_close(hC[i], f32_to_bf16_host(ref[i]), 4)) ++bad;
   }
   expect(bad == 0, "gemm dequant: device matches host reference (4 ULP)");
+  cudaFree(dA);
+  cudaFree(dB);
+  cudaFree(dC);
+}
+
+static void test_row_gemm_device() {
+  // The forward's GEMV shape: a = 1xK, B = N x K, K > 256 (the coalesced
+  // strided path), N not a multiple of the block dim (bounds-checking).
+  const int N = 97, K = 512;
+  const float scale = 0.0007f;
+  Xorshift64 rng(0xb077);
+  std::vector<std::uint16_t> hA(K);
+  std::vector<std::uint8_t> hB(N * K);
+  std::vector<std::uint16_t> hC(N);
+  for (auto& v : hA) v = gen_bf16(rng);
+  for (auto& v : hB) v = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+
+  std::uint16_t* dA, *dC;
+  std::uint8_t* dB;
+  if (cudaMalloc(&dA, hA.size() * 2) || cudaMalloc(&dB, hB.size()) ||
+      cudaMalloc(&dC, hC.size() * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dA, hA.data(), hA.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, hB.data(), hB.size(), cudaMemcpyHostToDevice));
+  expect(granite4_kernel_row_gemm_dequant(dA, dB, scale, N, K, dC) == 0,
+         "row-gemm launch");
+  CUDA_CHECK(cudaMemcpy(hC.data(), dC, hC.size() * 2, cudaMemcpyDeviceToHost));
+
+  std::vector<float> ref;
+  gemm_dequant_f32(hA.data(), hB.data(), scale, /*M=*/1, N, K, &ref);
+  int bad = 0;
+  for (std::size_t i = 0; i < hC.size(); ++i)
+    if (!bf16_close(hC[i], f32_to_bf16_host(ref[i]), 4)) ++bad;
+  expect(bad == 0, "row gemm (GEMV): device matches host reference (4 ULP)");
   cudaFree(dA);
   cudaFree(dB);
   cudaFree(dC);
@@ -449,10 +532,12 @@ int main() {
     return 1;
   }
   test_arch_probe();
+  test_fp8_decode_all();
   test_rmsnorm_device();
   test_rope_device();
   test_softmax_device();
   test_gemm_device();
+  test_row_gemm_device();
   test_attention_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
