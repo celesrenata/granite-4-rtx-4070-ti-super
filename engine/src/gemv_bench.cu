@@ -54,17 +54,42 @@ __device__ __forceinline__ std::uint16_t f32_to_bf16(float f) {
 }
 
 // The exact decode GEMV the forward uses (forward_gpu.cu
-// row_gemm_dequant_kernel, vectorized form).
+// row_gemm_dequant_kernel): coalesced block-per-row with a 16-byte (uint4)
+// vector path, falling back to a 4-element uint32 path then scalar.
 __global__ void row_gemm_dequant_kernel(const std::uint16_t* a, const std::uint8_t* B,
                                         float scale, int N, int K, std::uint16_t* out) {
   const int i = blockIdx.x;
   if (i >= N) return;
   const int t = threadIdx.x, nt = blockDim.x;
   const std::uint8_t* row = B + static_cast<std::size_t>(i) * K;
+  const std::uint32_t* a4 = reinterpret_cast<const std::uint32_t*>(a);
   float acc = 0.0f;
-  if ((K & 3) == 0) {
+  if ((K & 15) == 0 && (reinterpret_cast<std::uintptr_t>(row) & 15u) == 0 &&
+      (reinterpret_cast<std::uintptr_t>(a) & 3u) == 0) {
+    const int K16 = K >> 4;
+    const uint4* row16 = reinterpret_cast<const uint4*>(row);
+    for (int g = t; g < K16; g += nt) {
+      const uint4 w = row16[g];
+      const std::uint32_t ws[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const int e = 16 * g + 4 * q;
+        const std::uint32_t wq = ws[q];
+        const std::uint32_t y0 = a4[e / 2];
+        const std::uint32_t y1 = a4[e / 2 + 1];
+        const float b0 = fp8_to_f32(static_cast<std::uint8_t>(wq & 0xffu));
+        const float b1 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 8) & 0xffu));
+        const float b2 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 16) & 0xffu));
+        const float b3 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 24) & 0xffu));
+        const float fa0 = bf16_to_f32(static_cast<std::uint16_t>(y0 & 0xffffu));
+        const float fa1 = bf16_to_f32(static_cast<std::uint16_t>((y0 >> 16) & 0xffffu));
+        const float fa2 = bf16_to_f32(static_cast<std::uint16_t>(y1 & 0xffffu));
+        const float fa3 = bf16_to_f32(static_cast<std::uint16_t>((y1 >> 16) & 0xffffu));
+        acc += b0 * fa0 + b1 * fa1 + b2 * fa2 + b3 * fa3;
+      }
+    }
+  } else if ((K & 3) == 0) {
     const std::uint32_t* row4 = reinterpret_cast<const std::uint32_t*>(row);
-    const std::uint32_t* a4 = reinterpret_cast<const std::uint32_t*>(a);
     const int K4 = K >> 2;
     for (int k4 = t; k4 < K4; k4 += nt) {
       const std::uint32_t b = row4[k4];

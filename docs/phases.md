@@ -185,36 +185,50 @@ commands**; only numbers measured in this phase may be stated anywhere.
 | HBM read bandwidth | 631.9 GB/s | `granite4-kernel-bench`, 256 MB read, 100 iters |
 | HBM copy bandwidth | 602.7 GB/s | `granite4-kernel-bench`, 256 MB copy, 100 iters |
 | Per-token weight traffic | 8.38 GB | FP8 8B: 40 layers x 3.22 GB + lm_head 0.41 GB |
-| Decode step (GPU, steady) | **21.7 ms/step ≈ 46 tps** | 5-token prompt, greedy, `--gpu 1`, steady-state step 27–28 of a 24-token generate; same-run A/B: 24.5 ms (post-rmsnorm build) → 21.7 ms (branchless-decode build) |
-| GEMV-only decode | 22.1 ms/token (bench) | `granite4-gemv-bench`, L2-flushed, real per-layer shapes |
+| Decode step (GPU, steady) | **18.3 ms/step ≈ 55 tps** | 5-token prompt, greedy, `--gpu 1`, steady-state steps 27–28 of a 24-token generate with `G4_TIMESTEP=1` (one event pair per call; the `G4_TIMESTEP=2` bucket breakdown adds ~960 event records and reads ~2.4 ms slower, so use it for attribution only); same-run A/B: 18.5 ms (P4 build) → 18.3 ms (16-byte GEMV build), token-identical |
+| GEMV-only decode | 20.5 ms/token (bench) | `granite4-gemv-bench --iters 120`, L2-flushed, real per-layer shapes |
 | Roofline ceiling | ≈75 tps | 631.9 GB/s ÷ 8.38 GB/token |
 
-GEMV effective bandwidth by per-layer shape (`granite4-gemv-bench`, GB/s):
-q 330 / k 234 / v 237 / o 344 / gate 400 / up 400 / down 404 / lm_head 517.
+GEMV effective bandwidth by per-layer shape (`granite4-gemv-bench
+--iters 120`, GB/s): q 368 / k 251 / v 255 / o 371 / gate 429 / up 425 /
+down 419 / lm_head 542.
 
-Per-bucket step breakdown, `G4_TIMESTEP=2` (ms/step, steady, branchless
-build): `attn_g=3.10 attn_a=1.02 attn_o=3.49 ffn_g=7.75 ffn_o=4.20 lm=0.77`
-plus per-GEMV: `gqkv=2.30 go=1.46 ggateup=6.94 gdown=3.85 glm=0.75` → total
-21.7 ms. GEMVs are 15.1 ms (70%); the rest is attention, RMSNorm/residual
-glue, and KV compaction.
+Per-bucket attribution, `G4_TIMESTEP=2` (ms/step, steady step 28, current
+build; instrumented - the ~960 event records add ~2.4 ms to the 20.7 ms
+total): `attn_g=3.00 attn_a=0.97 attn_o=3.37 ffn_g=7.66 ffn_o=4.01 lm=0.73`
+plus per-GEMV: `gqkv=2.26 go=1.40 ggateup=6.92 gdown=3.74 glm=0.72`. The
+GEMV spans sum to ~15.0 ms (73% of the instrumented total); the rest is
+attention, RMSNorm/residual glue, and KV compaction.
 
-The two decisive P4 fixes (both verified bit-exact by
-`granite4-kernel-test`):
+The three decisive P4 fixes (all re-verified by `granite4-kernel-test`; the
+last two are additionally token-identical end-to-end):
 
 1. **rmsnorm block-reduction** — the one-thread-per-element form re-read the
    whole row per element (O(cols²), ~33 MB redundant HBM traffic per call at
    cols=4096). One block per row with a shared-memory tree reads the row
-   once; step went 55.7 ms → 24.5 ms.
+   once; step went 55.7 ms → 24.5 ms (bucket-instrumented, as are the P4
+   A/B numbers below; the uninstrumented step reads ~2.4 ms lower).
 2. **Branchless e4m3 decode** — the branchy `ldexp`-based `fp8_to_f32` was
    the per-element ALU cost of every dequant GEMM. The bit-mapped form
    (`((120+e)<<23)|(m<<20)`, predicated selects for subnormals/top/sNaN) is
    bit-identical on all 256 codepoints (`test_fp8_decode_all`) and lifts the
-   mid shapes from ~330 to ~400 GB/s effective; in a same-run A/B the step
-   went 24.5 ms → 21.7 ms (−2.75 ms, token-identical output).
+   mid shapes from ~330 to ~400 GB/s effective; in the bucket-instrumented
+   same-run A/B the step went 24.5 ms → 21.7 ms (−2.75 ms,
+   token-identical output).
+3. **16-byte (uint4) GEMV loads** — each lane loads 16 fp8 bytes per
+   iteration instead of one uint32 of 4, so the kernel issues 4x fewer global
+   loads and each lane has 4x the bytes in flight; effective read bandwidth
+   rose from 381 to 409 GB/s per token (q 330→368, k 234→251, gate
+   400→429, lm_head 517→542 GB/s) and the GEMV-only bench from 22.1 to
+   20.5 ms/token. The bf16 outputs are bit-identical to the uint32 form on
+   every decode shape (exhaustive per-shape comparison), and a same-run A/B
+   (uninstrumented step, `G4_TIMESTEP=1`) went 18.5 ms → 18.3 ms with a
+   token-identical 24-token generate.
 
 Parity: the GPU forward matches the host oracle within bf16 rounding
 (max |Δlogit| ≈ 1.1 bf16, same as P3); greedy `generate --gpu 1` (24
-tokens) is token-identical between the pre- and post-P4-kernel builds. The
+tokens) is token-identical across the P4 kernel builds (uint32 4-element
+GEMV, branchless decode, 16-byte GEMV). The
 token-6 tie vs the BF16 checkpoint reference (7754 vs 1217, both rounding
 to 17.625) is bounded bf16 quantization noise within the spec's allowed
 band, not an arithmetic defect.
@@ -223,18 +237,22 @@ Reproduction (GPU host, from the flake checkout):
 ```
 nix build .#engine-cuda          # engine binaries (incl. gemv-bench)
 ./result/bin/granite4-kernel-bench        # bandwidth / roofline (JSON)
-./result/bin/granite4-gemv-bench          # per-shape GEMV bandwidth (JSON)
+./result/bin/granite4-gemv-bench --iters 120   # per-shape GEMV bandwidth (JSON)
+G4_TIMESTEP=1 ./result/bin/granite4-infer generate \
+  --checkpoint <ckpt> --tokens 791,6864,315,9822,374 \
+  --max-tokens 24 --gpu 1        # per-step GPU ms (one event pair; headline)
 G4_TIMESTEP=2 ./result/bin/granite4-infer generate \
   --checkpoint <ckpt> --tokens 791,6864,315,9822,374 \
-  --max-tokens 24 --gpu 1        # per-bucket ms/step on stderr
+  --max-tokens 24 --gpu 1        # per-bucket ms/step on stderr (instrumented)
 ```
 
-Remaining headroom (optional, not required for the 50 tps target): the GEMVs
-are at ~77% of the HBM roofline. The measured ceiling for this 8B model on
-this card is ≈75 tps, so the GEMV path is the only remaining lever; further
-gains would need a fused attention+GEMV kernel or wider per-thread vector
-loads (both large rewrites, see the GEMV notes in the forward_gpu.cu
-header).
+Remaining headroom (optional): the isolated GEMV bench reports ~409 GB/s
+aggregate (65% of the 631.9 GB/s roofline; the L2-flush writeback inflates
+its per-call times relative to the in-context run). The in-context step is
+18.3 ms (≈55 tps) against the ≈75 tps measured ceiling, so the GEMV path
+remains the only lever; further gains would need a fused attention+GEMV
+kernel or split-K reductions (both larger rewrites, see the GEMV notes in
+the forward_gpu.cu header).
 
 ## Rules across phases
 

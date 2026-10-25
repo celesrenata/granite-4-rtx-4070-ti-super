@@ -188,6 +188,22 @@ __global__ void rope_at_pos_kernel(const std::uint16_t* x, const float* cos_row,
 // fp8_to_f32 * bf16_to_f32 float arithmetic as the P2 reference (only the
 // summation order differs, within float rounding); parity vs the host oracle
 // is unchanged.
+//
+// P4: 16-byte (uint4) weight loads. Each lane loads 16 fp8 bytes per
+// iteration (four 4-element subgroups) instead of one uint32 of 4, so the
+// kernel issues 4x fewer global loads and each lane has 4x the bytes in
+// flight. On the real decode shapes this lifted the measured read bandwidth
+// from 381 to 409 GB/s per token (q 330->368, k 234->251, gate 400->429,
+// lm_head 517->542 GB/s) and the GEMV-only bench from 22.1 to 20.5
+// ms/token; the uninstrumented decode step went 18.5 -> 18.3 ms. The bf16
+// outputs are bit-identical to the uint32 form on every shape (the changed
+// summation order stays inside bf16 rounding) and the 24-token greedy
+// generate is token-identical. Requires K 16-aligned, a 16-aligned row
+// start, and a 4-aligned activation vector (the layout's offsets are all
+// multiples of H=4096, so this always holds for the checkpoint; the
+// alignment tests keep the fast path honest if that ever changes). The
+// 4-element and scalar paths remain as fallbacks for shapes/pointers that
+// fail those tests.
 __global__ void row_gemm_dequant_kernel(const std::uint16_t* a, const std::uint8_t* B,
                                         float scale, int N, int K, std::uint16_t* out) {
   const int i = blockIdx.x;  // one output row per block
@@ -195,16 +211,38 @@ __global__ void row_gemm_dequant_kernel(const std::uint16_t* a, const std::uint8
   const int t = threadIdx.x;
   const int nt = blockDim.x;
   const std::uint8_t* const row = B + static_cast<std::size_t>(i) * K;
+  const std::uint32_t* const a4 = reinterpret_cast<const std::uint32_t*>(a);
   float acc = 0.0f;
-  // Four k-elements per iteration: one uint32 of 4 fp8 bytes and two uint32
-  // of 4 bf16 per lane, so each lane's memory stream moves 2x the bytes in
-  // flight versus the scalar form (which capped the card at ~300 GB/s
-  // against the 635 GB/s roofline). The vector path needs K 4-aligned (the
-  // row stride is K bytes); all decode shapes have K in {4096, 12800}.
-  if ((K & 3) == 0) {
-    const std::uint32_t* row4 =
+  // 16-byte vector path: one uint4 of 16 fp8 bytes per lane per iteration,
+  // with the matching 16 bf16 (two uint32 pairs per 4-element subgroup).
+  if ((K & 15) == 0 &&
+      (reinterpret_cast<std::uintptr_t>(row) & 15u) == 0 &&
+      (reinterpret_cast<std::uintptr_t>(a) & 3u) == 0) {
+    const int K16 = K >> 4;
+    const uint4* const row16 = reinterpret_cast<const uint4*>(row);
+    for (int g = t; g < K16; g += nt) {
+      const uint4 w = row16[g];
+      const std::uint32_t ws[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {  // each ws[q] = 4 fp8 elements
+        const int e = 16 * g + 4 * q;  // element index of this subgroup
+        const std::uint32_t wq = ws[q];
+        const std::uint32_t y0 = a4[e / 2];      // elements e, e+1
+        const std::uint32_t y1 = a4[e / 2 + 1];  // elements e+2, e+3
+        const float b0 = fp8_to_f32(static_cast<std::uint8_t>(wq & 0xffu));
+        const float b1 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 8) & 0xffu));
+        const float b2 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 16) & 0xffu));
+        const float b3 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 24) & 0xffu));
+        const float fa0 = bf16_to_f32(static_cast<std::uint16_t>(y0 & 0xffffu));
+        const float fa1 = bf16_to_f32(static_cast<std::uint16_t>((y0 >> 16) & 0xffffu));
+        const float fa2 = bf16_to_f32(static_cast<std::uint16_t>(y1 & 0xffffu));
+        const float fa3 = bf16_to_f32(static_cast<std::uint16_t>((y1 >> 16) & 0xffffu));
+        acc += b0 * fa0 + b1 * fa1 + b2 * fa2 + b3 * fa3;
+      }
+    }
+  } else if ((K & 3) == 0) {
+    const std::uint32_t* const row4 =
         reinterpret_cast<const std::uint32_t*>(row);
-    const std::uint32_t* a4 = reinterpret_cast<const std::uint32_t*>(a);
     const int K4 = K >> 2;
     for (int k4 = t; k4 < K4; k4 += nt) {
       const std::uint32_t b = row4[k4];
