@@ -214,12 +214,18 @@ __global__ void rope_at_pos_kernel(const std::uint16_t* x, const float* cos_row,
 // P4: the Q/K/V projections use row_gemm_dequant_qkv_kernel below, one grid
 // over three row ranges. It shares this exact per-row arithmetic and launch
 // width while retaining each projection's weight, scale, and output buffer.
+// The O-projection and FFN-down calls use row_gemm_dequant_resid_kernel,
+// which folds the residual add into the thread-0 epilogue (template
+// AddResidual) and writes d_hidden in place.
 constexpr int kRowGemvThreads = 128;
 
+template <bool AddResidual>
 __device__ __forceinline__ void gemv_row_dequant(const std::uint16_t* a,
                                                  const std::uint8_t* row,
                                                  float scale, int K,
-                                                 std::uint16_t* out, int i) {
+                                                 std::uint16_t* out, int i,
+                                                 const std::uint16_t* residual = nullptr,
+                                                 float residual_scale = 0.0f) {
   const int t = threadIdx.x;
   const int nt = blockDim.x;
   const std::uint32_t* const a4 = reinterpret_cast<const std::uint32_t*>(a);
@@ -284,14 +290,28 @@ __device__ __forceinline__ void gemv_row_dequant(const std::uint16_t* a,
   if (t == 0) {
     float s = red[0];
     for (int j = 1; j < (nt >> 5); ++j) s += red[j];
-    out[i] = f32_to_bf16(scale * s);
+    const float y = scale * s;
+    out[i] = AddResidual
+                 ? f32_to_bf16(bf16_to_f32(residual[i]) + residual_scale * y)
+                 : f32_to_bf16(y);
   }
 }
 __global__ void row_gemm_dequant_kernel(const std::uint16_t* a, const std::uint8_t* B,
                                         float scale, int N, int K, std::uint16_t* out) {
   const int i = blockIdx.x;  // one output row per block
   if (i >= N) return;
-  gemv_row_dequant(a, B + static_cast<std::size_t>(i) * K, scale, K, out, i);
+  gemv_row_dequant<false>(a, B + static_cast<std::size_t>(i) * K, scale, K, out, i);
+}
+
+__global__ void row_gemm_dequant_resid_kernel(const std::uint16_t* a,
+                                               const std::uint8_t* B, float scale,
+                                               const std::uint16_t* residual,
+                                               float residual_scale, int N, int K,
+                                               std::uint16_t* out) {
+  const int i = blockIdx.x;
+  if (i >= N) return;
+  gemv_row_dequant<true>(a, B + static_cast<std::size_t>(i) * K, scale, K, out, i,
+                         residual, residual_scale);
 }
 
 // Fused Q/K/V decode GEMV: one launch for the three attention projections, so
@@ -309,14 +329,14 @@ __global__ void row_gemm_dequant_qkv_kernel(const std::uint16_t* a,
                                             std::uint16_t* ov) {
   const int b = blockIdx.x;
   if (b < Nq) {
-    gemv_row_dequant(a, wq + static_cast<std::size_t>(b) * K, sq, K, oq, b);
+    gemv_row_dequant<false>(a, wq + static_cast<std::size_t>(b) * K, sq, K, oq, b);
   } else if (b < Nq + Nk) {
     const int i = b - Nq;
-    gemv_row_dequant(a, wk + static_cast<std::size_t>(i) * K, sk, K, ok, i);
+    gemv_row_dequant<false>(a, wk + static_cast<std::size_t>(i) * K, sk, K, ok, i);
   } else {
     const int i = b - Nq - Nk;
     if (i >= Nv) return;
-    gemv_row_dequant(a, wv + static_cast<std::size_t>(i) * K, sv, K, ov, i);
+    gemv_row_dequant<false>(a, wv + static_cast<std::size_t>(i) * K, sv, K, ov, i);
   }
 }
 
@@ -682,12 +702,10 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
                                     kv_len, d_attn_out) != 0)
         return seterr("gqa_value failed");
       gstamp(1, layer, 0);
-      row_gemm_dequant_kernel<<<H, kRowGemvThreads>>>(d_attn_out, wo, sl[3], H, H, d_o_out);
+      row_gemm_dequant_resid_kernel<<<H, kRowGemvThreads>>>(
+          d_attn_out, wo, sl[3], d_hidden, resid_scale, H, H, d_hidden);
       G4_CUDA_CHECK(cudaGetLastError());
       gstamp(1, layer, 1);
-      add_resid_kernel<<<(H + 255) / 256, 256>>>(d_hidden, d_o_out, resid_scale,
-                                                 d_hidden, H);
-      G4_CUDA_CHECK(cudaGetLastError());
 
       stamp(3, layer, 1);
       // ---- FFN block ----
@@ -702,13 +720,10 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
       stamp(4, layer, 1);
       stamp(5, layer, 0);
       gstamp(3, layer, 0);
-      row_gemm_dequant_kernel<<<H, kRowGemvThreads>>>(d_gate_out, wd, sl[6], H, I,
-                                                        d_ffn_out);
+      row_gemm_dequant_resid_kernel<<<H, kRowGemvThreads>>>(
+          d_gate_out, wd, sl[6], d_hidden, resid_scale, H, I, d_hidden);
       G4_CUDA_CHECK(cudaGetLastError());
       gstamp(3, layer, 1);
-      add_resid_kernel<<<(H + 255) / 256, 256>>>(d_hidden, d_ffn_out, resid_scale,
-                                                 d_hidden, H);
-      G4_CUDA_CHECK(cudaGetLastError());
       stamp(5, layer, 1);
     }
     stamp(6, 0, 0);
