@@ -528,7 +528,7 @@ int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out) {
-  granite4::silu_gate_up_kernel<<<N, 256>>>(d_wg, d_wu, d_x, scale_g, scale_u, N, K,
+  granite4::silu_gate_up_kernel<<<N, 128>>>(d_wg, d_wu, d_x, scale_g, scale_u, N, K,
                                             d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;

@@ -271,6 +271,13 @@ last two are additionally token-identical end-to-end):
    17.44-17.48 → 16.50-16.63 ms/step; `attn_o` 3.31 → 2.44 ms. Beyond
    `d + 2*kv_len` bf16 in 48 KiB of shared memory (~24 K context) the
    `gqa_fusable` flag falls back to the classic scratch path.
+8. **SwiGLU gate/up at 128 threads** — the fused gate/up kernel reads two
+   fp8 rows per output row, so its 12,800 blocks have substantially more
+   work than the Q/K/V rows. Nevertheless, reducing the launch width from
+   256 to 128 lowers the FFN-gate bucket 6.93 → 6.86 ms and the steady
+   decode 16.50-16.63 → 16.52-16.58 ms (within run noise, token-identical).
+   Keep the smaller launch: it is not a regression and saves about 70 µs in
+   the instrumented bucket.
 
 Parity: the GPU forward matches the host oracle within bf16 rounding
 (max |Δlogit| ≈ 1.1 bf16, same as P3); greedy `generate --gpu 1` (24
