@@ -210,15 +210,18 @@ __global__ void rope_at_pos_kernel(const std::uint16_t* x, const float* cos_row,
 // small-grid Q/K/V shapes gain most from the shorter ramp. Same-run A/B on
 // the full decode: 18.06-18.08 ms/step vs 18.29-18.33 ms at 256 threads
 // (token-identical).
+//
+// P4: the Q/K/V projections use row_gemm_dequant_qkv_kernel below, one grid
+// over three row ranges. It shares this exact per-row arithmetic and launch
+// width while retaining each projection's weight, scale, and output buffer.
 constexpr int kRowGemvThreads = 128;
 
-__global__ void row_gemm_dequant_kernel(const std::uint16_t* a, const std::uint8_t* B,
-                                        float scale, int N, int K, std::uint16_t* out) {
-  const int i = blockIdx.x;  // one output row per block
-  if (i >= N) return;
+__device__ __forceinline__ void gemv_row_dequant(const std::uint16_t* a,
+                                                 const std::uint8_t* row,
+                                                 float scale, int K,
+                                                 std::uint16_t* out, int i) {
   const int t = threadIdx.x;
   const int nt = blockDim.x;
-  const std::uint8_t* const row = B + static_cast<std::size_t>(i) * K;
   const std::uint32_t* const a4 = reinterpret_cast<const std::uint32_t*>(a);
   float acc = 0.0f;
   // 16-byte vector path: one uint4 of 16 fp8 bytes per lane per iteration,
@@ -284,6 +287,39 @@ __global__ void row_gemm_dequant_kernel(const std::uint16_t* a, const std::uint8
     out[i] = f32_to_bf16(scale * s);
   }
 }
+__global__ void row_gemm_dequant_kernel(const std::uint16_t* a, const std::uint8_t* B,
+                                        float scale, int N, int K, std::uint16_t* out) {
+  const int i = blockIdx.x;  // one output row per block
+  if (i >= N) return;
+  gemv_row_dequant(a, B + static_cast<std::size_t>(i) * K, scale, K, out, i);
+}
+
+// Fused Q/K/V decode GEMV: one launch for the three attention projections, so
+// the small k/v grids stop paying a separate ramp/drain and launch gap per
+// layer. Blocks are dispatched by range; per-row arithmetic is identical to
+// row_gemm_dequant_kernel.
+__global__ void row_gemm_dequant_qkv_kernel(const std::uint16_t* a,
+                                            const std::uint8_t* wq,
+                                            const std::uint8_t* wk,
+                                            const std::uint8_t* wv,
+                                            float sq, float sk, float sv,
+                                            int Nq, int Nk, int Nv, int K,
+                                            std::uint16_t* oq,
+                                            std::uint16_t* ok,
+                                            std::uint16_t* ov) {
+  const int b = blockIdx.x;
+  if (b < Nq) {
+    gemv_row_dequant(a, wq + static_cast<std::size_t>(b) * K, sq, K, oq, b);
+  } else if (b < Nq + Nk) {
+    const int i = b - Nq;
+    gemv_row_dequant(a, wk + static_cast<std::size_t>(i) * K, sk, K, ok, i);
+  } else {
+    const int i = b - Nq - Nk;
+    if (i >= Nv) return;
+    gemv_row_dequant(a, wv + static_cast<std::size_t>(i) * K, sv, K, ov, i);
+  }
+}
+
 
 // P2 device-verified primitives (kernels_phase2.cu; no header, declared the
 // way test_kernels.cu does).
@@ -593,13 +629,9 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
       if (granite4_kernel_rmsnorm(d_hidden, attn_norm, rms_eps, 1, H, d_normed) != 0)
         return seterr("rmsnorm (attention) failed");
       gstamp(0, layer, 0);
-      row_gemm_dequant_kernel<<<Hq * d, kRowGemvThreads>>>(d_normed, wq, sl[0], Hq * d, H, d_qf);
-      G4_CUDA_CHECK(cudaGetLastError());
-      row_gemm_dequant_kernel<<<Hk * d, kRowGemvThreads>>>(d_normed, wk, sl[1], Hk * d, H,
-                                               d_k_new);
-      G4_CUDA_CHECK(cudaGetLastError());
-      row_gemm_dequant_kernel<<<Hk * d, kRowGemvThreads>>>(d_normed, wv, sl[2], Hk * d, H,
-                                               d_v_new);
+      row_gemm_dequant_qkv_kernel<<<Hq * d + 2 * Hk * d, kRowGemvThreads>>>(
+          d_normed, wq, wk, wv, sl[0], sl[1], sl[2], Hq * d, Hk * d, Hk * d, H,
+          d_qf, d_k_new, d_v_new);
       G4_CUDA_CHECK(cudaGetLastError());
       gstamp(0, layer, 1);
 

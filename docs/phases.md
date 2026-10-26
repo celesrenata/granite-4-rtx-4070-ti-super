@@ -185,7 +185,7 @@ commands**; only numbers measured in this phase may be stated anywhere.
 | HBM read bandwidth | 631.9 GB/s | `granite4-kernel-bench`, 256 MB read, 100 iters |
 | HBM copy bandwidth | 602.7 GB/s | `granite4-kernel-bench`, 256 MB copy, 100 iters |
 | Per-token weight traffic | 8.38 GB | FP8 8B: 40 layers x 3.22 GB + lm_head 0.41 GB |
-| Decode step (GPU, steady) | **18.1 ms/step ≈ 55 tps** | 5-token prompt, greedy, `--gpu 1`, steady-state steps 27–28 of a 24-token generate with `G4_TIMESTEP=1` (one event pair per call; the `G4_TIMESTEP=2` bucket breakdown adds ~960 event records and reads ~2.4 ms slower, so use it for attribution only); same-run A/B: 18.5 ms (P4 build) → 18.3 ms (16-byte GEMV build) → 18.1 ms (128-thread launch policy), token-identical |
+| Decode step (GPU, steady) | **17.8 ms/step ≈ 56 tps** | 5-token prompt, greedy, `--gpu 1`, steady-state steps 27–28 of a 24-token generate with `G4_TIMESTEP=1` (one event pair per call; the `G4_TIMESTEP=2` bucket breakdown adds ~960 event records and reads ~2.4 ms slower, so use it for attribution only); same-run A/B: 18.5 ms (P4 build) → 18.3 ms (16-byte GEMV build) → 18.1 ms (128-thread launch policy) → 17.8 ms (fused QKV), token-identical |
 | GEMV-only decode | 20.3 ms/token (bench) | `granite4-gemv-bench --iters 120`, L2-flushed, real per-layer shapes |
 | Roofline ceiling | ≈75 tps | 631.9 GB/s ÷ 8.38 GB/token |
 
@@ -194,11 +194,15 @@ GEMV effective bandwidth by per-layer shape (`granite4-gemv-bench
 down 417 / lm_head 565.
 
 Per-bucket attribution, `G4_TIMESTEP=2` (ms/step, steady step 28, current
-build; instrumented - the ~960 event records add ~2.4 ms to the 20.5 ms
-total): `attn_g=2.94 attn_a=0.97 attn_o=3.33 ffn_g=7.66 ffn_o=3.90 lm=0.69`
-plus per-GEMV: `gqkv=2.21 go=1.36 ggateup=6.92 gdown=3.63 glm=0.67`. The
-GEMV spans sum to ~14.8 ms (72% of the instrumented total); the rest is
+build; instrumented - the ~960 event records add ~2.4 ms to the 20.2 ms
+total): `attn_g=2.65 attn_a=0.97 attn_o=3.34 ffn_g=7.66 ffn_o=3.91 lm=0.69`
+plus per-GEMV: `gqkv=1.92 go=1.37 ggateup=6.93 gdown=3.64 glm=0.68`. The
+GEMV spans sum to ~14.5 ms (72% of the instrumented total); the rest is
 attention, RMSNorm/residual glue, and KV compaction.
+
+The Q/K/V projections now share one launch over the concatenated q/k/v row
+ranges. This removes two launch ramps per layer while retaining separate
+weights, scales, and output buffers.
 
 The three decisive P4 fixes (all re-verified by `granite4-kernel-test`; the
 last two are additionally token-identical end-to-end):
@@ -227,6 +231,11 @@ last two are additionally token-identical end-to-end):
    comparison), and a same-run A/B (uninstrumented step, `G4_TIMESTEP=1`)
    went 18.5 ms → 18.3 ms (16-byte loads) → 18.1 ms (128 threads), all
    token-identical 24-token generates.
+4. **Fused Q/K/V GEMV launch** — Q, K, and V now share one grid over their
+   concatenated row ranges while retaining separate weights, scales, and
+   output buffers. This removes two launch ramps per layer; the in-context
+   qkv span went 2.21 → 1.92 ms and the full uninstrumented step went 18.1
+   → 17.8 ms, token-identical.
 
 Parity: the GPU forward matches the host oracle within bf16 rounding
 (max |Δlogit| ≈ 1.1 bf16, same as P3); greedy `generate --gpu 1` (24
@@ -252,10 +261,10 @@ G4_TIMESTEP=2 ./result/bin/granite4-infer generate \
 Remaining headroom (optional): the isolated GEMV bench reports ~413 GB/s
 aggregate (65% of the 631.9 GB/s roofline; the L2-flush writeback inflates
 its per-call times relative to the in-context run). The in-context step is
-18.1 ms (≈55 tps) against the ≈75 tps measured ceiling, so the GEMV path
-remains the only lever; further gains would need a fused attention+GEMV
-kernel or split-K reductions (both larger rewrites, see the GEMV notes in
-the forward_gpu.cu header).
+17.8 ms (≈56 tps) against the ≈75 tps measured ceiling, so the GEMV path
+remains the only lever; further gains would need fused attention/GEMV or
+split-K reductions (the latter changes summation order and needs the
+bit-exact token gate).
 
 Tried and rejected (same-run A/B, `G4_TIMESTEP=1`, token-identical): a
 16-byte-load form of the fused SwiGLU gate/up kernel (`kernels_phase2.cu`)
