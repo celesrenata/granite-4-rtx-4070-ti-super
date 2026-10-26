@@ -88,11 +88,17 @@ __global__ void rmsnorm_kernel(const std::uint16_t* x, const std::uint16_t* w,
     ps += static_cast<double>(v) * v;
   }
   __shared__ double red[320];  // blockDim must be <= 320 (launcher).
-  red[t] = ps;
+  // Deterministic warp-tree reduction: each warp keeps its lane-ordered
+  // partials, then lane 0 combines warp totals in warp order. This removes
+  // the 256-deep serial shared-memory loop from every decode RMSNorm.
+  for (int offset = 16; offset > 0; offset >>= 1)
+    ps += __shfl_down_sync(0xffffffffu, ps, offset);
+  if ((t & 31) == 0) red[t >> 5] = ps;
   __syncthreads();
   if (t == 0) {
     double s = 0.0;
-    for (int i = 0; i < nt; ++i) s += red[i];
+    const int warps = (nt + 31) >> 5;
+    for (int i = 0; i < warps; ++i) s += red[i];
     red[0] = s;
   }
   __syncthreads();

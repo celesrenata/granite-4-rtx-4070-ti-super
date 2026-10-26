@@ -287,6 +287,13 @@ last two are additionally token-identical end-to-end):
    0.47 ms/step faster. Output is token-identical. The direct path is the
    default; `G4_DIRECT_KV=0` restores the compact-prefix rollback path.
    A padded-stride device test checks direct-cache GQA bit identity.
+10. **Warp-tree RMSNorm reduction** — the decode RMSNorm ended with a
+   serial thread-0 loop over 256 double partials; it now does a deterministic
+   warp-shuffle tree in double and thread 0 combines only the eight warp
+   totals. Same double-precision accumulation, only the tree order changes
+   (inside bf16 rounding; output token-identical). Same-run A/B:
+   `attn_g` 2.68 → 2.47 ms, `ffn_g` 7.61 → 7.39 ms, full step
+   16.06-16.09 → 15.74-15.77 ms (~0.32 ms/step).
 
 Parity: the GPU forward matches the host oracle within bf16 rounding
 (max |Δlogit| ≈ 1.1 bf16, same as P3); greedy `generate --gpu 1` (24
