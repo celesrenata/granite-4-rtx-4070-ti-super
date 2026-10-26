@@ -146,6 +146,36 @@ __global__ void kv_compact_kernel(const std::uint16_t* cache, std::uint16_t* out
         cache[(static_cast<std::size_t>(hkv) * pos + kv) * d + i];
 }
 
+// One launch per layer for both k and v: append this position's RoPE'd K and
+// raw V to the history and gather the causal prefix 0..kv_len-1 into the
+// contiguous buffers the gqa kernels consume. Each thread owns (hkv, i) and
+// walks the columns; the appended slot is the value it just loaded, so there
+// is no read-after-write hazard across threads.
+__global__ void kv_append_compact_kernel(const std::uint16_t* src_k,
+                                         const std::uint16_t* src_v,
+                                         std::uint16_t* cache_k,
+                                         std::uint16_t* cache_v,
+                                         std::uint16_t* compact_k,
+                                         std::uint16_t* compact_v,
+                                         int kv_len, int t, int pos, int Hk, int d) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= Hk * d) return;
+  const int hkv = idx / d;
+  const int i = idx % d;
+  const std::size_t cache_row = static_cast<std::size_t>(hkv) * pos * d;
+  const std::size_t comp_row = static_cast<std::size_t>(hkv) * kv_len * d;
+  const std::uint16_t kk = src_k[idx];
+  const std::uint16_t vv = src_v[idx];
+  cache_k[cache_row + static_cast<std::size_t>(t) * d + i] = kk;
+  cache_v[cache_row + static_cast<std::size_t>(t) * d + i] = vv;
+  for (int kv = 0; kv < kv_len; ++kv) {
+    const std::size_t coff = cache_row + static_cast<std::size_t>(kv) * d + i;
+    const std::size_t doff = comp_row + static_cast<std::size_t>(kv) * d + i;
+    compact_k[doff] = (kv == t) ? kk : cache_k[coff];
+    compact_v[doff] = (kv == t) ? vv : cache_v[coff];
+  }
+}
+
 // Llama half-split RoPE at ONE position, applied to every head. cos_row /
 // sin_row are that position's [d/2] table rows (rope_freqs_f32 layout).
 // Formula identical to the P2 rope_kernel.
@@ -172,6 +202,39 @@ __global__ void rope_at_pos_kernel(const std::uint16_t* x, const float* cos_row,
     y = a * c + b * s;
   }
   out[idx] = f32_to_bf16(y);
+}
+
+// Llama half-split RoPE at ONE position, fused over the q and k projections
+// (one launch instead of two). Same formula and per-element arithmetic as
+// rope_at_pos_kernel.
+__global__ void rope_at_pos_qk_kernel(const std::uint16_t* q, const std::uint16_t* k,
+                                      const float* cos_row, const float* sin_row,
+                                      int Hq, int Hk, int d,
+                                      std::uint16_t* q_out, std::uint16_t* k_out) {
+  const int nq = Hq * d;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= nq + Hk * d) return;
+  const bool is_q = idx < nq;
+  const int local = is_q ? idx : idx - nq;
+  const std::uint16_t* x = is_q ? q : k;
+  std::uint16_t* out = is_q ? q_out : k_out;
+  const int h = local / d;
+  const int col = local % d;
+  const int half = d / 2;
+  const int i = col < half ? col : col - half;
+  const float c = cos_row[i];
+  const float s = sin_row[i];
+  float y;
+  if (col < half) {
+    const float a = bf16_to_f32(x[h * d + col]);
+    const float b = bf16_to_f32(x[h * d + col + half]);
+    y = a * c - b * s;
+  } else {
+    const float a = bf16_to_f32(x[h * d + col]);
+    const float b = bf16_to_f32(x[h * d + col - half]);
+    y = a * c + b * s;
+  }
+  out[local] = f32_to_bf16(y);
 }
 
 // out[i] = scale * sum_k a[k] * fp8_to_f32(B[i, k])  (M=1 GEMV: a is one row).
@@ -659,31 +722,17 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
       stamp(2, layer, 0);
       const float* const cos_t = g->cos_tbl + static_cast<std::size_t>(t) * half;
       const float* const sin_t = g->sin_tbl + static_cast<std::size_t>(t) * half;
-      rope_at_pos_kernel<<<(Hq * d + 255) / 256, 256>>>(d_qf, cos_t, sin_t, Hq, d,
-                                                        d_qf_rot);
-      G4_CUDA_CHECK(cudaGetLastError());
-      rope_at_pos_kernel<<<(Hk * d + 255) / 256, 256>>>(d_k_new, cos_t, sin_t, Hk, d,
-                                                        d_k_new_rot);
+      rope_at_pos_qk_kernel<<<(Hq * d + Hk * d + 255) / 256, 256>>>(
+          d_qf, d_k_new, cos_t, sin_t, Hq, Hk, d, d_qf_rot, d_k_new_rot);
       G4_CUDA_CHECK(cudaGetLastError());
 
-      // Append this position's RoPE'd K and raw V to the full history.
-      kv_append_kernel<<<(Hk * d + 255) / 256, 256>>>(d_k_new_rot, g->kv_k + kv_layer,
-                                                       t, max_pos, Hk, d);
-      G4_CUDA_CHECK(cudaGetLastError());
-      kv_append_kernel<<<(Hk * d + 255) / 256, 256>>>(d_v_new, g->kv_v + kv_layer,
-                                                       t, max_pos, Hk, d);
-      G4_CUDA_CHECK(cudaGetLastError());
-
-      // Gather the causal prefix into the contiguous [Hk][t+1][d] layout
-      // the gqa kernels consume (the oracle's explicit compaction).
+      // Append this position's RoPE'd K and raw V to the history and gather
+      // the causal prefix into the contiguous [Hk][t+1][d] layout the gqa
+      // kernels consume (append + compact in one launch for k and v).
       const int kv_len = t + 1;
-      kv_compact_kernel<<<(Hk * d + 255) / 256, 256>>>(g->kv_k + kv_layer,
-                                                       g->compact_k, kv_len,
-                                                       max_pos, Hk, d);
-      G4_CUDA_CHECK(cudaGetLastError());
-      kv_compact_kernel<<<(Hk * d + 255) / 256, 256>>>(g->kv_v + kv_layer,
-                                                       g->compact_v, kv_len,
-                                                       max_pos, Hk, d);
+      kv_append_compact_kernel<<<(Hk * d + 255) / 256, 256>>>(
+          d_k_new_rot, d_v_new, g->kv_k + kv_layer, g->kv_v + kv_layer,
+          g->compact_k, g->compact_v, kv_len, t, max_pos, Hk, d);
       G4_CUDA_CHECK(cudaGetLastError());
 
       stamp(2, layer, 1);

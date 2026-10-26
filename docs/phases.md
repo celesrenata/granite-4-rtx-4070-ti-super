@@ -185,7 +185,7 @@ commands**; only numbers measured in this phase may be stated anywhere.
 | HBM read bandwidth | 631.9 GB/s | `granite4-kernel-bench`, 256 MB read, 100 iters |
 | HBM copy bandwidth | 602.7 GB/s | `granite4-kernel-bench`, 256 MB copy, 100 iters |
 | Per-token weight traffic | 8.38 GB | FP8 8B: 40 layers x 3.22 GB + lm_head 0.41 GB |
-| Decode step (GPU, steady) | **17.7 ms/step ≈ 56 tps** | 5-token prompt, greedy, `--gpu 1`, steady-state steps 27–28 of a 24-token generate with `G4_TIMESTEP=1` (one event pair per call; the `G4_TIMESTEP=2` bucket breakdown adds ~960 event records and reads ~2.4 ms slower, so use it for attribution only); same-run A/B: 18.5 ms (P4 build) → 18.3 ms (16-byte GEMV build) → 18.1 ms (128-thread launch policy) → 17.8 ms (fused QKV) → 17.7 ms (residual adds fused into the O/down GEMV epilogues), token-identical |
+| Decode step (GPU, steady) | **17.5 ms/step ≈ 57 tps** | 5-token prompt, greedy, `--gpu 1`, steady-state steps 27–28 of a 24-token generate with `G4_TIMESTEP=1` (one event pair per call; the `G4_TIMESTEP=2` bucket breakdown adds ~960 event records and reads ~2.4 ms slower, so use it for attribution only); same-run A/B: 18.5 ms (P4 build) → 18.3 ms (16-byte GEMV build) → 18.1 ms (128-thread launch policy) → 17.8 ms (fused QKV) → 17.7 ms (residual adds fused into the O/down GEMV epilogues) → 17.5 ms (fused rope q/k and KV append+compact), token-identical |
 | GEMV-only decode | 20.3 ms/token (bench) | `granite4-gemv-bench --iters 120`, L2-flushed, real per-layer shapes |
 | Roofline ceiling | ≈75 tps | 631.9 GB/s ÷ 8.38 GB/token |
 
@@ -194,17 +194,19 @@ GEMV effective bandwidth by per-layer shape (`granite4-gemv-bench
 down 417 / lm_head 565.
 
 Per-bucket attribution, `G4_TIMESTEP=2` (ms/step, steady step 28, current
-build; instrumented - the ~960 event records add ~2.4 ms to the 20.1 ms
+build; instrumented - the ~960 event records add ~2.4 ms to the 20.2 ms
 total, and the bucket run itself drifts ~0.5 ms run-to-run):
-`attn_g=2.66 attn_a=0.98 attn_o=3.29 ffn_g=7.66 ffn_o=3.86 lm=0.69` plus
-per-GEMV: `gqkv=1.92 go=1.37 ggateup=6.93 gdown=3.64 glm=0.68`. The GEMV
+`attn_g=2.66 attn_a=0.80 attn_o=3.31 ffn_g=7.67 ffn_o=3.85 lm=0.70` plus
+per-GEMV: `gqkv=1.92 go=1.37 ggateup=6.93 gdown=3.65 glm=0.68`. The GEMV
 spans sum to ~14.5 ms (72% of the instrumented total); the rest is
 attention, RMSNorm/residual glue, and KV compaction.
 
 The Q/K/V projections now share one launch over the concatenated q/k/v row
-ranges, and the O-projection and FFN-down GEMVs fold their residual adds
-into the thread-0 epilogue (writing `d_hidden` in place). Each removes a
-launch plus an intermediate global write/read per layer.
+ranges, the O-projection and FFN-down GEMVs fold their residual adds into
+the thread-0 epilogue (writing `d_hidden` in place), and the attention block
+fuses rope q/k into one launch and the KV append+compact (k and v) into one.
+Each removes a launch plus an intermediate global write/read per layer; the
+`attn_a` bucket (rope + KV) fell from 0.98 to 0.80 ms.
 
 The three decisive P4 fixes (all re-verified by `granite4-kernel-test`; the
 last two are additionally token-identical end-to-end):
@@ -246,6 +248,15 @@ last two are additionally token-identical end-to-end):
    the intermediate buffer per layer. Same-run A/B: 17.78-17.83 →
    17.61-17.72 ms/step, token-identical (the epilogue keeps the intermediate
    `bf16(scale * sum)` rounding, so outputs stay bit-identical).
+6. **Fused rope q/k and KV append+compact** — the attention block launched
+   rope for q and k separately and then four KV micro-kernels (append k,
+   append v, compact k, compact v); at Hk=8 those copies move only ~1 KB
+   each and were pure launch latency. `rope_at_pos_qk_kernel` handles both
+   projections in one grid, and `kv_append_compact_kernel` appends the
+   current slot and gathers the causal prefix for k and v in one grid (each
+   thread owns one (hkv, i) column, so the appended value is the one it just
+   loaded). The `attn_a` span fell 0.98 → 0.80 ms and the full step
+   17.7 → 17.5 ms, token-identical.
 
 Parity: the GPU forward matches the host oracle within bf16 rounding
 (max |Δlogit| ≈ 1.1 bf16, same as P3); greedy `generate --gpu 1` (24
@@ -271,7 +282,7 @@ G4_TIMESTEP=2 ./result/bin/granite4-infer generate \
 Remaining headroom (optional): the isolated GEMV bench reports ~413 GB/s
 aggregate (65% of the 631.9 GB/s roofline; the L2-flush writeback inflates
 its per-call times relative to the in-context run). The in-context step is
-17.7 ms (≈56 tps) against the ≈75 tps measured ceiling, so the GEMV path
+17.5 ms (≈57 tps) against the ≈75 tps measured ceiling, so the GEMV path
 remains the only lever; further gains would need fused attention/GEMV or
 split-K reductions (the latter changes summation order and needs the
 bit-exact token gate).
