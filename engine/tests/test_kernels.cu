@@ -36,6 +36,9 @@ extern "C" int granite4_kernel_gqa_logits(const std::uint16_t* d_q, const std::u
                                           std::uint16_t* d_logits);
 extern "C" int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v,
                                          int Hq, int Hk, int d, int kv_len, std::uint16_t* d_out);
+extern "C" int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k,
+                                         const std::uint16_t* d_v, float att_scale, int Hq,
+                                         int Hk, int d, int kv_len, std::uint16_t* d_out);
 extern "C" int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                            const std::uint16_t* d_x, float scale_g, float scale_u,
                                            int N, int K, std::uint16_t* d_out);
@@ -369,6 +372,54 @@ static void test_attention_device() {
   cudaFree(dout);
 }
 
+static void test_gqa_fused_device() {
+  // The fused decode GQA kernel must be bit-identical to the three-kernel
+  // pipeline (logits -> softmax(1.0) -> value) at the real head shape.
+  const int Hq = 32, Hk = 8, d = 128, kv = 29;  // step 29 of the A/B prompt
+  Xorshift64 rng(0x77e1);
+  std::vector<std::uint16_t> hq(Hq * d), hk(Hk * kv * d), hv(Hk * kv * d);
+  for (auto& t : hq) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& t : hk) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& t : hv) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  const float scale = 0.114456f;  // 1.0 / sqrt(128), the Granite value
+
+  std::uint16_t *dq, *dk, *dv, *dlog, *dp, *dout, *dout2;
+  if (cudaMalloc(&dq, hq.size() * 2) || cudaMalloc(&dk, hk.size() * 2) ||
+      cudaMalloc(&dv, hv.size() * 2) || cudaMalloc(&dlog, Hq * kv * 2) ||
+      cudaMalloc(&dp, Hq * kv * 2) || cudaMalloc(&dout, Hq * d * 2) ||
+      cudaMalloc(&dout2, Hq * d * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, hq.data(), hq.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, hk.data(), hk.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, hv.data(), hv.size() * 2, cudaMemcpyHostToDevice));
+
+  expect(granite4_kernel_gqa_logits(dq, dk, scale, Hq, Hk, d, kv, dlog) == 0,
+         "fused: logits launch");
+  expect(granite4_kernel_softmax(dlog, 1.0f, Hq, kv, dp) == 0,
+         "fused: softmax launch");
+  expect(granite4_kernel_gqa_value(dp, dv, Hq, Hk, d, kv, dout) == 0,
+         "fused: value launch");
+  expect(granite4_kernel_gqa_fused(dq, dk, dv, scale, Hq, Hk, d, kv, dout2) == 0,
+         "fused: gqa_fused launch");
+
+  std::vector<std::uint16_t> ref(Hq * d), alt(Hq * d);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dout, ref.size() * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(alt.data(), dout2, alt.size() * 2, cudaMemcpyDeviceToHost));
+  int bad = 0;
+  for (std::size_t i = 0; i < ref.size(); ++i)
+    if (ref[i] != alt[i]) ++bad;
+  expect(bad == 0, "gqa_fused is bit-identical to the logits/softmax/value pipeline");
+  cudaFree(dq);
+  cudaFree(dk);
+  cudaFree(dv);
+  cudaFree(dlog);
+  cudaFree(dp);
+  cudaFree(dout);
+  cudaFree(dout2);
+}
+
 static void test_paged_kv_compact_device() {
   // P3: gather one layer's K/V out of the paged FP8 pool into contiguous
   // [Hk, kv_len, d] BF16 and check it bit-exactly against the host reference
@@ -539,6 +590,7 @@ int main() {
   test_gemm_device();
   test_row_gemm_device();
   test_attention_device();
+  test_gqa_fused_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();

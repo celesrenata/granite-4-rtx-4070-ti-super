@@ -209,6 +209,69 @@ __global__ void gqa_value_kernel(const std::uint16_t* p, const std::uint16_t* v,
 }
 
 // ---------------------------------------------------------------------------
+// Fused decode GQA: logits -> softmax -> value in ONE block per Q head.
+// Bit-identical to the three-kernel pipeline (gqa_logits_kernel +
+// softmax_kernel + gqa_value_kernel): the bf16 logits and bf16 probabilities
+// are materialized in shared memory exactly as the pipeline's global scratch
+// buffers would hold them, and each stage's arithmetic (summation order,
+// bf16 rounding, the double-precision softmax denominator) is reproduced
+// verbatim. Removes two launches per layer and the two global scratch
+// round-trips. Needs d + 2*kv_len bf16 of shared memory (48 KiB default
+// limit covers kv_len up to ~24 K).
+// ---------------------------------------------------------------------------
+__global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
+                                 const std::uint16_t* v, float att_scale, int Hq,
+                                 int Hk, int d, int kv_len, std::uint16_t* out) {
+  const int hq = blockIdx.x;
+  const int hkv = hq / (Hq / Hk);
+  const int t = threadIdx.x;
+  const int nt = blockDim.x;  // blockDim.x == d
+
+  extern __shared__ std::uint16_t smem[];
+  std::uint16_t* const sq = smem;              // [d]
+  std::uint16_t* const slog = smem + d;        // [kv_len] bf16 logits
+  std::uint16_t* const sp = smem + d + kv_len;  // [kv_len] bf16 probs
+
+  // Preload the q head row once (identical values to re-reading global).
+  for (int i = t; i < d; i += nt) sq[i] = q[hq * d + i];
+  __syncthreads();
+
+  // Phase A: bf16 logits[hq, kv] = att_scale * dot(q[hq], k[hkv, kv]).
+  for (int kv = t; kv < kv_len; kv += nt) {
+    const int kbase = (hkv * kv_len + kv) * d;
+    float acc = 0.0f;
+    for (int i = 0; i < d; ++i)
+      acc += bf16_to_f32(k[kbase + i]) * bf16_to_f32(sq[i]);
+    slog[kv] = f32_to_bf16(att_scale * acc);
+  }
+  __syncthreads();
+
+  // Phase B: softmax over the row (scale 1.0f, double-precision denominator)
+  // computed by one thread so the summation order matches the reference
+  // element-wise softmax exactly.
+  if (t == 0) {
+    float m = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < kv_len; ++i)
+      m = fmaxf(m, 1.0f * bf16_to_f32(slog[i]));
+    double sum = 0.0;
+    for (int i = 0; i < kv_len; ++i)
+      sum += std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[i]) - m));
+    for (int i = 0; i < kv_len; ++i)
+      sp[i] = f32_to_bf16(
+          static_cast<float>(std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[i]) - m)) /
+                             sum));
+  }
+  __syncthreads();
+
+  // Phase C: out[hq, i] = sum_kv p[hq, kv] * v[hkv, kv, i].
+  const int i = t;
+  float acc = 0.0f;
+  for (int kv = 0; kv < kv_len; ++kv)
+    acc += bf16_to_f32(sp[kv]) * bf16_to_f32(v[(hkv * kv_len + kv) * d + i]);
+  out[hq * d + i] = f32_to_bf16(acc);
+}
+
+// ---------------------------------------------------------------------------
 // FFN gate/up (SwiGLU): y[r] = silu(sg * Wg[r].x) * (su * Wu[r].x).
 // ---------------------------------------------------------------------------
 
@@ -448,6 +511,16 @@ int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v
                               int Hq, int Hk, int d, int kv_len, std::uint16_t* d_out) {
   granite4::gqa_value_kernel<<<(Hq * d + 255) / 256, 256>>>(
       d_p, d_v, Hq, Hk, d, kv_len, d_out);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
+int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k,
+                              const std::uint16_t* d_v, float att_scale, int Hq,
+                              int Hk, int d, int kv_len, std::uint16_t* d_out) {
+  const int smem_bytes = (d + 2 * kv_len) * sizeof(std::uint16_t);
+  granite4::gqa_fused_kernel<<<Hq, d, smem_bytes>>>(d_q, d_k, d_v, att_scale, Hq, Hk,
+                                                     d, kv_len, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }

@@ -418,6 +418,9 @@ int granite4_kernel_gqa_logits(const std::uint16_t* d_q, const std::uint16_t* d_
                                std::uint16_t* d_logits);
 int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v,
                               int Hq, int Hk, int d, int kv_len, std::uint16_t* d_out);
+int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k,
+                               const std::uint16_t* d_v, float att_scale, int Hq,
+                               int Hk, int d, int kv_len, std::uint16_t* d_out);
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out);
@@ -448,12 +451,11 @@ struct GpuCtx {
   std::uint16_t* kv_v = nullptr;  // [L][Hk][max_pos][d]
   std::uint16_t* compact_k = nullptr;  // [Hk][max_pos][d] working prefix
   std::uint16_t* compact_v = nullptr;  // [Hk][max_pos][d]
-  std::uint16_t* logits_scratch = nullptr;  // [Hq][max_pos]
-  std::uint16_t* probs_scratch = nullptr;   // [Hq][max_pos] (softmax output; the
-                                            // P2 softmax kernel is not in-place
-                                            // safe - one thread reads a whole
-                                            // row while its peers write theirs)
+  std::uint16_t* logits_scratch = nullptr;  // [Hq][max_pos] (fallback path)
+  std::uint16_t* probs_scratch = nullptr;   // [Hq][max_pos] (fallback path)
   std::uint16_t* scratch = nullptr;
+  bool gqa_fusable = true;  // fused GQA fits in the default smem limit
+
   float* cos_tbl = nullptr;  // [max_pos][d/2]
   float* sin_tbl = nullptr;
   int written = 0;  // KV positions written so far
@@ -513,6 +515,11 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
                        sizeof(std::uint16_t));
   if (e == cudaSuccess)
     e = cudaMalloc(&g->scratch, scratch_elems * sizeof(std::uint16_t));
+  // Fused decode GQA keeps [q row + logits + probs] in shared memory:
+  // d + 2*max_positions bf16 elements. The default per-block limit is 48 KiB
+  // (no attribute bump); beyond it the 3-kernel scratch path runs.
+  g->gqa_fusable =
+      static_cast<std::size_t>(g->d) + 2u * max_positions <= 49152u / 2u;
   if (e == cudaSuccess) {
     float* c = nullptr;
     float* s = nullptr;
@@ -737,19 +744,24 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
 
       stamp(2, layer, 1);
       stamp(3, layer, 0);
-      if (granite4_kernel_gqa_logits(d_qf_rot, g->compact_k, att_scale, Hq, Hk, d,
-                                     kv_len, g->logits_scratch) != 0)
-        return seterr("gqa_logits failed");
-      // softmax over the scaled logits (scale 1.0 - the scale was folded
-      // into the logits by gqa_logits, exactly as the oracle does). The P2
-      // kernel reads every element of each row while writing its own
-      // element, so the output must be a separate buffer (no in-place).
-      if (granite4_kernel_softmax(g->logits_scratch, 1.0f, Hq, kv_len,
-                                  g->probs_scratch) != 0)
-        return seterr("softmax failed");
-      if (granite4_kernel_gqa_value(g->probs_scratch, g->compact_v, Hq, Hk, d,
-                                    kv_len, d_attn_out) != 0)
-        return seterr("gqa_value failed");
+      if (g->gqa_fusable) {
+        if (granite4_kernel_gqa_fused(d_qf_rot, g->compact_k, g->compact_v, att_scale,
+                                      Hq, Hk, d, kv_len, d_attn_out) != 0)
+          return seterr("gqa_fused failed");
+      } else {
+        // Fallback for very long sequences: the classic three-kernel path
+        // over global scratch (the fused kernel's shared-memory row exceeds
+        // the 48 KiB default limit).
+        if (granite4_kernel_gqa_logits(d_qf_rot, g->compact_k, att_scale, Hq, Hk,
+                                       d, kv_len, g->logits_scratch) != 0)
+          return seterr("gqa_logits failed");
+        if (granite4_kernel_softmax(g->logits_scratch, 1.0f, Hq, kv_len,
+                                   g->probs_scratch) != 0)
+          return seterr("softmax failed");
+        if (granite4_kernel_gqa_value(g->probs_scratch, g->compact_v, Hq, Hk, d,
+                                     kv_len, d_attn_out) != 0)
+          return seterr("gqa_value failed");
+      }
       gstamp(1, layer, 0);
       row_gemm_dequant_resid_kernel<<<H, kRowGemvThreads>>>(
           d_attn_out, wo, sl[3], d_hidden, resid_scale, H, H, d_hidden);
