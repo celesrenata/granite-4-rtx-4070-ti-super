@@ -298,8 +298,7 @@ aggregate (65% of the 631.9 GB/s roofline; the L2-flush writeback inflates
 its per-call times relative to the in-context run). The in-context step is
 16.5 ms (≈60 tps) against the ≈75 tps measured ceiling, so the GEMV path
 remains the only lever; further gains would need split-K reductions (the
-latter changes summation order and needs the bit-exact token gate) or a
-wider memory-level-parallelism pass on the GEMV loads.
+latter changes summation order and needs the bit-exact token gate).
 
 Tried and rejected (same-run A/B, `G4_TIMESTEP=1`, token-identical): a
 16-byte-load form of the fused SwiGLU gate/up kernel (`kernels_phase2.cu`)
@@ -307,6 +306,15 @@ read 18.64–18.78 ms/step vs 18.29–18.33 ms for the 256-thread baseline it
 was compared against. That block already streams two fp8 rows (8 bytes/lane)
 with a shared activation decode, so widening it doubles register pressure
 for no extra bytes in flight.
+
+Tried and rejected: pairing the two half-rows of the GEMV vector path
+(each lane loads chunk g and g + K/2 in one iteration with separate
+accumulators - deeper memory-level parallelism) read 16.81–16.85 ms/step
+vs 16.50–16.63 ms committed. Weight and activation bytes are still each
+read exactly once per block, so the cost is register pressure: the lane
+holds two in-flight uint4 weight vectors and two decode pipelines at once,
+which drops blocks-per-SM and hurts latency hiding more than the extra
+MLP helps.
 
 ## Rules across phases
 
