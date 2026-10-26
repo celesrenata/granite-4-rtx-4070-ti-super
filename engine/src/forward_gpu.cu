@@ -146,11 +146,21 @@ __global__ void kv_compact_kernel(const std::uint16_t* cache, std::uint16_t* out
         cache[(static_cast<std::size_t>(hkv) * pos + kv) * d + i];
 }
 
-// One launch per layer for both k and v: append this position's RoPE'd K and
-// raw V to the history and gather the causal prefix 0..kv_len-1 into the
-// contiguous buffers the gqa kernels consume. Each thread owns (hkv, i) and
-// walks the columns; the appended slot is the value it just loaded, so there
-// is no read-after-write hazard across threads.
+// Append-only form (direct-cache GQA): store this position's RoPE'd K and raw
+// V in the persistent [Hk][max_pos][d] cache; attention reads the cache rows
+// directly with max_pos as the stride, so the per-step prefix gather is gone.
+__global__ void kv_append_kernel(const std::uint16_t* src_k, const std::uint16_t* src_v,
+                                 std::uint16_t* cache_k, std::uint16_t* cache_v,
+                                 int t, int pos, int Hk, int d) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= Hk * d) return;
+  const int hkv = idx / d;
+  const int i = idx % d;
+  const std::size_t cache_row = static_cast<std::size_t>(hkv) * pos * d;
+  cache_k[cache_row + static_cast<std::size_t>(t) * d + i] = src_k[idx];
+  cache_v[cache_row + static_cast<std::size_t>(t) * d + i] = src_v[idx];
+}
+
 __global__ void kv_append_compact_kernel(const std::uint16_t* src_k,
                                          const std::uint16_t* src_v,
                                          std::uint16_t* cache_k,
@@ -420,7 +430,8 @@ int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v
                               int Hq, int Hk, int d, int kv_len, std::uint16_t* d_out);
 int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k,
                                const std::uint16_t* d_v, float att_scale, int Hq,
-                               int Hk, int d, int kv_len, std::uint16_t* d_out);
+                               int Hk, int d, int kv_len, int k_stride,
+                               std::uint16_t* d_out);
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out);
@@ -455,6 +466,7 @@ struct GpuCtx {
   std::uint16_t* probs_scratch = nullptr;   // [Hq][max_pos] (fallback path)
   std::uint16_t* scratch = nullptr;
   bool gqa_fusable = true;  // fused GQA fits in the default smem limit
+  bool direct_kv = false;   // A/B: fused GQA indexes the persistent cache
 
   float* cos_tbl = nullptr;  // [max_pos][d/2]
   float* sin_tbl = nullptr;
@@ -520,6 +532,11 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
   // (no attribute bump); beyond it the 3-kernel scratch path runs.
   g->gqa_fusable =
       static_cast<std::size_t>(g->d) + 2u * max_positions <= 49152u / 2u;
+  // Direct-cache GQA (skip the per-step prefix gather) is an A/B switch.
+  {
+    const char* dkv = std::getenv("G4_DIRECT_KV");
+    g->direct_kv = dkv == nullptr || dkv[0] == '1';
+  }
   if (e == cudaSuccess) {
     float* c = nullptr;
     float* s = nullptr;
@@ -733,20 +750,31 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
           d_qf, d_k_new, cos_t, sin_t, Hq, Hk, d, d_qf_rot, d_k_new_rot);
       G4_CUDA_CHECK(cudaGetLastError());
 
-      // Append this position's RoPE'd K and raw V to the history and gather
-      // the causal prefix into the contiguous [Hk][t+1][d] layout the gqa
-      // kernels consume (append + compact in one launch for k and v).
+      // Append this position's RoPE'd K and raw V to the history. In direct
+      // mode attention reads the persistent cache rows straight out of
+      // [Hk][max_pos][d]; otherwise gather the causal prefix into the
+      // contiguous [Hk][t+1][d] buffers the gqa kernels consume.
       const int kv_len = t + 1;
-      kv_append_compact_kernel<<<(Hk * d + 255) / 256, 256>>>(
-          d_k_new_rot, d_v_new, g->kv_k + kv_layer, g->kv_v + kv_layer,
-          g->compact_k, g->compact_v, kv_len, t, max_pos, Hk, d);
+      const bool direct_kv = g->direct_kv && g->gqa_fusable;
+      if (direct_kv) {
+        kv_append_kernel<<<(Hk * d + 255) / 256, 256>>>(
+            d_k_new_rot, d_v_new, g->kv_k + kv_layer, g->kv_v + kv_layer, t, max_pos,
+            Hk, d);
+      } else {
+        kv_append_compact_kernel<<<(Hk * d + 255) / 256, 256>>>(
+            d_k_new_rot, d_v_new, g->kv_k + kv_layer, g->kv_v + kv_layer,
+            g->compact_k, g->compact_v, kv_len, t, max_pos, Hk, d);
+      }
       G4_CUDA_CHECK(cudaGetLastError());
 
       stamp(2, layer, 1);
       stamp(3, layer, 0);
       if (g->gqa_fusable) {
-        if (granite4_kernel_gqa_fused(d_qf_rot, g->compact_k, g->compact_v, att_scale,
-                                      Hq, Hk, d, kv_len, d_attn_out) != 0)
+        const std::uint16_t* const k_attn = direct_kv ? g->kv_k + kv_layer : g->compact_k;
+        const std::uint16_t* const v_attn = direct_kv ? g->kv_v + kv_layer : g->compact_v;
+        const int k_stride = direct_kv ? max_pos : kv_len;
+        if (granite4_kernel_gqa_fused(d_qf_rot, k_attn, v_attn, att_scale, Hq, Hk,
+                                      d, kv_len, k_stride, d_attn_out) != 0)
           return seterr("gqa_fused failed");
       } else {
         // Fallback for very long sequences: the classic three-kernel path

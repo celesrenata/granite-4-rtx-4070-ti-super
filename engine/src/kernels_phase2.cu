@@ -221,7 +221,8 @@ __global__ void gqa_value_kernel(const std::uint16_t* p, const std::uint16_t* v,
 // ---------------------------------------------------------------------------
 __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
                                  const std::uint16_t* v, float att_scale, int Hq,
-                                 int Hk, int d, int kv_len, std::uint16_t* out) {
+                                 int Hk, int d, int kv_len, int k_stride,
+                                 std::uint16_t* out) {
   const int hq = blockIdx.x;
   const int hkv = hq / (Hq / Hk);
   const int t = threadIdx.x;
@@ -238,7 +239,7 @@ __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
 
   // Phase A: bf16 logits[hq, kv] = att_scale * dot(q[hq], k[hkv, kv]).
   for (int kv = t; kv < kv_len; kv += nt) {
-    const int kbase = (hkv * kv_len + kv) * d;
+    const int kbase = (hkv * k_stride + kv) * d;
     float acc = 0.0f;
     for (int i = 0; i < d; ++i)
       acc += bf16_to_f32(k[kbase + i]) * bf16_to_f32(sq[i]);
@@ -267,7 +268,7 @@ __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
   const int i = t;
   float acc = 0.0f;
   for (int kv = 0; kv < kv_len; ++kv)
-    acc += bf16_to_f32(sp[kv]) * bf16_to_f32(v[(hkv * kv_len + kv) * d + i]);
+    acc += bf16_to_f32(sp[kv]) * bf16_to_f32(v[(hkv * k_stride + kv) * d + i]);
   out[hq * d + i] = f32_to_bf16(acc);
 }
 
@@ -517,10 +518,11 @@ int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v
 
 int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k,
                               const std::uint16_t* d_v, float att_scale, int Hq,
-                              int Hk, int d, int kv_len, std::uint16_t* d_out) {
+                              int Hk, int d, int kv_len, int k_stride,
+                              std::uint16_t* d_out) {
   const int smem_bytes = (d + 2 * kv_len) * sizeof(std::uint16_t);
   granite4::gqa_fused_kernel<<<Hq, d, smem_bytes>>>(d_q, d_k, d_v, att_scale, Hq, Hk,
-                                                     d, kv_len, d_out);
+                                                     d, kv_len, k_stride, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }

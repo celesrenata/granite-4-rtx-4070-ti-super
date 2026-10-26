@@ -278,6 +278,15 @@ last two are additionally token-identical end-to-end):
    decode 16.50-16.63 → 16.52-16.58 ms (within run noise, token-identical).
    Keep the smaller launch: it is not a regression and saves about 70 µs in
    the instrumented bucket.
+9. **Direct-cache GQA** — the append step now writes only the current K/V
+   slot to the persistent `[Hk][max_pos][d]` cache, and fused GQA indexes
+   that cache directly with `max_pos` as its row stride. This removes the
+   per-layer causal-prefix gather and its full-prefix BF16 read/write traffic.
+   Same-run A/B at the 5-token prompt and 24-token decode: `attn_a`
+   0.80 → 0.24 ms and full step 16.51-16.56 → 16.06-16.09 ms, about
+   0.47 ms/step faster. Output is token-identical. The direct path is the
+   default; `G4_DIRECT_KV=0` restores the compact-prefix rollback path.
+   A padded-stride device test checks direct-cache GQA bit identity.
 
 Parity: the GPU forward matches the host oracle within bf16 rounding
 (max |Δlogit| ≈ 1.1 bf16, same as P3); greedy `generate --gpu 1` (24

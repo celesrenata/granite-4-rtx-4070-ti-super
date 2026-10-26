@@ -38,7 +38,8 @@ extern "C" int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::ui
                                          int Hq, int Hk, int d, int kv_len, std::uint16_t* d_out);
 extern "C" int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k,
                                          const std::uint16_t* d_v, float att_scale, int Hq,
-                                         int Hk, int d, int kv_len, std::uint16_t* d_out);
+                                         int Hk, int d, int kv_len, int k_stride,
+                                         std::uint16_t* d_out);
 extern "C" int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                            const std::uint16_t* d_x, float scale_g, float scale_u,
                                            int N, int K, std::uint16_t* d_out);
@@ -401,7 +402,7 @@ static void test_gqa_fused_device() {
          "fused: softmax launch");
   expect(granite4_kernel_gqa_value(dp, dv, Hq, Hk, d, kv, dout) == 0,
          "fused: value launch");
-  expect(granite4_kernel_gqa_fused(dq, dk, dv, scale, Hq, Hk, d, kv, dout2) == 0,
+  expect(granite4_kernel_gqa_fused(dq, dk, dv, scale, Hq, Hk, d, kv, kv, dout2) == 0,
          "fused: gqa_fused launch");
 
   std::vector<std::uint16_t> ref(Hq * d), alt(Hq * d);
@@ -411,6 +412,40 @@ static void test_gqa_fused_device() {
   for (std::size_t i = 0; i < ref.size(); ++i)
     if (ref[i] != alt[i]) ++bad;
   expect(bad == 0, "gqa_fused is bit-identical to the logits/softmax/value pipeline");
+
+  // Direct-cache form: the same rows with a padded row stride (the persistent
+  // cache is [Hk][max_pos][d], max_pos >= kv_len) must give identical output.
+  const int pad = 7;  // max_pos - kv_len in the padded cache
+  std::uint16_t* dkc = nullptr;
+  std::uint16_t* dvc = nullptr;
+  std::uint16_t* dout3 = nullptr;
+  if (cudaMalloc(&dkc, static_cast<std::size_t>(Hk) * (kv + pad) * d * 2) ||
+      cudaMalloc(&dvc, static_cast<std::size_t>(Hk) * (kv + pad) * d * 2) ||
+      cudaMalloc(&dout3, Hq * d * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemset(dkc, 0xff, static_cast<std::size_t>(Hk) * (kv + pad) * d * 2));
+  CUDA_CHECK(cudaMemset(dvc, 0xff, static_cast<std::size_t>(Hk) * (kv + pad) * d * 2));
+  for (int h = 0; h < Hk; ++h) {
+    CUDA_CHECK(cudaMemcpy(dkc + static_cast<std::size_t>(h) * (kv + pad) * d,
+                          hk.data() + static_cast<std::size_t>(h) * kv * d,
+                          static_cast<std::size_t>(kv) * d * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dvc + static_cast<std::size_t>(h) * (kv + pad) * d,
+                          hv.data() + static_cast<std::size_t>(h) * kv * d,
+                          static_cast<std::size_t>(kv) * d * 2, cudaMemcpyHostToDevice));
+  }
+  expect(granite4_kernel_gqa_fused(dq, dkc, dvc, scale, Hq, Hk, d, kv, kv + pad, dout3) == 0,
+         "fused: gqa_fused direct-cache launch");
+  std::vector<std::uint16_t> alt3(Hq * d);
+  CUDA_CHECK(cudaMemcpy(alt3.data(), dout3, alt3.size() * 2, cudaMemcpyDeviceToHost));
+  bad = 0;
+  for (std::size_t i = 0; i < ref.size(); ++i)
+    if (ref[i] != alt3[i]) ++bad;
+  expect(bad == 0, "gqa_fused direct-cache stride is bit-identical to the compact form");
+  cudaFree(dkc);
+  cudaFree(dvc);
+  cudaFree(dout3);
   cudaFree(dq);
   cudaFree(dk);
   cudaFree(dv);
