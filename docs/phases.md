@@ -294,6 +294,15 @@ last two are additionally token-identical end-to-end):
    (inside bf16 rounding; output token-identical). Same-run A/B:
    `attn_g` 2.68 → 2.47 ms, `ffn_g` 7.61 → 7.39 ms, full step
    16.06-16.09 → 15.74-15.77 ms (~0.32 ms/step).
+11. **Parallel softmax exponentials in fused GQA** — Phase B's serial
+   thread-0 loop ran ~58 double-precision `exp()` calls per layer, which are
+   slow on consumer Ada. The exp terms are now computed across the block and
+   accumulated in ascending kv order by one thread, so the double denominator
+   and the bf16 probabilities are the same sequence of additions as the
+   reference (bit-identical, token-identical). Parallel form covers
+   `kv_len <= 512`; longer contexts keep the exact serial loop. Same-run
+   A/B: `attn_o` 2.50 → 1.89 ms, full step 15.74-15.77 → 15.16-15.21 ms
+   (~0.55 ms/step).
 
 Parity: the GPU forward matches the host oracle within bf16 rounding
 (max |Δlogit| ≈ 1.1 bf16, same as P3); greedy `generate --gpu 1` (24

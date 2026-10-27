@@ -224,7 +224,15 @@ __global__ void gqa_value_kernel(const std::uint16_t* p, const std::uint16_t* v,
 // verbatim. Removes two launches per layer and the two global scratch
 // round-trips. Needs d + 2*kv_len bf16 of shared memory (48 KiB default
 // limit covers kv_len up to ~24 K).
+//
+// Phase B runs the exp() terms in parallel but accumulates them in ascending
+// kv order by one thread: the sequence of double additions is identical to
+// the serial reference, so the denominator and probabilities stay
+// bit-identical. The parallel form needs kv_len doubles of extra shared
+// memory; beyond kGqaSoftmaxParallelMax the exact serial loop runs.
 // ---------------------------------------------------------------------------
+static constexpr int kGqaSoftmaxParallelMax = 512;
+
 __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
                                  const std::uint16_t* v, float att_scale, int Hq,
                                  int Hk, int d, int kv_len, int k_stride,
@@ -238,6 +246,14 @@ __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
   std::uint16_t* const sq = smem;              // [d]
   std::uint16_t* const slog = smem + d;        // [kv_len] bf16 logits
   std::uint16_t* const sp = smem + d + kv_len;  // [kv_len] bf16 probs
+  const std::size_t base_elems =
+      static_cast<std::size_t>(d) + 2u * static_cast<std::size_t>(kv_len);
+  const std::size_t exp_off = (base_elems + 3u) & ~std::size_t(3);  // 8B align
+  double* const dexp = (kv_len <= kGqaSoftmaxParallelMax)
+                           ? reinterpret_cast<double*>(smem + exp_off)
+                           : nullptr;
+  __shared__ float smax;     // row max (Phase B)
+  __shared__ double sdenom;  // softmax denominator (Phase B)
 
   // Preload the q head row once (identical values to re-reading global).
   for (int i = t; i < d; i += nt) sq[i] = q[hq * d + i];
@@ -253,19 +269,34 @@ __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
   }
   __syncthreads();
 
-  // Phase B: softmax over the row (scale 1.0f, double-precision denominator)
-  // computed by one thread so the summation order matches the reference
-  // element-wise softmax exactly.
+  // Phase B: preserve the reference max and ordered double denominator.
+  // Only the expensive exp() calls are distributed across the block.
   if (t == 0) {
     float m = -std::numeric_limits<float>::infinity();
     for (int i = 0; i < kv_len; ++i)
       m = fmaxf(m, 1.0f * bf16_to_f32(slog[i]));
+    smax = m;
+  }
+  __syncthreads();
+  if (dexp != nullptr) {
+    for (int i = t; i < kv_len; i += nt)
+      dexp[i] = std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[i]) - smax));
+    __syncthreads();
+    if (t == 0) {
+      double sum = 0.0;
+      for (int i = 0; i < kv_len; ++i) sum += dexp[i];
+      sdenom = sum;
+    }
+    __syncthreads();
+    for (int i = t; i < kv_len; i += nt)
+      sp[i] = f32_to_bf16(static_cast<float>(dexp[i] / sdenom));
+  } else if (t == 0) {
     double sum = 0.0;
     for (int i = 0; i < kv_len; ++i)
-      sum += std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[i]) - m));
+      sum += std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[i]) - smax));
     for (int i = 0; i < kv_len; ++i)
       sp[i] = f32_to_bf16(
-          static_cast<float>(std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[i]) - m)) /
+          static_cast<float>(std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[i]) - smax)) /
                              sum));
   }
   __syncthreads();
@@ -526,7 +557,11 @@ int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k
                               const std::uint16_t* d_v, float att_scale, int Hq,
                               int Hk, int d, int kv_len, int k_stride,
                               std::uint16_t* d_out) {
-  const int smem_bytes = (d + 2 * kv_len) * sizeof(std::uint16_t);
+  const std::size_t base_elems = static_cast<std::size_t>(d) + 2u * kv_len;
+  const std::size_t exp_elems = (kv_len <= granite4::kGqaSoftmaxParallelMax) ? kv_len : 0u;
+  const std::size_t smem_bytes =
+      ((base_elems + exp_elems * (sizeof(double) / sizeof(std::uint16_t)) + 3u) & ~std::size_t(3)) *
+      sizeof(std::uint16_t);
   granite4::gqa_fused_kernel<<<Hq, d, smem_bytes>>>(d_q, d_k, d_v, att_scale, Hq, Hk,
                                                      d, kv_len, k_stride, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
