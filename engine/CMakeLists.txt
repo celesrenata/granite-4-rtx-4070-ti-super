@@ -113,6 +113,9 @@ if(GRANITE_ENABLE_CUDA)
                  src/verify_gemv.cu tests/test_verify_gemv.cu)
   target_link_libraries(granite4-verify-gemv-test PRIVATE CUDA::cudart)
   add_test(NAME verify_gemv_device COMMAND granite4-verify-gemv-test)
+  add_executable(granite4-verify-gemv-bench
+                 src/verify_gemv.cu tests/verify_gemv_bench.cu)
+  target_link_libraries(granite4-verify-gemv-bench PRIVATE CUDA::cudart)
 endif()
 
 # Phase 1 checkpoint CLI (host-only: verify + FP8 export). Linked statically

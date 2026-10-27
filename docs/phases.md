@@ -303,6 +303,16 @@ last two are additionally token-identical end-to-end):
    `kv_len <= 512`; longer contexts keep the exact serial loop. Same-run
    A/B: `attn_o` 2.50 → 1.89 ms, full step 15.74-15.77 → 15.16-15.21 ms
    (~0.55 ms/step).
+12. **Fused-k speculative verify GEMV primitive** — the standalone
+   `granite4-verify-gemv-bench` streams each FP8 weight row once while
+   accumulating up to four BF16 activation rows. On `gremlin-2`, with a
+   4096×4096 FP8 projection and 30 iterations: k=2 is 1.85× faster than
+   two single-token launches, k=3 is 2.14×, and k=4 is 2.29× (32.2 →
+   14.0 µs/token). The device correctness test passes. This is not yet an
+   end-to-end speculative path: k-token RMSNorm, RoPE, causal GQA/KV append,
+   candidate generation, and the exact accept/reject gate remain to be
+   implemented; the primitive is deliberately not linked into production
+   decode.
 
 Parity: the GPU forward matches the host oracle within bf16 rounding
 (max |Δlogit| ≈ 1.1 bf16, same as P3); greedy `generate --gpu 1` (24

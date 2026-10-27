@@ -174,6 +174,7 @@
             install -m 0755 build/engine/granite4-kernel-bench $out/bin/
             install -m 0755 build/engine/granite4-gemv-bench $out/bin/
             install -m 0755 build/engine/granite4-verify-gemv-test $out/bin/
+            install -m 0755 build/engine/granite4-verify-gemv-bench $out/bin/
             install -m 0755 build/engine/granite4-infer $out/bin/
             install -m 0644 engine/src/*.h $out/include/granite4/
           '';
