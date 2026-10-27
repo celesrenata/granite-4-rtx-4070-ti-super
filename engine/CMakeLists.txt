@@ -18,6 +18,8 @@ set(GRANITE_ENGINE_SOURCES
   src/checkpoint_main.cc
   src/kv_pool.h
   src/kv_pool.cc
+  src/draft_lookup.h
+  src/draft_lookup.cc
   src/weights.h
   src/weights.cc)
 
@@ -85,6 +87,12 @@ add_test(NAME kernel_math COMMAND granite4-kernel-math-test)
 add_executable(granite4-kv-pool-test tests/test_kv_pool.cc)
 target_link_libraries(granite4-kv-pool-test PRIVATE granite4_static)
 add_test(NAME kv_pool COMMAND granite4-kv-pool-test)
+
+# Speculative drafters (host-only): prompt-lookup proposals are verified by
+# the target model, so they carry no weights and no GPU dependency.
+add_executable(granite4-draft-lookup-test tests/test_draft_lookup.cc)
+target_link_libraries(granite4-draft-lookup-test PRIVATE granite4_static)
+add_test(NAME draft_lookup COMMAND granite4-draft-lookup-test)
 
 if(GRANITE_ENABLE_CUDA)
   add_executable(granite4-kernel-test tests/test_kernels.cu)

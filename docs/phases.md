@@ -177,7 +177,7 @@ artifact either way). P4 (benchmarking) then tunes the GPU path.
 Exit criteria: benchmark table lands in `docs/` **with reproduction
 commands**; only numbers measured in this phase may be stated anywhere.
 
-### P4 result (measured on gremlin-2, RTX 4070 Ti SUPER, sm_89, CUDA 13.3,
+### P4 result (measured on gremlin-1, RTX 4070 Ti SUPER, sm_89, CUDA 13.3,
 16 GB, stock clocks/power; build `nix build .#engine-cuda`)
 
 | Quantity | Value | Conditions |
@@ -305,7 +305,7 @@ last two are additionally token-identical end-to-end):
    (~0.55 ms/step).
 12. **Fused-k speculative verify GEMV primitive** — the standalone
    `granite4-verify-gemv-bench` streams each FP8 weight row once while
-   accumulating up to four BF16 activation rows. On `gremlin-2`, with a
+   accumulating up to four BF16 activation rows. On `gremlin-1`, with a
    4096×4096 FP8 projection and 30 iterations: k=2 is 1.85× faster than
    two single-token launches, k=3 is 2.14×, and k=4 is 2.29× (32.2 →
    14.0 µs/token). The device correctness test passes. This is not yet an
