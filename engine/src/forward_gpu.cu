@@ -956,6 +956,10 @@ int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
 
 int gpu_ctx_written(GpuCtx* ctx) { return ctx != nullptr ? ctx->written : 0; }
 
+void gpu_ctx_reset(GpuCtx* ctx) {
+  if (ctx != nullptr) ctx->written = 0;
+}
+
 // Test launcher for the coalesced GEMV (consumed by tests/test_kernels.cu):
 // one block per output row, 256 threads - the launch the forward uses.
 extern "C" int granite4_kernel_row_gemm_dequant(const std::uint16_t* d_a,

@@ -14,17 +14,24 @@
 //     the reference (parity is checked by running both and diffing).
 //
 //   generate --checkpoint DIR --tokens "id,..." --max-tokens N
-//            [--seed S] [--gpu 1]
+//            [--seed S] [--gpu 1] [--draft-lookup K]
 //     Greedy (seed=0) or seeded top-p generation, emitting the produced
 //     token ids as JSON. (Tokenization/detokenization is done by the caller -
 //     the Python harness - so this path is token-level, not text-level.)
 //     With `--gpu 1` the per-step forward runs on the device.
+//     `--draft-lookup K` (greedy only) proposes up to K repeated spans from
+//     the token history, verifies each proposal against the target's greedy
+//     argmax one position at a time, and commits the accepted prefix. It
+//     prints `G4_DRAFT steps=... proposed=... accepted=...` to stderr so the
+//     acceptance rate can be measured before the fused k-token verify path
+//     is integrated.
 //
 // Tokenization is intentionally NOT done here: the checkpoint ships an HF
 // `tokenizer.json` that the Python harness loads with the `tokenizers`
 // library, keeping token-for-token parity on one side.
 
 #include "checkpoint.h"
+#include "draft_lookup.h"
 #include "kernel_math.h"
 #include "weights.h"
 
@@ -258,6 +265,10 @@ struct GpuSession {
                                   cudaMemcpyDeviceToHost));
     return true;
   }
+
+  // Discard every cached position: the next step replays from position 0.
+  // Used to drop KV rows written for rejected speculative drafts.
+  void reset() { gpu_ctx_reset(ctx); }
 };
 
 #endif  // GRANITE_CUDA
@@ -266,13 +277,14 @@ struct GpuSession {
 
 bool parse_args(int argc, char** argv, std::string* sub, std::string* dir,
                 std::vector<std::int32_t>* tokens, int* max_tokens, long* seed,
-                int* last, int* gpu) {
+                int* last, int* gpu, int* draft_k) {
   *sub = "";
   *dir = "";
   *max_tokens = 0;
   *seed = 0;
   *last = 0;
   *gpu = 0;
+  *draft_k = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "forward" || a == "generate") {
@@ -294,6 +306,8 @@ bool parse_args(int argc, char** argv, std::string* sub, std::string* dir,
       *last = std::atoi(argv[++i]);
     } else if (a == "--gpu" && i + 1 < argc) {
       *gpu = std::atoi(argv[++i]);
+    } else if (a == "--draft-lookup" && i + 1 < argc) {
+      *draft_k = std::atoi(argv[++i]);
     } else {
       return false;
     }
@@ -306,16 +320,16 @@ bool parse_args(int argc, char** argv, std::string* sub, std::string* dir,
 int main(int argc, char** argv) {
   std::string sub, dir, err;
   std::vector<std::int32_t> tokens;
-  int max_tokens = 0, last = 0, gpu = 0;
+  int max_tokens = 0, last = 0, gpu = 0, draft_k = 0;
   long seed = 0;
   if (!parse_args(argc, argv, &sub, &dir, &tokens, &max_tokens, &seed, &last,
-                  &gpu)) {
+                  &gpu, &draft_k)) {
     std::fprintf(
         stderr,
         "usage: granite4-infer forward --checkpoint DIR --tokens id,id,... "
         "[--last N] [--gpu 0|1]\n"
         "       granite4-infer generate --checkpoint DIR --tokens id,id,... "
-        "--max-tokens N [--seed S] [--gpu 0|1]\n");
+        "--max-tokens N [--seed S] [--gpu 0|1] [--draft-lookup K]\n");
     return 2;
   }
 
@@ -401,7 +415,8 @@ int main(int argc, char** argv) {
         return 1;
       }
       const int max_pos =
-          static_cast<int>(tokens.size()) + max_tokens;
+          static_cast<int>(tokens.size()) + max_tokens +
+          (draft_k > 0 ? draft_k : 0);
       GpuSession session;
       std::vector<std::uint16_t> logits;
       if (!session.open(gm, w.model, max_pos, &err)) {
@@ -412,6 +427,84 @@ int main(int argc, char** argv) {
 
       std::vector<std::int32_t> seq = tokens;
       std::vector<std::int32_t> generated;
+      // Sample one token from a logits row: greedy for seed=0, seeded top-p
+      // otherwise (the draft path requires greedy so verification is exact).
+      auto sample_row = [&](const std::uint16_t* row, int step_index) -> int {
+        std::vector<float> p(V);
+        for (int i = 0; i < V; ++i) p[i] = bf16_to_f32_host(row[i]);
+        if (seed == 0) return sample_greedy_f32(p.data(), V);
+        Xorshift64 rng(static_cast<std::uint64_t>(seed) +
+                       static_cast<std::uint64_t>(step_index));
+        return sample_top_p_f32(p.data(), /*nucleus=*/0.9f, rng.next_float(), V);
+      };
+
+      if (draft_k > 0) {
+        if (seed != 0) {
+          std::fprintf(stderr, "draft-lookup: greedy only (omit --seed)\n");
+          return 2;
+        }
+        long proposed_total = 0, accepted_total = 0;
+        int steps = 0;
+        while (static_cast<int>(generated.size()) < max_tokens) {
+          // Replay the accepted prefix from position 0. The verification
+          // forwards below advance the KV watermark; reset discards them.
+          session.reset();
+          if (!session.step(seq.data(), static_cast<int>(seq.size()), &logits, &err)) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return 1;
+          }
+          const int len = static_cast<int>(seq.size());
+          const std::uint16_t* row =
+              logits.data() + static_cast<std::size_t>(len - 1) * V;
+          const int next = sample_row(row, 0);
+          seq.push_back(next);
+          generated.push_back(next);
+          ++steps;
+          if (static_cast<int>(generated.size()) >= max_tokens) break;
+
+          // Never propose past the output budget or the ctx's position limit.
+          const int room = std::min(draft_k, max_tokens - static_cast<int>(generated.size()));
+          const int pos_room = max_pos - static_cast<int>(seq.size());
+          const int k = std::min(room, pos_room);
+          const std::vector<std::int32_t> proposal = draft_lookup(seq, k);
+          proposed_total += static_cast<long>(proposal.size());
+          std::vector<std::int32_t> cand = seq;
+          int accepted = 0;
+          for (std::size_t j = 0; j < proposal.size(); ++j) {
+            if (!session.step(cand.data(), static_cast<int>(cand.size()), &logits, &err)) {
+              std::fprintf(stderr, "%s\n", err.c_str());
+              return 1;
+            }
+            const int pos = static_cast<int>(cand.size()) - 1;
+            const std::uint16_t* prow = logits.data() + static_cast<std::size_t>(pos) * V;
+            if (sample_row(prow, 0) != proposal[j]) break;
+            cand.push_back(proposal[j]);
+            ++accepted;
+          }
+          accepted_total += accepted;
+          if (accepted > 0) {
+            const std::vector<std::int32_t> accepted_tokens(
+                cand.begin() + static_cast<long>(seq.size()), cand.end());
+            seq.insert(seq.end(), accepted_tokens.begin(), accepted_tokens.end());
+            generated.insert(generated.end(), accepted_tokens.begin(),
+                             accepted_tokens.end());
+          }
+        }
+        std::fprintf(stderr,
+                     "G4_DRAFT steps=%d proposed=%ld accepted=%ld rate=%.3f\n",
+                     steps, proposed_total, accepted_total,
+                     proposed_total > 0
+                         ? static_cast<double>(accepted_total) / static_cast<double>(proposed_total)
+                         : 0.0);
+        std::printf("{\"generated\":[");
+        for (std::size_t i = 0; i < generated.size(); ++i) {
+          if (i) std::printf(",");
+          std::printf("%d", generated[i]);
+        }
+        std::printf("]}\n");
+        return 0;
+      }
+
       // Prefill: forward the whole prompt once (populates the KV caches and
       // leaves the prompt's final-position row ready to sample from).
       {
@@ -428,16 +521,7 @@ int main(int argc, char** argv) {
         const std::uint16_t* row =
             logits.data() +
             static_cast<std::size_t>(len - 1) * static_cast<std::size_t>(V);
-        std::vector<float> p(V);
-        for (int i = 0; i < V; ++i) p[i] = bf16_to_f32_host(row[i]);
-        int next;
-        if (seed == 0) {
-          next = sample_greedy_f32(p.data(), V);
-        } else {
-          Xorshift64 rng(static_cast<std::uint64_t>(seed) +
-                         static_cast<std::uint64_t>(step));
-          next = sample_top_p_f32(p.data(), /*nucleus=*/0.9f, rng.next_float(), V);
-        }
+        const int next = sample_row(row, step);
         seq.push_back(next);
         generated.push_back(next);
         // Compute the new position's row (skipped on the last step - it is

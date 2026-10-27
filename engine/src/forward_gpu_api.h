@@ -58,6 +58,11 @@ void gpu_weights_free(GpuCtx* ctx);
 // below this value only when end <= written.
 int gpu_ctx_written(GpuCtx* ctx);
 
+// Rewind the KV watermark to 0 without freeing anything. Re-forwarding
+// overwrites the cached rows, so this discards positions produced for
+// rejected speculative drafts.
+void gpu_ctx_reset(GpuCtx* ctx);
+
 // Run the forward pass for positions [start, end) of the token sequence on
 // the current device, where start = min(ctx->written, end): already-processed
 // positions are skipped because their KV entries persist in the ctx caches.
