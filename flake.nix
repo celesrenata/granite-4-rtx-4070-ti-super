@@ -161,7 +161,7 @@
           # run every ctest suite except the GPU-only kernels_device run.
           checkPhase = ''
             ctest --test-dir build --output-on-failure \
-              --exclude-regex kernels_device
+              --exclude-regex 'kernels_device|verify_gemv_device'
           '';
           installPhase = ''
             mkdir -p $out/lib $out/bin $out/include/granite4
@@ -173,6 +173,7 @@
             install -m 0755 build/engine/granite4-kernel-test $out/bin/
             install -m 0755 build/engine/granite4-kernel-bench $out/bin/
             install -m 0755 build/engine/granite4-gemv-bench $out/bin/
+            install -m 0755 build/engine/granite4-verify-gemv-test $out/bin/
             install -m 0755 build/engine/granite4-infer $out/bin/
             install -m 0644 engine/src/*.h $out/include/granite4/
           '';

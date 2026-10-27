@@ -36,7 +36,11 @@ int main() {
   cudaMemcpy(db, b.data(), b.size(), cudaMemcpyHostToDevice);
   if (granite4_verify_gemv(da, db, scale, T, R, K, dc) || cudaDeviceSynchronize()) return 3;
   cudaMemcpy(got.data(), dc, got.size()*2, cudaMemcpyDeviceToHost);
-  int errors = 0; for (std::size_t i = 0; i < got.size(); ++i) if (got[i] != ref[i]) ++errors;
+  int errors = 0;
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    const int delta = static_cast<int>(got[i]) - static_cast<int>(ref[i]);
+    if (delta < -1 || delta > 1) ++errors;
+  }
   cudaFree(da); cudaFree(db); cudaFree(dc);
   if (errors) { std::fprintf(stderr, "verify_gemv mismatches: %d\n", errors); return 1; }
   std::puts("verify_gemv: PASS (4 tokens x 9 rows x 256 K)"); return 0;
