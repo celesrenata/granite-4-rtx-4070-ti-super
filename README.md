@@ -5,12 +5,13 @@ Super (16 GB, sm_89), written in C++20 / CUDA with a dependency-light Python
 stdlib API in front. It is not a general engine: the constants, memory plan and
 kernels are written for this one model on this one GPU.
 
-**Status: Phase 0 scaffold.** There is no inference in this tree. The API
-process, the model-constant surface, the C ABI and the build are in place;
-`POST /v1/chat/completions` validates requests and then returns
-**501 `inference_unavailable`**. Nothing here loads weights, runs a kernel, or
-contains a benchmark number — every figure in [docs/](docs/) is a planning
-estimate, not a measurement.
+**Status: P4 engine / speculative-decoding preparation.** The CUDA engine loads
+FP8 weights, runs the full Granite 4.2 8B forward pass, and serves deterministic
+GPU generation through the native inference binary. On an RTX 4070 Ti Super,
+steady batch-1 decode is currently about **15.2 ms/token (~65 tps)** for the
+5-token prompt benchmark; see [`docs/phases.md`](docs/phases.md) for commands
+and conditions. The Python HTTP layer remains a thin API scaffold while the
+native engine and speculative-decoding kernels evolve.
 
 `reference/qwen3-27b-5090/` is a different model/GPU kept for layout
 conventions only. No kernels, code or numbers were copied from it.
