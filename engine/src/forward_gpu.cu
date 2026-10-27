@@ -956,8 +956,16 @@ int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
 
 int gpu_ctx_written(GpuCtx* ctx) { return ctx != nullptr ? ctx->written : 0; }
 
+int gpu_ctx_truncate(GpuCtx* ctx, int written) {
+  if (ctx == nullptr || written < 0 || written > ctx->written ||
+      written > ctx->max_pos)
+    return -1;
+  ctx->written = written;
+  return 0;
+}
+
 void gpu_ctx_reset(GpuCtx* ctx) {
-  if (ctx != nullptr) ctx->written = 0;
+  (void)gpu_ctx_truncate(ctx, 0);
 }
 
 // Test launcher for the coalesced GEMV (consumed by tests/test_kernels.cu):

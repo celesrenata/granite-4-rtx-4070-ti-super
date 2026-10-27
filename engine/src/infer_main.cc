@@ -269,6 +269,9 @@ struct GpuSession {
   // Discard every cached position: the next step replays from position 0.
   // Used to drop KV rows written for rejected speculative drafts.
   void reset() { gpu_ctx_reset(ctx); }
+
+  // Keep the accepted prefix and discard only speculative rows.
+  bool truncate(int written) { return gpu_ctx_truncate(ctx, written) == 0; }
 };
 
 #endif  // GRANITE_CUDA
