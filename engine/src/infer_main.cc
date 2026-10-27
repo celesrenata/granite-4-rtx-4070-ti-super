@@ -470,6 +470,8 @@ int main(int argc, char** argv) {
           proposed_total += static_cast<long>(proposal.size());
           std::vector<std::int32_t> cand = seq;
           int accepted = 0;
+          bool rejected = false;
+          std::int32_t correction = 0;
           for (std::size_t j = 0; j < proposal.size(); ++j) {
             if (!session.step(cand.data(), static_cast<int>(cand.size()), &logits, &err)) {
               std::fprintf(stderr, "%s\n", err.c_str());
@@ -477,7 +479,14 @@ int main(int argc, char** argv) {
             }
             const int pos = static_cast<int>(cand.size()) - 1;
             const std::uint16_t* prow = logits.data() + static_cast<std::size_t>(pos) * V;
-            if (sample_row(prow, 0) != proposal[j]) break;
+            const int target = sample_row(prow, 0);
+            if (target != proposal[j]) {
+              // Greedy speculative decoding emits the target correction at
+              // the first rejection; dropping it would change the sequence.
+              correction = target;
+              rejected = true;
+              break;
+            }
             cand.push_back(proposal[j]);
             ++accepted;
           }
@@ -488,6 +497,10 @@ int main(int argc, char** argv) {
             seq.insert(seq.end(), accepted_tokens.begin(), accepted_tokens.end());
             generated.insert(generated.end(), accepted_tokens.begin(),
                              accepted_tokens.end());
+          }
+          if (rejected && static_cast<int>(generated.size()) < max_tokens) {
+            seq.push_back(correction);
+            generated.push_back(correction);
           }
         }
         std::fprintf(stderr,

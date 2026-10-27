@@ -313,6 +313,25 @@ last two are additionally token-identical end-to-end):
    candidate generation, and the exact accept/reject gate remain to be
    implemented; the primitive is deliberately not linked into production
    decode.
+13. **Prompt-lookup drafter with measured acceptance** — `granite4-infer
+   generate --draft-lookup K` (greedy only) proposes up to K tokens by
+   copying the continuation of the most recent non-overlapping occurrence of
+   the longest repeated suffix (≥2 tokens), then verifies each proposal
+   against the target's greedy argmax one position at a time. It carries no
+   weights and no extra VRAM, and emits `G4_DRAFT steps=... proposed=...
+   accepted=... rate=...`. Measured on `gremlin-1` with a 24-token budget
+   and K=4: repeated text/list 7/8 accepted (0.875) in 16 steps, repeated
+   Python code 13/17 (0.765) in 9 steps, repeated JSON 11/12 (0.917) in 12
+   steps; ordinary chat produced no proposals (0/0) because the suffix never
+   repeats. Baseline and draft outputs are token-identical on all three
+   structured prompts. A rejected proposal now emits the target's corrective
+   token at the first mismatch (previously it was dropped and recomputed,
+   which cost extra steps); consensus voting across occurrences was tried
+   and measured identical acceptance, so the simpler most-recent copy is
+   kept. This is an acceptance measurement, not a throughput win: the
+   verifications still run one position at a time, so the fused-k GEMV
+   (2.29× at k=4) and batched causal attention/KV append are the next
+   integration step.
 
 Parity: the GPU forward matches the host oracle within bf16 rounding
 (max |Δlogit| ≈ 1.1 bf16, same as P3); greedy `generate --gpu 1` (24
