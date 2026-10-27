@@ -106,6 +106,13 @@ if(GRANITE_ENABLE_CUDA)
   # real model shapes, isolates the per-token weight-streaming cost.
   add_executable(granite4-gemv-bench src/gemv_bench.cu)
   target_link_libraries(granite4-gemv-bench PRIVATE CUDA::cudart)
+
+  # Experimental speculative-decoding verify path. Kept out of granite4 and
+  # production decode until its batched traffic wins on the target workload.
+  add_executable(granite4-verify-gemv-test
+                 src/verify_gemv.cu tests/test_verify_gemv.cu)
+  target_link_libraries(granite4-verify-gemv-test PRIVATE CUDA::cudart)
+  add_test(NAME verify_gemv_device COMMAND granite4-verify-gemv-test)
 endif()
 
 # Phase 1 checkpoint CLI (host-only: verify + FP8 export). Linked statically
