@@ -185,7 +185,7 @@ commands**; only numbers measured in this phase may be stated anywhere.
 | HBM read bandwidth | 631.9 GB/s | `granite4-kernel-bench`, 256 MB read, 100 iters |
 | HBM copy bandwidth | 602.7 GB/s | `granite4-kernel-bench`, 256 MB copy, 100 iters |
 | Per-token weight traffic | 8.38 GB | FP8 8B: 40 layers x 3.22 GB + lm_head 0.41 GB |
-| Decode step (GPU, steady) | **16.5 ms/step ≈ 60 tps** | 5-token prompt, greedy, `--gpu 1`, steady-state steps 27–28 of a 24-token generate with `G4_TIMESTEP=1` (one event pair per call; the `G4_TIMESTEP=2` bucket breakdown adds ~960 event records and reads ~2.4 ms slower, so use it for attribution only); same-run A/B: 18.5 ms (P4 build) → 18.3 ms (16-byte GEMV build) → 18.1 ms (128-thread launch policy) → 17.8 ms (fused QKV) → 17.7 ms (residual adds fused into the O/down GEMV epilogues) → 17.5 ms (fused rope q/k and KV append+compact) → 16.5 ms (fused decode GQA), token-identical |
+| Decode step (GPU, steady) | **15.2 ms/step ≈ 65 tps** | 5-token prompt, greedy, `--gpu 1`, steady-state steps 27–28 of a 24-token generate with `G4_TIMESTEP=1` (one event pair per call; the `G4_TIMESTEP=2` bucket breakdown adds ~440 event records and reads ~2.3 ms slower, so use it for attribution only); same-run A/B: 18.5 ms (P4 build) → 18.3 ms (16-byte GEMV build) → 18.1 ms (128-thread launch policy) → 17.8 ms (fused QKV) → 17.7 ms (residual adds fused into the O/down GEMV epilogues) → 17.5 ms (fused rope q/k and KV append+compact) → 16.5 ms (fused decode GQA) → 16.1 ms (direct-cache GQA) → 15.75 ms (warp-tree RMSNorm) → 15.2 ms (parallel softmax exp), token-identical |
 | GEMV-only decode | 20.3 ms/token (bench) | `granite4-gemv-bench --iters 120`, L2-flushed, real per-layer shapes |
 | Roofline ceiling | ≈75 tps | 631.9 GB/s ÷ 8.38 GB/token |
 
@@ -194,12 +194,12 @@ GEMV effective bandwidth by per-layer shape (`granite4-gemv-bench
 down 417 / lm_head 565.
 
 Per-bucket attribution, `G4_TIMESTEP=2` (ms/step, steady step 28, current
-build; instrumented - the ~960 event records add ~2.4 ms to the 19.1 ms
-total, and the bucket run itself drifts ~0.5 ms run-to-run):
-`attn_g=2.67 attn_a=0.80 attn_o=2.44 ffn_g=7.67 ffn_o=3.85 lm=0.69` plus
-per-GEMV: `gqkv=1.93 go=1.37 ggateup=6.91 gdown=3.63 glm=0.67`. The GEMV
-spans sum to ~14.5 ms (76% of the instrumented total); the rest is
-attention, RMSNorm/residual glue, and KV compaction.
+build; instrumented - the ~440 event records add ~2.3 ms to the 17.5 ms
+total, and the bucket run itself drifts ~0.1 ms run-to-run):
+`attn_g=2.47 attn_a=0.24 attn_o=1.89 ffn_g=7.40 ffn_o=3.85 lm=0.69` plus
+per-GEMV: `gqkv=1.93 go=1.37 ggateup=6.85 gdown=3.64 glm=0.68`. The GEMV
+spans sum to ~14.5 ms (83% of the instrumented total); the rest is
+attention, RMSNorm/residual glue, and KV append.
 
 The Q/K/V projections now share one launch over the concatenated q/k/v row
 ranges, the O-projection and FFN-down GEMVs fold their residual adds into
@@ -328,9 +328,24 @@ G4_TIMESTEP=2 ./result/bin/granite4-infer generate \
 Remaining headroom (optional): the isolated GEMV bench reports ~413 GB/s
 aggregate (65% of the 631.9 GB/s roofline; the L2-flush writeback inflates
 its per-call times relative to the in-context run). The in-context step is
-16.5 ms (≈60 tps) against the ≈75 tps measured ceiling, so the GEMV path
-remains the only lever; further gains would need split-K reductions (the
-latter changes summation order and needs the bit-exact token gate).
+15.2 ms (≈65 tps) against the ≈75 tps measured ceiling; the GEMV spans are
+now at 78–97% of the roofline per shape, so remaining gains are small and
+need split-K reductions (the latter changes summation order and needs the
+bit-exact token gate). The non-GEMV glue is ~0.9 ms of per-launch overhead
+across ~160 small kernels (80 RMSNorm, 40 rope, 40 KV append), which CUDA
+graphs would address; it was not pursued because uninstrumented wall time
+already tracks GPU event time (the CPU is not the limiter).
+
+Tried and rejected: 64-thread blocks for the small-grid QKV and O
+projections (they are latency-limited at 128 threads). Same-run A/B read
+15.13–15.17 ms/step vs 15.16–15.21 committed, and the bucket spans were
+unchanged (`gqkv` 1.93→1.91, `go` 1.36→1.37 - both noise), so 128 threads
+remain.
+
+Tried and rejected: 128-thread RMSNorm (halving the serial thread-0
+reduction but doubling the per-lane strided pass) read 16.65–16.71 ms/step
+vs 16.06–16.09 committed. The warp-tree reduction later fixed the same
+overhead without lengthening the strided pass.
 
 Tried and rejected (same-run A/B, `G4_TIMESTEP=1`, token-identical): a
 16-byte-load form of the fused SwiGLU gate/up kernel (`kernels_phase2.cu`)
