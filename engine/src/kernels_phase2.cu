@@ -680,7 +680,10 @@ int granite4_fp8_decode_all(float** d_out) {
   G4_CUDA_CHECK(cudaMalloc(&d_out_p, 256 * sizeof(float)));
   if (d_out_p == nullptr) return -1;
   granite4::fp8_decode_all_kernel<<<1, 256>>>(d_out_p);
-  G4_CUDA_CHECK(cudaGetLastError());
+  if (cudaGetLastError() != cudaSuccess) {
+    cudaFree(d_out_p);
+    return -1;
+  }
   *d_out = d_out_p;
   return 0;
 }
@@ -698,6 +701,7 @@ int granite4_rope_tables_build(double theta, int head_dim, int max_pos,
   std::vector<float> h_cos, h_sin;
   granite4::rope_freqs_f32(theta, head_dim, max_pos, &h_cos, &h_sin);
   const std::size_t bytes = h_cos.size() * sizeof(float);
+  if (bytes == 0 || h_sin.size() != h_cos.size()) return -1;
   cudaError_t e = cudaMalloc(d_cos, bytes);
   if (e != cudaSuccess) return -1;
   e = cudaMalloc(d_sin, bytes);
