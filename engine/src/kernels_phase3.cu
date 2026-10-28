@@ -11,6 +11,7 @@
 // first tiling, matching the P2 convention); FP8->BF16 is exact, so the
 // result is bit-identical to the host reference paged_kv_compact_bf16.
 #include <cmath>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 
@@ -84,11 +85,14 @@ extern "C" int granite4_kernel_paged_kv_compact(
     const std::uint8_t* d_paged, const std::size_t* d_block_table, int kv_len,
     int tokens_per_page, int num_layers, int Hk, int d, int layer, int which,
     std::uint16_t* d_out) {
-  if (kv_len <= 0 || tokens_per_page <= 0 || num_layers <= 0 || Hk <= 0 ||
+  if (d_paged == nullptr || d_block_table == nullptr || d_out == nullptr ||
+      kv_len <= 0 || tokens_per_page <= 0 || num_layers <= 0 || Hk <= 0 ||
       d <= 0 || layer < 0 || layer >= num_layers || (which != 0 && which != 1)) {
     return 1;
   }
-  const int total = Hk * kv_len * d;
+  const long long total64 = static_cast<long long>(Hk) * kv_len * d;
+  if (total64 > INT_MAX) return 1;
+  const int total = static_cast<int>(total64);
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
   granite4::paged_kv_compact_kernel<<<blocks, threads>>>(
