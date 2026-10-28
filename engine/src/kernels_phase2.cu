@@ -760,6 +760,11 @@ int granite4_kernel_gemm_dequant(const std::uint16_t* d_a, const std::uint8_t* d
 int granite4_kernel_gqa_logits(const std::uint16_t* d_q, const std::uint16_t* d_k,
                                float scale, int Hq, int Hk, int d, int kv_len,
                                std::uint16_t* d_logits) {
+  if (d_q == nullptr || d_k == nullptr || d_logits == nullptr ||
+      !std::isfinite(scale) || Hq <= 0 || Hk <= 0 || d <= 0 || kv_len <= 0 ||
+      Hq < Hk || Hq % Hk != 0 ||
+      static_cast<long long>(Hq) * kv_len > INT_MAX)
+    return -1;
   granite4::gqa_logits_kernel<<<(Hq * kv_len + 255) / 256, 256>>>(
       d_q, d_k, scale, Hq, Hk, d, kv_len, d_logits);
   G4_CUDA_CHECK(cudaGetLastError());
@@ -768,6 +773,10 @@ int granite4_kernel_gqa_logits(const std::uint16_t* d_q, const std::uint16_t* d_
 
 int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v,
                               int Hq, int Hk, int d, int kv_len, std::uint16_t* d_out) {
+  if (d_p == nullptr || d_v == nullptr || d_out == nullptr || Hq <= 0 ||
+      Hk <= 0 || d <= 0 || kv_len <= 0 || Hq < Hk || Hq % Hk != 0 ||
+      static_cast<long long>(Hq) * d > INT_MAX)
+    return -1;
   granite4::gqa_value_kernel<<<(Hq * d + 255) / 256, 256>>>(
       d_p, d_v, Hq, Hk, d, kv_len, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
@@ -778,6 +787,11 @@ int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k
                               const std::uint16_t* d_v, float att_scale, int Hq,
                               int Hk, int d, int kv_len, int k_stride,
                               std::uint16_t* d_out) {
+  if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_out == nullptr ||
+      !std::isfinite(att_scale) || Hq <= 0 || Hk <= 0 || d <= 0 || kv_len <= 0 ||
+      k_stride < kv_len || Hq < Hk || Hq % Hk != 0 ||
+      static_cast<long long>(kv_len) + d > INT_MAX)
+    return -1;
   const std::size_t base_elems = static_cast<std::size_t>(d) + 2u * kv_len;
   const std::size_t exp_elems = (kv_len <= granite4::kGqaSoftmaxParallelMax) ? kv_len : 0u;
   const std::size_t smem_bytes =
