@@ -394,7 +394,8 @@ static void test_verify_gemv_production_parity_device() {
   std::vector<std::uint8_t> b(static_cast<std::size_t>(rows) * k);
   for (auto& v : a) v = gen_bf16(rng);
   for (auto& v : b) v = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
-  std::uint16_t *da, *db, *dv, *dr;
+  std::uint16_t *da, *dv, *dr;
+  std::uint8_t *db;
   if (cudaMalloc(&da, a.size() * 2) || cudaMalloc(&db, b.size()) ||
       cudaMalloc(&dv, static_cast<std::size_t>(tokens) * rows * 2) ||
       cudaMalloc(&dr, static_cast<std::size_t>(tokens) * rows * 2)) {
@@ -430,7 +431,8 @@ static void test_batched_qkv_parity_device() {
   for (auto& x : wv) x = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
   const std::size_t qn = static_cast<std::size_t>(tokens) * nq;
   const std::size_t kn = static_cast<std::size_t>(tokens) * nk;
-  std::uint16_t *da, *dwq, *dwk, *dwv, *dq, *dk, *dv, *rq, *rk, *rv;
+  std::uint16_t *da, *dq, *dk, *dv, *rq, *rk, *rv;
+  std::uint8_t *dwq, *dwk, *dwv;
   if (cudaMalloc(&da, a.size() * 2) || cudaMalloc(&dwq, wq.size()) ||
       cudaMalloc(&dwk, wk.size()) || cudaMalloc(&dwv, wv.size()) ||
       cudaMalloc(&dq, qn * 2) || cudaMalloc(&dk, kn * 2) || cudaMalloc(&dv, kn * 2) ||
