@@ -697,6 +697,9 @@ int granite4_rope_tables_build(double theta, int head_dim, int max_pos,
 
 int granite4_kernel_rmsnorm(const std::uint16_t* d_x, const std::uint16_t* d_w,
                             float eps, int rows, int cols, std::uint16_t* d_out) {
+  if (d_x == nullptr || d_w == nullptr || d_out == nullptr ||
+      !std::isfinite(eps) || eps <= 0.0f || rows <= 0 || cols <= 0)
+    return -1;
   // One block per row (block-per-row reduction; blockDim <= 320).
   granite4::rmsnorm_kernel<<<rows, 256>>>(d_x, d_w, eps, rows, cols, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
@@ -709,7 +712,9 @@ int granite4_kernel_rmsnorm_batched(const std::uint16_t* d_x,
   // rmsnorm_kernel is already row-batched (one block per row); this wrapper
   // just pins the verify-path bounds. Reusing it keeps a single
   // implementation, so a batched call cannot drift from the decode path.
-  if (rows <= 0 || rows > 4 || cols <= 0) return -1;
+  if (d_x == nullptr || d_w == nullptr || d_out == nullptr ||
+      !std::isfinite(eps) || eps <= 0.0f || rows <= 0 || rows > 4 || cols <= 0)
+    return -1;
   granite4::rmsnorm_kernel<<<rows, 256>>>(d_x, d_w, eps, rows, cols, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
@@ -718,6 +723,10 @@ int granite4_kernel_rmsnorm_batched(const std::uint16_t* d_x,
 int granite4_kernel_rope(const std::uint16_t* d_x, const float* d_cos,
                          const float* d_sin, int rows, int head_dim,
                          std::uint16_t* d_out) {
+  if (d_x == nullptr || d_cos == nullptr || d_sin == nullptr || d_out == nullptr ||
+      rows <= 0 || head_dim <= 0 || (head_dim & 1) != 0 ||
+      static_cast<long long>(rows) * head_dim > INT_MAX)
+    return -1;
   granite4::rope_kernel<<<(rows * head_dim + 255) / 256, 256>>>(
       d_x, d_cos, d_sin, rows, head_dim, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
@@ -726,6 +735,10 @@ int granite4_kernel_rope(const std::uint16_t* d_x, const float* d_cos,
 
 int granite4_kernel_softmax(const std::uint16_t* d_x, float scale, int rows,
                            int seq_len, std::uint16_t* d_out) {
+  if (d_x == nullptr || d_out == nullptr || !std::isfinite(scale) ||
+      rows <= 0 || seq_len <= 0 ||
+      static_cast<long long>(rows) * seq_len > INT_MAX)
+    return -1;
   granite4::softmax_kernel<<<(rows * seq_len + 255) / 256, 256>>>(
       d_x, scale, rows, seq_len, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
@@ -734,6 +747,10 @@ int granite4_kernel_softmax(const std::uint16_t* d_x, float scale, int rows,
 
 int granite4_kernel_gemm_dequant(const std::uint16_t* d_a, const std::uint8_t* d_b,
                                  float scale, int M, int N, int K, std::uint16_t* d_c) {
+  if (d_a == nullptr || d_b == nullptr || d_c == nullptr ||
+      !std::isfinite(scale) || M <= 0 || N <= 0 || K <= 0 ||
+      static_cast<long long>(M) * N > INT_MAX)
+    return -1;
   granite4::gemm_dequant_kernel<<<(M * N + 255) / 256, 256>>>(
       d_a, d_b, scale, M, N, K, d_c);
   G4_CUDA_CHECK(cudaGetLastError());
