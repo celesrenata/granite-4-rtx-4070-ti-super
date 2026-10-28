@@ -1288,6 +1288,8 @@ extern "C" int granite4_kernel_verify_qkv_stage(
       d_cache_k == nullptr || d_cache_v == nullptr || base_pos < 0 ||
       rows <= 0 || rows > 4 || Hq <= 0 || Hk <= 0 || Hq < Hk ||
       Hq % Hk != 0 || d <= 0 || (d & 1) != 0 ||
+      static_cast<long long>(rows) * Hq * d > INT_MAX ||
+      static_cast<long long>(rows) * Hk * d > INT_MAX ||
       base_pos > INT_MAX - rows + 1 ||
       cache_stride <= base_pos + rows - 1)
     return -1;
