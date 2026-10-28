@@ -673,6 +673,8 @@ __global__ void fp8_decode_all_kernel(float* out) {
 extern "C" {
 
 int granite4_fp8_decode_all(float** d_out) {
+  if (d_out == nullptr) return -1;
+  *d_out = nullptr;
   // d_out must hold 256 floats.
   float* d_out_p = nullptr;
   G4_CUDA_CHECK(cudaMalloc(&d_out_p, 256 * sizeof(float)));
@@ -685,6 +687,11 @@ int granite4_fp8_decode_all(float** d_out) {
 
 int granite4_rope_tables_build(double theta, int head_dim, int max_pos,
                                float** d_cos, float** d_sin) {
+  if (d_cos == nullptr || d_sin == nullptr || !std::isfinite(theta) || theta <= 0.0 ||
+      head_dim <= 0 || (head_dim & 1) != 0 || max_pos <= 0)
+    return -1;
+  *d_cos = nullptr;
+  *d_sin = nullptr;
   std::vector<float> h_cos, h_sin;
   granite4::rope_freqs_f32(theta, head_dim, max_pos, &h_cos, &h_sin);
   const std::size_t bytes = h_cos.size() * sizeof(float);
