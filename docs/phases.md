@@ -333,6 +333,20 @@ last two are additionally token-identical end-to-end):
    (2.29× at k=4) and batched causal attention/KV append are the next
    integration step.
 
+   Granite 4.2 chat-template prompts (rendered from the checkpoint's
+   `<|im_start|>…<|im_end|>` template with `enable_thinking`, tokenized by
+   the checkpoint byte-level BPE), same conditions, token-identical to
+   greedy: reasoning + repeated list 8/11 accepted (0.727) in 15 steps;
+   tool-call JSON 7/12 (0.583) in 14 steps; repeated Python code 8/16
+   (0.500) in 13 steps; ordinary chat 4/8 (0.500) in 18 steps. Ordinary
+   chat still yields proposals because the chat template itself repeats
+   structural markers (`<|im_start|>`, newlines); identity holds there too.
+   Chat framing lowers code acceptance versus the raw prompt (0.765 →
+   0.500) because the assistant preamble and turn markers dilute the
+   copied run. Tests: `tests/test_granite42_drafter_cases.py` (always-on
+   token/contract corpus) and `tests/test_granite42_gpu_drafter.py`
+   (opt-in, `GRANITE4_GPU_TESTS=1` plus `GRANITE4_INFER`/`GRANITE4_CKPT`).
+
 Parity: the GPU forward matches the host oracle within bf16 rounding
 (max |Δlogit| ≈ 1.1 bf16, same as P3); greedy `generate --gpu 1` (24
 tokens) is token-identical across the P4 kernel builds (uint32 4-element
