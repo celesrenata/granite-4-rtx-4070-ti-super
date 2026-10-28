@@ -46,6 +46,10 @@ extern "C" int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std:
 extern "C" int granite4_kernel_row_gemm_dequant(const std::uint16_t* d_a,
                                                 const std::uint8_t* d_B, float scale, int N,
                                                 int K, std::uint16_t* d_out);
+extern "C" int granite4_kernel_row_gemm_resid_dequant(
+    const std::uint16_t* d_a, const std::uint8_t* d_B, float scale,
+    const std::uint16_t* d_residual, float residual_scale, int tokens, int N, int K,
+    std::uint16_t* d_out);
 extern "C" int granite4_verify_gemv(const std::uint16_t* d_a,
                                      const std::uint8_t* d_b, float scale,
                                      int tokens, int rows, int k,
@@ -449,6 +453,50 @@ static void test_batched_qkv_parity_device() {
          "batched QKV: bit-identical to production calls");
   cudaFree(da); cudaFree(dwq); cudaFree(dwk); cudaFree(dwv);
   cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(rq); cudaFree(rk); cudaFree(rv);
+}
+
+static void test_batched_residual_projection_parity_device() {
+  const int tokens = 4, N = 96, K = 384;
+  Xorshift64 rng(0x5151);
+  std::vector<std::uint16_t> a(static_cast<std::size_t>(tokens) * K);
+  std::vector<std::uint16_t> residual(static_cast<std::size_t>(tokens) * N);
+  std::vector<std::uint8_t> weights(static_cast<std::size_t>(N) * K);
+  for (auto& x : a) x = gen_bf16(rng);
+  for (auto& x : residual) x = gen_bf16(rng);
+  for (auto& x : weights) x = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  const std::size_t count = static_cast<std::size_t>(tokens) * N;
+  std::uint16_t *da, *dr, *do_batched, *do_single;
+  std::uint8_t* dw;
+  if (cudaMalloc(&da, a.size() * 2) || cudaMalloc(&dr, residual.size() * 2) ||
+      cudaMalloc(&dw, weights.size()) || cudaMalloc(&do_batched, count * 2) ||
+      cudaMalloc(&do_single, count * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(da, a.data(), a.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dr, residual.data(), residual.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dw, weights.data(), weights.size(), cudaMemcpyHostToDevice));
+  expect(granite4_kernel_row_gemm_resid_dequant(
+             da, dw, .0006f, dr, .75f, tokens, N, K, do_batched) == 0,
+         "batched residual projection: launch");
+  for (int t = 0; t < tokens; ++t) {
+    expect(granite4_kernel_row_gemm_dequant(
+               da + static_cast<std::size_t>(t) * K, dw, .0006f, N, K,
+               do_single + static_cast<std::size_t>(t) * N) == 0,
+           "residual projection: production launch");
+  }
+  std::vector<std::uint16_t> got(count), ref(count);
+  CUDA_CHECK(cudaMemcpy(got.data(), do_batched, count * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(ref.data(), do_single, count * 2, cudaMemcpyDeviceToHost));
+  for (int t = 0; t < tokens; ++t) {
+    for (int i = 0; i < N; ++i) {
+      const float expected = bf16_to_f32_host(residual[static_cast<std::size_t>(t) * N + i]) +
+                             .75f * bf16_to_f32_host(ref[static_cast<std::size_t>(t) * N + i]);
+      expect(got[static_cast<std::size_t>(t) * N + i] == f32_to_bf16_host(expected),
+             "batched residual projection: residual arithmetic");
+    }
+  }
+  cudaFree(da); cudaFree(dr); cudaFree(dw); cudaFree(do_batched); cudaFree(do_single);
 }
 
 static void test_attention_device() {
@@ -965,6 +1013,7 @@ int main() {
   test_row_gemm_device();
   test_verify_gemv_production_parity_device();
   test_batched_qkv_parity_device();
+  test_batched_residual_projection_parity_device();
   test_attention_device();
   test_gqa_fused_device();
   test_batched_verify_attention_device();
