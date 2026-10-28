@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <climits>
 
 #include "forward_gpu.h"      // GpuWeightsLayout
 #include "forward_gpu_api.h"  // public C ABI
@@ -1054,6 +1055,7 @@ int gpu_verify_attention_stage(
       !std::isfinite(attention_scale) || rows < 1 || rows > 4 ||
       base_pos < 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
       q_heads < kv_heads || q_heads % kv_heads != 0 ||
+      base_pos > INT_MAX - rows + 1 ||
       cache_stride <= base_pos + rows - 1)
     return -1;
   return granite4_kernel_verify_attention_stage(
@@ -1078,7 +1080,9 @@ int gpu_verify_attention_layer(
       !std::isfinite(q_scale) || !std::isfinite(k_scale) ||
       !std::isfinite(v_scale) || !std::isfinite(attention_scale) ||
       hidden_size <= 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
-      rows < 1 || rows > 4 || base_pos < 0 || cache_stride <= base_pos + rows - 1)
+      rows < 1 || rows > 4 || base_pos < 0 ||
+      base_pos > INT_MAX - rows + 1 ||
+      cache_stride <= base_pos + rows - 1)
     return -1;
   if (q_heads < kv_heads || q_heads % kv_heads != 0 ||
       q_heads * head_dim <= 0 || kv_heads * head_dim <= 0)
@@ -1204,6 +1208,7 @@ extern "C" int granite4_kernel_verify_qkv_stage(
       d_cache_k == nullptr || d_cache_v == nullptr || base_pos < 0 ||
       rows <= 0 || rows > 4 || Hq <= 0 || Hk <= 0 || Hq < Hk ||
       Hq % Hk != 0 || d <= 0 || (d & 1) != 0 ||
+      base_pos > INT_MAX - rows + 1 ||
       cache_stride <= base_pos + rows - 1)
     return -1;
   const std::size_t nq = static_cast<std::size_t>(rows) * Hq * d;
