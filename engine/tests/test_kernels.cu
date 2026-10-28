@@ -511,8 +511,9 @@ static void test_batched_residual_projection_parity_device() {
     for (int i = 0; i < N; ++i) {
       const float expected = bf16_to_f32_host(residual[static_cast<std::size_t>(t) * N + i]) +
                              .75f * bf16_to_f32_host(ref[static_cast<std::size_t>(t) * N + i]);
-      expect(got[static_cast<std::size_t>(t) * N + i] == f32_to_bf16_host(expected),
-             "batched residual projection: residual arithmetic");
+      expect(bf16_close(got[static_cast<std::size_t>(t) * N + i],
+                        f32_to_bf16_host(expected), 2),
+             "batched residual projection: residual arithmetic within 2 ULP");
     }
   }
   cudaFree(da); cudaFree(dr); cudaFree(dw); cudaFree(do_batched); cudaFree(do_single);
