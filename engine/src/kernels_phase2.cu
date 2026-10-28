@@ -691,7 +691,8 @@ int granite4_fp8_decode_all(float** d_out) {
 int granite4_rope_tables_build(double theta, int head_dim, int max_pos,
                                float** d_cos, float** d_sin) {
   if (d_cos == nullptr || d_sin == nullptr || !std::isfinite(theta) || theta <= 0.0 ||
-      head_dim <= 0 || (head_dim & 1) != 0 || max_pos <= 0 ||
+      head_dim <= 0 || (head_dim & 1) != 0 ||
+      head_dim > granite4::kMaxHeadDim || max_pos <= 0 ||
       static_cast<std::size_t>(max_pos) >
           SIZE_MAX / (static_cast<std::size_t>(head_dim) / 2u) ||
       static_cast<std::size_t>(max_pos) * (head_dim / 2u) > SIZE_MAX / sizeof(float))
