@@ -688,17 +688,40 @@ int granite4_fp8_decode_all(float** d_out) {
 int granite4_rope_tables_build(double theta, int head_dim, int max_pos,
                                float** d_cos, float** d_sin) {
   if (d_cos == nullptr || d_sin == nullptr || !std::isfinite(theta) || theta <= 0.0 ||
-      head_dim <= 0 || (head_dim & 1) != 0 || max_pos <= 0)
+      head_dim <= 0 || (head_dim & 1) != 0 || max_pos <= 0 ||
+      static_cast<std::size_t>(max_pos) >
+          SIZE_MAX / (static_cast<std::size_t>(head_dim) / 2u) ||
+      static_cast<std::size_t>(max_pos) * (head_dim / 2u) > SIZE_MAX / sizeof(float))
     return -1;
   *d_cos = nullptr;
   *d_sin = nullptr;
   std::vector<float> h_cos, h_sin;
   granite4::rope_freqs_f32(theta, head_dim, max_pos, &h_cos, &h_sin);
   const std::size_t bytes = h_cos.size() * sizeof(float);
-  G4_CUDA_CHECK(cudaMalloc(d_cos, bytes));
-  G4_CUDA_CHECK(cudaMalloc(d_sin, bytes));
-  G4_CUDA_CHECK(cudaMemcpy(*d_cos, h_cos.data(), bytes, cudaMemcpyHostToDevice));
-  G4_CUDA_CHECK(cudaMemcpy(*d_sin, h_sin.data(), bytes, cudaMemcpyHostToDevice));
+  cudaError_t e = cudaMalloc(d_cos, bytes);
+  if (e != cudaSuccess) return -1;
+  e = cudaMalloc(d_sin, bytes);
+  if (e != cudaSuccess) {
+    cudaFree(*d_cos);
+    *d_cos = nullptr;
+    return -1;
+  }
+  e = cudaMemcpy(*d_cos, h_cos.data(), bytes, cudaMemcpyHostToDevice);
+  if (e != cudaSuccess) {
+    cudaFree(*d_cos);
+    cudaFree(*d_sin);
+    *d_cos = nullptr;
+    *d_sin = nullptr;
+    return -1;
+  }
+  e = cudaMemcpy(*d_sin, h_sin.data(), bytes, cudaMemcpyHostToDevice);
+  if (e != cudaSuccess) {
+    cudaFree(*d_cos);
+    cudaFree(*d_sin);
+    *d_cos = nullptr;
+    *d_sin = nullptr;
+    return -1;
+  }
   return 0;
 }
 
