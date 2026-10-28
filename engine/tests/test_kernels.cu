@@ -109,11 +109,13 @@ extern "C" int granite4_kernel_kv_append_batched(
     const std::uint16_t* d_src_k, const std::uint16_t* d_src_v,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, int base_pos, int rows,
     int stride, int Hk, int d);
-extern "C" int gpu_verify_attention_layer(
+namespace granite4 {
+int gpu_verify_attention_layer(
     const std::uint16_t*, const std::uint8_t*, const std::uint8_t*, const std::uint8_t*,
     float, float, float, const float*, const float*, float, int, int, int, int, int,
     int, int, std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*,
     std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*);
+}
 extern "C" int granite4_kernel_gqa_fused_batched(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
     float att_scale, int Hq, int Hk, int d, int base_kv, int rows, int k_stride,
