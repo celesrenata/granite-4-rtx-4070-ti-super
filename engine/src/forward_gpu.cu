@@ -214,6 +214,39 @@ __global__ void rope_at_pos_kernel(const std::uint16_t* x, const float* cos_row,
   out[idx] = f32_to_bf16(y);
 }
 
+// Batched RoPE over `rows` consecutive positions (speculative verify): row r
+// rotates every head with cos_rows/sin_rows row r. Same formula and
+// per-element arithmetic as rope_at_pos_kernel.
+__global__ void rope_at_pos_batched_kernel(const std::uint16_t* x,
+                                           const float* cos_rows,
+                                           const float* sin_rows, int rows,
+                                           int heads, int d,
+                                           std::uint16_t* out) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= rows * heads * d) return;
+  const int row = idx / (heads * d);
+  const int local = idx % (heads * d);
+  const int h = local / d;
+  const int col = local % d;
+  const int half = d / 2;
+  const int i = col < half ? col : col - half;
+  const float c = cos_rows[row * half + i];
+  const float s = sin_rows[row * half + i];
+  const std::size_t base =
+      static_cast<std::size_t>(row) * heads * d + static_cast<std::size_t>(h) * d;
+  float y;
+  if (col < half) {
+    const float a = bf16_to_f32(x[base + col]);
+    const float b = bf16_to_f32(x[base + col + half]);
+    y = a * c - b * s;
+  } else {
+    const float a = bf16_to_f32(x[base + col]);
+    const float b = bf16_to_f32(x[base + col - half]);
+    y = a * c + b * s;
+  }
+  out[idx] = f32_to_bf16(y);
+}
+
 // Llama half-split RoPE at ONE position, fused over the q and k projections
 // (one launch instead of two). Same formula and per-element arithmetic as
 // rope_at_pos_kernel.
@@ -979,13 +1012,38 @@ void gpu_ctx_reset(GpuCtx* ctx) {
   (void)gpu_ctx_truncate(ctx, 0);
 }
 
-// Test launcher for the coalesced GEMV (consumed by tests/test_kernels.cu):
-// one block per output row, 256 threads - the launch the forward uses.
+// Test launcher for the coalesced GEMV (consumed by tests/test_kernels.cu and
+// the verify-GEMV parity test): one block per output row, at the forward's
+// launch width. The width matters for bit-identity - the per-lane strided
+// accumulation depends on blockDim - so it must stay kRowGemvThreads.
 extern "C" int granite4_kernel_row_gemm_dequant(const std::uint16_t* d_a,
                                                 const std::uint8_t* d_B,
                                                 float scale, int N, int K,
                                                 std::uint16_t* d_out) {
-  row_gemm_dequant_kernel<<<N, 256>>>(d_a, d_B, scale, N, K, d_out);
+  row_gemm_dequant_kernel<<<N, kRowGemvThreads>>>(d_a, d_B, scale, N, K, d_out);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
+// Test launchers for the production one-position RoPE kernel (the verify
+// reference) and its batched verify form.
+extern "C" int granite4_kernel_rope_at_pos(const std::uint16_t* d_x,
+                                           const float* d_cos,
+                                           const float* d_sin, int heads, int d,
+                                           std::uint16_t* d_out) {
+  rope_at_pos_kernel<<<(heads * d + 255) / 256, 256>>>(d_x, d_cos, d_sin,
+                                                      heads, d, d_out);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
+extern "C" int granite4_kernel_rope_at_pos_batched(
+    const std::uint16_t* d_x, const float* d_cos, const float* d_sin, int rows,
+    int heads, int d, std::uint16_t* d_out) {
+  if (rows <= 0 || rows > 4 || heads <= 0 || d <= 0 || (d & 1) != 0) return -1;
+  const std::size_t n = static_cast<std::size_t>(rows) * heads * d;
+  rope_at_pos_batched_kernel<<<(n + 255) / 256, 256>>>(
+      d_x, d_cos, d_sin, rows, heads, d, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }

@@ -33,7 +33,7 @@ if(GRANITE_ENABLE_CUDA)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo --expt-relaxed-constexpr")
   find_package(CUDAToolkit REQUIRED)
   list(APPEND GRANITE_ENGINE_SOURCES src/kernels.cu src/kernels_phase2.cu
-       src/kernels_phase3.cu src/forward_gpu.cu)
+       src/kernels_phase3.cu src/forward_gpu.cu src/verify_gemv.cu)
 endif()
 
 add_library(granite4 SHARED ${GRANITE_ENGINE_SOURCES})

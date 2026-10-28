@@ -46,6 +46,10 @@ extern "C" int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std:
 extern "C" int granite4_kernel_row_gemm_dequant(const std::uint16_t* d_a,
                                                 const std::uint8_t* d_B, float scale, int N,
                                                 int K, std::uint16_t* d_out);
+extern "C" int granite4_verify_gemv(const std::uint16_t* d_a,
+                                     const std::uint8_t* d_b, float scale,
+                                     int tokens, int rows, int k,
+                                     std::uint16_t* d_c);
 extern "C" int granite4_kernel_sample_greedy(const std::uint16_t* d_p, int rows, int n, int* d_out);
 extern "C" int granite4_kernel_sample_top_p(const std::uint16_t* d_p, float nucleus,
                                             const float* d_u, int rows, int n, int* d_out);
@@ -67,6 +71,13 @@ extern "C" int granite4_kernel_silu_gate_up_batched(
 extern "C" int granite4_kernel_rmsnorm_batched(
     const std::uint16_t* d_x, const std::uint16_t* d_w, float eps, int rows,
     int cols, std::uint16_t* d_out);
+extern "C" int granite4_kernel_rope_at_pos(const std::uint16_t* d_x,
+                                           const float* d_cos,
+                                           const float* d_sin, int heads, int d,
+                                           std::uint16_t* d_out);
+extern "C" int granite4_kernel_rope_at_pos_batched(
+    const std::uint16_t* d_x, const float* d_cos, const float* d_sin, int rows,
+    int heads, int d, std::uint16_t* d_out);
 extern "C" int granite4_kernel_kv_append_batched(
     const std::uint16_t* d_src_k, const std::uint16_t* d_src_v,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, int base_pos, int rows,
@@ -347,6 +358,37 @@ static void test_row_gemm_device() {
   cudaFree(dA);
   cudaFree(dB);
   cudaFree(dC);
+}
+
+static void test_verify_gemv_production_parity_device() {
+  const int tokens = 4, rows = 17, k = 512;
+  Xorshift64 rng(0x9494);
+  std::vector<std::uint16_t> a(static_cast<std::size_t>(tokens) * k);
+  std::vector<std::uint8_t> b(static_cast<std::size_t>(rows) * k);
+  for (auto& v : a) v = gen_bf16(rng);
+  for (auto& v : b) v = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  std::uint16_t *da, *db, *dv, *dr;
+  if (cudaMalloc(&da, a.size() * 2) || cudaMalloc(&db, b.size()) ||
+      cudaMalloc(&dv, static_cast<std::size_t>(tokens) * rows * 2) ||
+      cudaMalloc(&dr, static_cast<std::size_t>(tokens) * rows * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(da, a.data(), a.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(db, b.data(), b.size(), cudaMemcpyHostToDevice));
+  expect(granite4_verify_gemv(da, db, 0.0007f, tokens, rows, k, dv) == 0,
+         "verify GEMV: launch");
+  for (int t = 0; t < tokens; ++t)
+    expect(granite4_kernel_row_gemm_dequant(
+               da + static_cast<std::size_t>(t) * k, db, 0.0007f, rows, k,
+               dr + static_cast<std::size_t>(t) * rows) == 0,
+           "verify GEMV: production reference launch");
+  std::vector<std::uint16_t> v(static_cast<std::size_t>(tokens) * rows),
+      r(v.size());
+  CUDA_CHECK(cudaMemcpy(v.data(), dv, v.size() * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(r.data(), dr, r.size() * 2, cudaMemcpyDeviceToHost));
+  expect(v == r, "verify GEMV: bit-identical to production GEMV");
+  cudaFree(da); cudaFree(db); cudaFree(dv); cudaFree(dr);
 }
 
 static void test_attention_device() {
@@ -643,6 +685,55 @@ static void test_batched_rmsnorm_device() {
   cudaFree(dx); cudaFree(dw); cudaFree(db); cudaFree(ds);
 }
 
+static void test_batched_rope_device() {
+  // P4: batched RoPE over consecutive verify positions must be bit-identical
+  // to one rope_at_pos call per position (the production decode primitive).
+  const int rows = 4, heads = 8, d = 128, half = d / 2;
+  Xorshift64 rng(0x7272);
+  std::vector<std::uint16_t> x(static_cast<std::size_t>(rows) * heads * d);
+  for (auto& v : x) v = f32_to_bf16_host(rng.next_float_range(2.0));
+  // Verify positions base..base+rows-1: row r uses that position's table row.
+  std::vector<float> cs(static_cast<std::size_t>(rows) * half),
+      sn(static_cast<std::size_t>(rows) * half);
+  for (int r = 0; r < rows; ++r)
+    for (int i = 0; i < half; ++i) {
+      const float th = 1.0f / std::pow(10000.0f, 2.0f * i / d);
+      cs[r * half + i] = std::cos((r + 3) * th);
+      sn[r * half + i] = std::sin((r + 3) * th);
+    }
+  std::uint16_t *dx, *db, *ds;
+  float *dc, *dsin;
+  if (cudaMalloc(&dx, x.size() * 2) || cudaMalloc(&db, x.size() * 2) ||
+      cudaMalloc(&ds, x.size() * 2) || cudaMalloc(&dc, cs.size() * 4) ||
+      cudaMalloc(&dsin, sn.size() * 4)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dc, cs.data(), cs.size() * 4, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsin, sn.data(), sn.size() * 4, cudaMemcpyHostToDevice));
+  expect(granite4_kernel_rope_at_pos_batched(dx, dc, dsin, rows, heads, d,
+                                             db) == 0,
+         "batched rope: launch");
+  expect(granite4_kernel_rope_at_pos_batched(dx, dc, dsin, 5, heads, d,
+                                             db) == -1,
+         "batched rope: rejects rows > 4");
+  for (int r = 0; r < rows; ++r)
+    expect(granite4_kernel_rope_at_pos(
+               dx + static_cast<std::size_t>(r) * heads * d,
+               dc + static_cast<std::size_t>(r) * half,
+               dsin + static_cast<std::size_t>(r) * half, heads, d,
+               ds + static_cast<std::size_t>(r) * heads * d) == 0,
+           "batched rope: single-position reference launch");
+  std::vector<std::uint16_t> batch(x.size()), single(x.size());
+  CUDA_CHECK(cudaMemcpy(batch.data(), db, batch.size() * 2,
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(single.data(), ds, single.size() * 2,
+                        cudaMemcpyDeviceToHost));
+  expect(batch == single, "batched rope: bit-identical to per-position calls");
+  cudaFree(dx); cudaFree(db); cudaFree(ds); cudaFree(dc); cudaFree(dsin);
+}
+
 static void test_paged_kv_compact_device() {
   // P3: gather one layer's K/V out of the paged FP8 pool into contiguous
   // [Hk, kv_len, d] BF16 and check it bit-exactly against the host reference
@@ -812,11 +903,13 @@ int main() {
   test_softmax_device();
   test_gemm_device();
   test_row_gemm_device();
+  test_verify_gemv_production_parity_device();
   test_attention_device();
   test_gqa_fused_device();
   test_batched_verify_attention_device();
   test_batched_silu_gate_up_device();
   test_batched_rmsnorm_device();
+  test_batched_rope_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();
