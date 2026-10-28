@@ -797,13 +797,15 @@ int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_out == nullptr ||
       !std::isfinite(att_scale) || Hq <= 0 || Hk <= 0 || d <= 0 || kv_len <= 0 ||
       k_stride < kv_len || Hq < Hk || Hq % Hk != 0 ||
-      static_cast<long long>(kv_len) + d > INT_MAX)
+      static_cast<long long>(kv_len) + d > INT_MAX ||
+      static_cast<std::size_t>(kv_len) > granite4::kGqaSoftmaxParallelMax * 1024u)
     return -1;
   const std::size_t base_elems = static_cast<std::size_t>(d) + 2u * kv_len;
   const std::size_t exp_elems = (kv_len <= granite4::kGqaSoftmaxParallelMax) ? kv_len : 0u;
   const std::size_t smem_bytes =
       ((base_elems + exp_elems * (sizeof(double) / sizeof(std::uint16_t)) + 3u) & ~std::size_t(3)) *
       sizeof(std::uint16_t);
+  if (smem_bytes > 48u * 1024u) return -1;
   granite4::gqa_fused_kernel<<<Hq, d, smem_bytes>>>(d_q, d_k, d_v, att_scale, Hq, Hk,
                                                      d, kv_len, k_stride, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
@@ -835,7 +837,8 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_out == nullptr ||
       !std::isfinite(att_scale) || rows <= 0 || rows > 4 || Hq <= 0 || Hk <= 0 ||
       d <= 0 || base_kv < 0 || Hq < Hk || Hq % Hk != 0 ||
-      base_kv > INT_MAX - rows || k_stride < base_kv + rows)
+      base_kv > INT_MAX - rows || k_stride < base_kv + rows ||
+      static_cast<std::size_t>(base_kv + rows) > granite4::kGqaSoftmaxParallelMax * 1024u)
     return -1;
   // Shared memory is sized for the longest row (base_kv + rows); each block
   // row uses only its own causal prefix within that allocation.
