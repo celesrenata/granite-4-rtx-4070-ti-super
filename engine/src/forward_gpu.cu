@@ -1058,6 +1058,32 @@ int gpu_verify_attention_stage(
       d_cache_k, d_cache_v, d_out);
 }
 
+int gpu_verify_attention_layer(
+    const std::uint16_t* d_normed, const std::uint8_t* d_wq,
+    const std::uint8_t* d_wk, const std::uint8_t* d_wv, float q_scale,
+    float k_scale, float v_scale, const float* d_cos, const float* d_sin,
+    float attention_scale, int base_pos, int rows, int q_heads, int kv_heads,
+    int head_dim, int hidden_size, int cache_stride, std::uint16_t* d_q,
+    std::uint16_t* d_k, std::uint16_t* d_v, std::uint16_t* d_q_rot,
+    std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
+    std::uint16_t* d_attn_out) {
+  if (d_normed == nullptr || d_wq == nullptr || d_wk == nullptr || d_wv == nullptr ||
+      d_q == nullptr || d_k == nullptr || d_v == nullptr || d_cos == nullptr ||
+      d_sin == nullptr || d_q_rot == nullptr || d_k_rot == nullptr ||
+      d_cache_k == nullptr || d_cache_v == nullptr || d_attn_out == nullptr ||
+      hidden_size <= 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0)
+    return -1;
+  if (granite4_kernel_qkv_dequant_batched(
+          d_normed, d_wq, d_wk, d_wv, q_scale, k_scale, v_scale, rows,
+          q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim,
+          hidden_size, d_q, d_k, d_v) != 0)
+    return -1;
+  return gpu_verify_attention_stage(
+      d_q, d_k, d_v, d_cos, d_sin, attention_scale, base_pos, rows,
+      q_heads, kv_heads, head_dim, cache_stride, d_q_rot, d_k_rot,
+      d_cache_k, d_cache_v, d_attn_out);
+}
+
 int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
                       std::uint16_t* d_logits, char* error,
                       std::size_t error_size) {

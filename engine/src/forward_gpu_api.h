@@ -96,6 +96,18 @@ int gpu_verify_attention_stage(
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k,
     std::uint16_t* d_cache_v, std::uint16_t* d_out);
 
+// Project normalized speculative rows and run one transformer's attention block.
+// Q/K/V weights are row-major FP8 device matrices with one scale per matrix.
+int gpu_verify_attention_layer(
+    const std::uint16_t* d_normed, const std::uint8_t* d_wq,
+    const std::uint8_t* d_wk, const std::uint8_t* d_wv, float q_scale,
+    float k_scale, float v_scale, const float* d_cos, const float* d_sin,
+    float attention_scale, int base_pos, int rows, int q_heads, int kv_heads,
+    int head_dim, int hidden_size, int cache_stride, std::uint16_t* d_q,
+    std::uint16_t* d_k, std::uint16_t* d_v, std::uint16_t* d_q_rot,
+    std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
+    std::uint16_t* d_attn_out);
+
 }  // namespace granite4
 
 #endif  // GRANITE4_FORWARD_GPU_API_H
