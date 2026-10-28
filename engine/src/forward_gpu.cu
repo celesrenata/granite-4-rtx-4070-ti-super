@@ -591,6 +591,7 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
       model.vocab_size == 0 || model.num_attention_heads < model.num_key_value_heads ||
       model.num_attention_heads % model.num_key_value_heads != 0 ||
       model.head_dim > static_cast<std::size_t>(INT_MAX) ||
+      model.head_dim > static_cast<std::size_t>(kMaxHeadDim) ||
       model.hidden_size > static_cast<std::size_t>(INT_MAX) ||
       model.intermediate_size > static_cast<std::size_t>(INT_MAX) ||
       model.num_layers > static_cast<std::size_t>(INT_MAX) ||
