@@ -1132,6 +1132,9 @@ extern "C" int granite4_kernel_row_gemm_dequant(const std::uint16_t* d_a,
                                                 const std::uint8_t* d_B,
                                                 float scale, int N, int K,
                                                 std::uint16_t* d_out) {
+  if (d_a == nullptr || d_B == nullptr || d_out == nullptr ||
+      !std::isfinite(scale) || N <= 0 || K <= 0 || N > INT_MAX)
+    return -1;
   row_gemm_dequant_kernel<<<N, kRowGemvThreads>>>(d_a, d_B, scale, N, K, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
@@ -1191,6 +1194,10 @@ extern "C" int granite4_kernel_rope_at_pos(const std::uint16_t* d_x,
                                            const float* d_cos,
                                            const float* d_sin, int heads, int d,
                                            std::uint16_t* d_out) {
+  if (d_x == nullptr || d_cos == nullptr || d_sin == nullptr || d_out == nullptr ||
+      heads <= 0 || d <= 0 || (d & 1) != 0 ||
+      static_cast<long long>(heads) * d > INT_MAX)
+    return -1;
   rope_at_pos_kernel<<<(heads * d + 255) / 256, 256>>>(d_x, d_cos, d_sin,
                                                       heads, d, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
@@ -1200,7 +1207,9 @@ extern "C" int granite4_kernel_rope_at_pos(const std::uint16_t* d_x,
 extern "C" int granite4_kernel_rope_at_pos_batched(
     const std::uint16_t* d_x, const float* d_cos, const float* d_sin, int rows,
     int heads, int d, std::uint16_t* d_out) {
-  if (rows <= 0 || rows > 4 || heads <= 0 || d <= 0 || (d & 1) != 0) return -1;
+  if (d_x == nullptr || d_cos == nullptr || d_sin == nullptr || d_out == nullptr ||
+      rows <= 0 || rows > 4 || heads <= 0 || d <= 0 || (d & 1) != 0)
+    return -1;
   const std::size_t n = static_cast<std::size_t>(rows) * heads * d;
   rope_at_pos_batched_kernel<<<(n + 255) / 256, 256>>>(
       d_x, d_cos, d_sin, rows, heads, d, d_out);
