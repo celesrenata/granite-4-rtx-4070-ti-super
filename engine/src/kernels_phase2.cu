@@ -748,7 +748,8 @@ int granite4_kernel_rmsnorm_batched(const std::uint16_t* d_x,
   // just pins the verify-path bounds. Reusing it keeps a single
   // implementation, so a batched call cannot drift from the decode path.
   if (d_x == nullptr || d_w == nullptr || d_out == nullptr ||
-      !std::isfinite(eps) || eps <= 0.0f || rows <= 0 || rows > 4 || cols <= 0)
+      !std::isfinite(eps) || eps <= 0.0f || rows <= 0 || rows > 4 || cols <= 0 ||
+      static_cast<long long>(rows) * cols > INT_MAX)
     return -1;
   granite4::rmsnorm_kernel<<<rows, 256>>>(d_x, d_w, eps, rows, cols, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
@@ -760,7 +761,8 @@ int granite4_kernel_rope(const std::uint16_t* d_x, const float* d_cos,
                          std::uint16_t* d_out) {
   if (d_x == nullptr || d_cos == nullptr || d_sin == nullptr || d_out == nullptr ||
       rows <= 0 || head_dim <= 0 || (head_dim & 1) != 0 ||
-      static_cast<long long>(rows) * head_dim > INT_MAX)
+      static_cast<long long>(rows) * head_dim > INT_MAX ||
+      head_dim > granite4::kMaxHeadDim)
     return -1;
   granite4::rope_kernel<<<(rows * head_dim + 255) / 256, 256>>>(
       d_x, d_cos, d_sin, rows, head_dim, d_out);
