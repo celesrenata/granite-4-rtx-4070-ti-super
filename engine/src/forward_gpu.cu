@@ -1197,8 +1197,13 @@ extern "C" int granite4_kernel_verify_qkv_stage(
     int base_pos, int rows, int Hq, int Hk, int d, int cache_stride,
     std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v) {
-  if (rows <= 0 || rows > 4 || Hq <= 0 || Hk <= 0 || d <= 0 ||
-      (d & 1) != 0 || cache_stride <= base_pos + rows - 1) return -1;
+  if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_cos == nullptr ||
+      d_sin == nullptr || d_q_rot == nullptr || d_k_rot == nullptr ||
+      d_cache_k == nullptr || d_cache_v == nullptr || base_pos < 0 ||
+      rows <= 0 || rows > 4 || Hq <= 0 || Hk <= 0 || Hq < Hk ||
+      Hq % Hk != 0 || d <= 0 || (d & 1) != 0 ||
+      cache_stride <= base_pos + rows - 1)
+    return -1;
   const std::size_t nq = static_cast<std::size_t>(rows) * Hq * d;
   const std::size_t nk = static_cast<std::size_t>(rows) * Hk * d;
   rope_at_pos_batched_kernel<<<(nq + 255) / 256, 256>>>(
