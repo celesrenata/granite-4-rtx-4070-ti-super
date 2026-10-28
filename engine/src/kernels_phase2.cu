@@ -816,6 +816,7 @@ int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v
                               int Hq, int Hk, int d, int kv_len, std::uint16_t* d_out) {
   if (d_p == nullptr || d_v == nullptr || d_out == nullptr || Hq <= 0 ||
       Hk <= 0 || d <= 0 || kv_len <= 0 || Hq < Hk || Hq % Hk != 0 ||
+      d > granite4::kMaxHeadDim ||
       static_cast<long long>(Hq) * d > INT_MAX ||
       static_cast<long long>(Hk) * d > INT_MAX)
     return -1;
@@ -832,6 +833,9 @@ int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_out == nullptr ||
       !std::isfinite(att_scale) || Hq <= 0 || Hk <= 0 || d <= 0 || kv_len <= 0 ||
       k_stride < kv_len || Hq < Hk || Hq % Hk != 0 ||
+      d > granite4::kMaxHeadDim ||
+      static_cast<long long>(Hq) * d > INT_MAX ||
+      static_cast<long long>(Hk) * d > INT_MAX ||
       static_cast<long long>(kv_len) + d > INT_MAX ||
       static_cast<std::size_t>(kv_len) > granite4::kGqaSoftmaxParallelMax * 1024u)
     return -1;
