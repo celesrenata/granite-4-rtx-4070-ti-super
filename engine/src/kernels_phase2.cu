@@ -479,6 +479,96 @@ __global__ void silu_gate_up_kernel(const std::uint8_t* Wg, const std::uint8_t* 
   }
 }
 
+// Batched SwiGLU for speculative verification. One block owns one output row
+// and accumulates all activation rows while streaming each gate/up weight row
+// once. The final nonlinear operation and BF16 conversion use the same order
+// as silu_gate_up_kernel.
+__global__ void silu_gate_up_batched_kernel(const std::uint8_t* Wg,
+                                            const std::uint8_t* Wu,
+                                            const std::uint16_t* x, float sg,
+                                            float su, int N, int K, int rows,
+                                            std::uint16_t* out) {
+  const int r = blockIdx.x;
+  if (r >= N) return;
+  const int t = threadIdx.x;
+  const int nt = blockDim.x;
+  float g[4] = {0.f, 0.f, 0.f, 0.f};
+  float u[4] = {0.f, 0.f, 0.f, 0.f};
+  const std::uint8_t* const rg = Wg + static_cast<std::size_t>(r) * K;
+  const std::uint8_t* const ru = Wu + static_cast<std::size_t>(r) * K;
+  if ((K & 3) == 0) {
+    const std::uint32_t* rg4 = reinterpret_cast<const std::uint32_t*>(rg);
+    const std::uint32_t* ru4 = reinterpret_cast<const std::uint32_t*>(ru);
+    const int K4 = K >> 2;
+    for (int k4 = t; k4 < K4; k4 += nt) {
+      const std::uint32_t bg = rg4[k4], bu = ru4[k4];
+#pragma unroll
+      for (int row = 0; row < 4; ++row) {
+        if (row >= rows) break;
+        const std::uint32_t* x4 = reinterpret_cast<const std::uint32_t*>(
+            x + static_cast<std::size_t>(row) * K);
+        const std::uint32_t xa = x4[2 * k4], xb = x4[2 * k4 + 1];
+        const float x0 = bf16_to_f32(static_cast<std::uint16_t>(xa & 0xffffu));
+        const float x1 = bf16_to_f32(static_cast<std::uint16_t>(xa >> 16));
+        const float x2 = bf16_to_f32(static_cast<std::uint16_t>(xb & 0xffffu));
+        const float x3 = bf16_to_f32(static_cast<std::uint16_t>(xb >> 16));
+        g[row] += fp8_to_f32(static_cast<std::uint8_t>(bg & 0xffu)) * x0 +
+                  fp8_to_f32(static_cast<std::uint8_t>(bg >> 8)) * x1 +
+                  fp8_to_f32(static_cast<std::uint8_t>(bg >> 16)) * x2 +
+                  fp8_to_f32(static_cast<std::uint8_t>(bg >> 24)) * x3;
+        u[row] += fp8_to_f32(static_cast<std::uint8_t>(bu & 0xffu)) * x0 +
+                  fp8_to_f32(static_cast<std::uint8_t>(bu >> 8)) * x1 +
+                  fp8_to_f32(static_cast<std::uint8_t>(bu >> 16)) * x2 +
+                  fp8_to_f32(static_cast<std::uint8_t>(bu >> 24)) * x3;
+      }
+    }
+  } else {
+    for (int i = t; i < K; i += nt) {
+      const float wg = fp8_to_f32(rg[i]);
+      const float wu = fp8_to_f32(ru[i]);
+#pragma unroll
+      for (int row = 0; row < 4; ++row) {
+        if (row >= rows) break;
+        const float xv = bf16_to_f32(x[static_cast<std::size_t>(row) * K + i]);
+        g[row] += wg * xv;
+        u[row] += wu * xv;
+      }
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+    for (int row = 0; row < 4; ++row) {
+      g[row] += __shfl_down_sync(0xffffffffu, g[row], off);
+      u[row] += __shfl_down_sync(0xffffffffu, u[row], off);
+    }
+  }
+  __shared__ float rg_[4][32], ru_[4][32];
+  if ((t & 31) == 0) {
+#pragma unroll
+    for (int row = 0; row < 4; ++row) {
+      rg_[row][t >> 5] = g[row];
+      ru_[row][t >> 5] = u[row];
+    }
+  }
+  __syncthreads();
+  if (t == 0) {
+    const int warps = nt >> 5;
+#pragma unroll
+    for (int row = 0; row < 4; ++row) {
+      if (row >= rows) break;
+      float gs = rg_[row][0], us = ru_[row][0];
+      for (int j = 1; j < warps; ++j) {
+        gs += rg_[row][j];
+        us += ru_[row][j];
+      }
+      const float sig = 1.0f / (1.0f + std::exp(-(sg * gs)));
+      out[static_cast<std::size_t>(row) * N + r] =
+          f32_to_bf16(sg * gs * sig * (su * us));
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Sampling. Greedy: one thread per row (any vocab size). Top-p: one block
 // per row with a shared-memory stable sort; vocab <= 4096 (the production
@@ -713,6 +803,18 @@ int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d
                                  int N, int K, std::uint16_t* d_out) {
   granite4::silu_gate_up_kernel<<<N, 128>>>(d_wg, d_wu, d_x, scale_g, scale_u, N, K,
                                             d_out);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
+int granite4_kernel_silu_gate_up_batched(const std::uint8_t* d_wg,
+                                         const std::uint8_t* d_wu,
+                                         const std::uint16_t* d_x, float scale_g,
+                                         float scale_u, int N, int K, int rows,
+                                         std::uint16_t* d_out) {
+  if (rows <= 0 || rows > 4 || N <= 0 || K <= 0) return -1;
+  granite4::silu_gate_up_batched_kernel<<<N, 128>>>(
+      d_wg, d_wu, d_x, scale_g, scale_u, N, K, rows, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }

@@ -56,6 +56,14 @@ extern "C" int granite4_kernel_paged_kv_compact(
     const std::uint8_t* d_paged, const std::size_t* d_block_table, int kv_len,
     int tokens_per_page, int num_layers, int Hk, int d, int layer, int which,
     std::uint16_t* d_out);
+extern "C" int granite4_kernel_silu_gate_up(
+    const std::uint8_t* d_wg, const std::uint8_t* d_wu,
+    const std::uint16_t* d_x, float scale_g, float scale_u, int N, int K,
+    std::uint16_t* d_out);
+extern "C" int granite4_kernel_silu_gate_up_batched(
+    const std::uint8_t* d_wg, const std::uint8_t* d_wu,
+    const std::uint16_t* d_x, float scale_g, float scale_u, int N, int K,
+    int rows, std::uint16_t* d_out);
 extern "C" int granite4_kernel_kv_append_batched(
     const std::uint16_t* d_src_k, const std::uint16_t* d_src_v,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, int base_pos, int rows,
@@ -562,6 +570,45 @@ static void test_batched_verify_attention_device() {
   cudaFree(dref);
 }
 
+static void test_batched_silu_gate_up_device() {
+  const int N = 257, K = 4096, rows = 4;
+  Xorshift64 rng(0x5151);
+  std::vector<std::uint8_t> wg(static_cast<std::size_t>(N) * K),
+      wu(static_cast<std::size_t>(N) * K);
+  std::vector<std::uint16_t> x(static_cast<std::size_t>(rows) * K);
+  for (auto& v : wg) v = static_cast<std::uint8_t>(rng.next());
+  for (auto& v : wu) v = static_cast<std::uint8_t>(rng.next());
+  for (auto& v : x) v = f32_to_bf16_host(rng.next_float_range(2.0));
+  std::uint8_t *dwg, *dwu;
+  std::uint16_t *dx, *db, *ds;
+  if (cudaMalloc(&dwg, wg.size()) || cudaMalloc(&dwu, wu.size()) ||
+      cudaMalloc(&dx, x.size() * 2) || cudaMalloc(&db, static_cast<std::size_t>(rows) * N * 2) ||
+      cudaMalloc(&ds, static_cast<std::size_t>(rows) * N * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dwg, wg.data(), wg.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dwu, wu.data(), wu.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+  const float sg = 0.03125f, su = 0.02734375f;
+  expect(granite4_kernel_silu_gate_up_batched(dwg, dwu, dx, sg, su, N, K,
+                                              rows, db) == 0,
+         "batched silu: launch");
+  expect(granite4_kernel_silu_gate_up_batched(dwg, dwu, dx, sg, su, N, K, 5,
+                                              db) == -1,
+         "batched silu: rejects rows > 4");
+  for (int r = 0; r < rows; ++r)
+    expect(granite4_kernel_silu_gate_up(
+               dwg, dwu, dx + static_cast<std::size_t>(r) * K, sg, su, N, K,
+               ds + static_cast<std::size_t>(r) * N) == 0,
+           "batched silu: single-row reference launch");
+  std::vector<std::uint16_t> batch(static_cast<std::size_t>(rows) * N), single(batch.size());
+  CUDA_CHECK(cudaMemcpy(batch.data(), db, batch.size() * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(single.data(), ds, single.size() * 2, cudaMemcpyDeviceToHost));
+  expect(batch == single, "batched silu: bit-identical to single-row calls");
+  cudaFree(dwg); cudaFree(dwu); cudaFree(dx); cudaFree(db); cudaFree(ds);
+}
+
 static void test_paged_kv_compact_device() {
   // P3: gather one layer's K/V out of the paged FP8 pool into contiguous
   // [Hk, kv_len, d] BF16 and check it bit-exactly against the host reference
@@ -734,6 +781,7 @@ int main() {
   test_attention_device();
   test_gqa_fused_device();
   test_batched_verify_attention_device();
+  test_batched_silu_gate_up_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();
