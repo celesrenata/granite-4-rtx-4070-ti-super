@@ -50,6 +50,18 @@ extern "C" int granite4_verify_gemv(const std::uint16_t* d_a,
                                      const std::uint8_t* d_b, float scale,
                                      int tokens, int rows, int k,
                                      std::uint16_t* d_c);
+extern "C" int granite4_kernel_qkv_dequant(
+    const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
+    const std::uint8_t* d_wv, float sq, float sk, float sv, int nq, int nk, int k,
+    std::uint16_t* d_q, std::uint16_t* d_kk, std::uint16_t* d_v);
+extern "C" int granite4_verify_qkv(
+    const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
+    const std::uint8_t* d_wv, float sq, float sk, float sv, int tokens, int nq,
+    int nk, int k, std::uint16_t* d_q, std::uint16_t* d_k, std::uint16_t* d_v);
+extern "C" int granite4_kernel_qkv_dequant(
+    const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
+    const std::uint8_t* d_wv, float sq, float sk, float sv, int nq, int nk, int k,
+    std::uint16_t* d_q, std::uint16_t* d_kk, std::uint16_t* d_v);
 extern "C" int granite4_kernel_sample_greedy(const std::uint16_t* d_p, int rows, int n, int* d_out);
 extern "C" int granite4_kernel_sample_top_p(const std::uint16_t* d_p, float nucleus,
                                             const float* d_u, int rows, int n, int* d_out);
@@ -389,6 +401,54 @@ static void test_verify_gemv_production_parity_device() {
   CUDA_CHECK(cudaMemcpy(r.data(), dr, r.size() * 2, cudaMemcpyDeviceToHost));
   expect(v == r, "verify GEMV: bit-identical to production GEMV");
   cudaFree(da); cudaFree(db); cudaFree(dv); cudaFree(dr);
+}
+
+static void test_batched_qkv_parity_device() {
+  const int tokens = 4, nq = 32, nk = 8, k = 256;
+  Xorshift64 rng(0xa5a5);
+  std::vector<std::uint16_t> a(static_cast<std::size_t>(tokens) * k);
+  std::vector<std::uint8_t> wq(static_cast<std::size_t>(nq) * k),
+      wk(static_cast<std::size_t>(nk) * k), wv(static_cast<std::size_t>(nk) * k);
+  for (auto& x : a) x = gen_bf16(rng);
+  for (auto& x : wq) x = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  for (auto& x : wk) x = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  for (auto& x : wv) x = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  const std::size_t qn = static_cast<std::size_t>(tokens) * nq;
+  const std::size_t kn = static_cast<std::size_t>(tokens) * nk;
+  std::uint16_t *da, *dwq, *dwk, *dwv, *dq, *dk, *dv, *rq, *rk, *rv;
+  if (cudaMalloc(&da, a.size() * 2) || cudaMalloc(&dwq, wq.size()) ||
+      cudaMalloc(&dwk, wk.size()) || cudaMalloc(&dwv, wv.size()) ||
+      cudaMalloc(&dq, qn * 2) || cudaMalloc(&dk, kn * 2) || cudaMalloc(&dv, kn * 2) ||
+      cudaMalloc(&rq, qn * 2) || cudaMalloc(&rk, kn * 2) || cudaMalloc(&rv, kn * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(da, a.data(), a.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dwq, wq.data(), wq.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dwk, wk.data(), wk.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dwv, wv.data(), wv.size(), cudaMemcpyHostToDevice));
+  expect(granite4_verify_qkv(da, dwq, dwk, dwv, .0007f, .0008f, .0009f,
+                             tokens, nq, nk, k, dq, dk, dv) == 0,
+         "batched QKV: launch");
+  for (int t = 0; t < tokens; ++t)
+    expect(granite4_kernel_qkv_dequant(
+               da + static_cast<std::size_t>(t) * k, dwq, dwk, dwv,
+               .0007f, .0008f, .0009f, nq, nk, k,
+               rq + static_cast<std::size_t>(t) * nq,
+               rk + static_cast<std::size_t>(t) * nk,
+               rv + static_cast<std::size_t>(t) * nk) == 0,
+           "batched QKV: production reference launch");
+  std::vector<std::uint16_t> gotq(qn), gotk(kn), gotv(kn), refq(qn), refk(kn), refv(kn);
+  CUDA_CHECK(cudaMemcpy(gotq.data(), dq, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(gotk.data(), dk, kn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(gotv.data(), dv, kn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(refq.data(), rq, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(refk.data(), rk, kn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(refv.data(), rv, kn * 2, cudaMemcpyDeviceToHost));
+  expect(gotq == refq && gotk == refk && gotv == refv,
+         "batched QKV: bit-identical to production calls");
+  cudaFree(da); cudaFree(dwq); cudaFree(dwk); cudaFree(dwv);
+  cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(rq); cudaFree(rk); cudaFree(rv);
 }
 
 static void test_attention_device() {
@@ -904,6 +964,7 @@ int main() {
   test_gemm_device();
   test_row_gemm_device();
   test_verify_gemv_production_parity_device();
+  test_batched_qkv_parity_device();
   test_attention_device();
   test_gqa_fused_device();
   test_batched_verify_attention_device();

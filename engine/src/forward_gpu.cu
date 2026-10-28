@@ -1025,6 +1025,17 @@ extern "C" int granite4_kernel_row_gemm_dequant(const std::uint16_t* d_a,
   return 0;
 }
 
+extern "C" int granite4_kernel_qkv_dequant(
+    const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
+    const std::uint8_t* d_wv, float sq, float sk, float sv, int nq, int nk, int k,
+    std::uint16_t* d_q, std::uint16_t* d_kk, std::uint16_t* d_v) {
+  if (nq <= 0 || nk <= 0 || k <= 0) return -1;
+  row_gemm_dequant_qkv_kernel<<<nq + 2 * nk, kRowGemvThreads>>>(
+      d_a, d_wq, d_wk, d_wv, sq, sk, sv, nq, nk, nk, k, d_q, d_kk, d_v);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
 // Test launchers for the production one-position RoPE kernel (the verify
 // reference) and its batched verify form.
 extern "C" int granite4_kernel_rope_at_pos(const std::uint16_t* d_x,
