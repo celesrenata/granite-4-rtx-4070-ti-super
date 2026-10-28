@@ -519,6 +519,29 @@ static void test_batched_residual_projection_parity_device() {
   cudaFree(da); cudaFree(dr); cudaFree(dw); cudaFree(do_batched); cudaFree(do_single);
 }
 
+static void test_verify_attention_validation_device() {
+  expect(granite4_kernel_verify_qkv_stage(
+              nullptr, nullptr, nullptr, nullptr, nullptr, 0, 1, 2, 1, 32,
+              32, nullptr, nullptr, nullptr, nullptr) == -1,
+         "verify stage: rejects null pointers");
+  expect(granite4_kernel_verify_qkv_stage(
+              nullptr, nullptr, nullptr, nullptr, nullptr, -1, 1, 2, 1, 32,
+              32, nullptr, nullptr, nullptr, nullptr) == -1,
+         "verify stage: rejects negative position");
+  expect(granite4_kernel_verify_qkv_stage(
+              nullptr, nullptr, nullptr, nullptr, nullptr, 0, 1, 1, 2, 32,
+              32, nullptr, nullptr, nullptr, nullptr) == -1,
+         "verify stage: rejects invalid GQA topology");
+  expect(granite4_kernel_verify_attention_stage(
+              nullptr, nullptr, nullptr, nullptr, nullptr, NAN, 0, 1, 2, 1,
+              32, 32, nullptr, nullptr, nullptr, nullptr, nullptr) == -1,
+         "verify attention: rejects non-finite scale");
+  expect(granite4_kernel_verify_attention_stage(
+              nullptr, nullptr, nullptr, nullptr, nullptr, 1.0f, 0, 5, 2, 1,
+              32, 32, nullptr, nullptr, nullptr, nullptr, nullptr) == -1,
+         "verify attention: rejects oversized batch");
+}
+
 static void test_verify_qkv_stage_device() {
   const int base = 5, rows = 4, Hq = 8, Hk = 2, d = 32, stride = 32, half = d / 2;
   Xorshift64 rng(0x9191);
@@ -1131,6 +1154,7 @@ int main() {
   test_verify_gemv_production_parity_device();
   test_batched_qkv_parity_device();
   test_batched_residual_projection_parity_device();
+  test_verify_attention_validation_device();
   test_verify_qkv_stage_device();
   test_verify_attention_stage_device();
   test_attention_device();
