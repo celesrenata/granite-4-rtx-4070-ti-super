@@ -808,7 +808,10 @@ int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
                                       std::uint16_t* d_cache_k,
                                       std::uint16_t* d_cache_v, int base_pos,
                                       int rows, int stride, int Hk, int d) {
-  if (rows <= 0 || rows > 4 || stride < base_pos + rows || Hk <= 0 || d <= 0)
+  if (d_src_k == nullptr || d_src_v == nullptr || d_cache_k == nullptr ||
+      d_cache_v == nullptr || base_pos < 0 || rows <= 0 || rows > 4 ||
+      Hk <= 0 || d <= 0 || base_pos > INT_MAX - rows ||
+      stride < base_pos + rows || static_cast<long long>(Hk) * d > INT_MAX)
     return -1;
   granite4::kv_append_batched_kernel<<<dim3((Hk * d + 255) / 256, rows), 256>>>(
       d_src_k, d_src_v, d_cache_k, d_cache_v, base_pos, rows, stride, Hk, d);
@@ -847,6 +850,9 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out) {
+  if (d_wg == nullptr || d_wu == nullptr || d_x == nullptr || d_out == nullptr ||
+      !std::isfinite(scale_g) || !std::isfinite(scale_u) || N <= 0 || K <= 0)
+    return -1;
   granite4::silu_gate_up_kernel<<<N, 128>>>(d_wg, d_wu, d_x, scale_g, scale_u, N, K,
                                             d_out);
   G4_CUDA_CHECK(cudaGetLastError());
@@ -858,7 +864,10 @@ int granite4_kernel_silu_gate_up_batched(const std::uint8_t* d_wg,
                                          const std::uint16_t* d_x, float scale_g,
                                          float scale_u, int N, int K, int rows,
                                          std::uint16_t* d_out) {
-  if (rows <= 0 || rows > 4 || N <= 0 || K <= 0) return -1;
+  if (d_wg == nullptr || d_wu == nullptr || d_x == nullptr || d_out == nullptr ||
+      !std::isfinite(scale_g) || !std::isfinite(scale_u) || rows <= 0 || rows > 4 ||
+      N <= 0 || K <= 0)
+    return -1;
   granite4::silu_gate_up_batched_kernel<<<N, 128>>>(
       d_wg, d_wu, d_x, scale_g, scale_u, N, K, rows, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
@@ -866,6 +875,8 @@ int granite4_kernel_silu_gate_up_batched(const std::uint8_t* d_wg,
 }
 
 int granite4_kernel_sample_greedy(const std::uint16_t* d_p, int rows, int n, int* d_out) {
+  if (d_p == nullptr || d_out == nullptr || rows <= 0 || n <= 0)
+    return -1;
   granite4::sample_greedy_kernel<<<(rows + 255) / 256, 256>>>(d_p, rows, n, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
@@ -873,7 +884,10 @@ int granite4_kernel_sample_greedy(const std::uint16_t* d_p, int rows, int n, int
 
 int granite4_kernel_sample_top_p(const std::uint16_t* d_p, float nucleus,
                                  const float* d_u, int rows, int n, int* d_out) {
-  if (n > granite4::kTopPVocabMax) return -1;
+  if (d_p == nullptr || d_u == nullptr || d_out == nullptr ||
+      !std::isfinite(nucleus) || nucleus <= 0.0f || nucleus > 1.0f ||
+      rows <= 0 || n <= 0 || n > granite4::kTopPVocabMax)
+    return -1;
   // One block per row: the shared-memory arrays hold the row being sorted.
   granite4::sample_top_p_kernel<<<rows, 256>>>(d_p, nucleus, d_u, n, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
