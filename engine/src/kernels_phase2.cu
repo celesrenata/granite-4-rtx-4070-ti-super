@@ -310,6 +310,107 @@ __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
 }
 
 // ---------------------------------------------------------------------------
+// Batched speculative verify: append `rows` consecutive KV positions in one
+// grid, then run one fused-GQA block per (query head, row) with that row's
+// causal prefix [0, base_kv + row + 1). The per-row arithmetic is the same
+// order as the single-row kernels, so each row stays bit-identical.
+// ---------------------------------------------------------------------------
+__global__ void kv_append_batched_kernel(const std::uint16_t* src_k,
+                                         const std::uint16_t* src_v,
+                                         std::uint16_t* cache_k,
+                                         std::uint16_t* cache_v,
+                                         int base_pos, int rows, int stride,
+                                         int Hk, int d) {
+  const int r = blockIdx.y;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows || idx >= Hk * d) return;
+  const int hkv = idx / d;
+  const int i = idx % d;
+  const int pos = base_pos + r;
+  const std::size_t cache_row = static_cast<std::size_t>(hkv) * stride * d;
+  const std::size_t src_off =
+      static_cast<std::size_t>(r) * Hk * d + static_cast<std::size_t>(idx);
+  cache_k[cache_row + static_cast<std::size_t>(pos) * d + i] = src_k[src_off];
+  cache_v[cache_row + static_cast<std::size_t>(pos) * d + i] = src_v[src_off];
+}
+
+__global__ void gqa_fused_batched_kernel(const std::uint16_t* q,
+                                         const std::uint16_t* k,
+                                         const std::uint16_t* v,
+                                         float att_scale, int Hq, int Hk, int d,
+                                         int base_kv, int rows, int k_stride,
+                                         std::uint16_t* out) {
+  const int hq = blockIdx.x;
+  const int row = blockIdx.y;
+  const int hkv = hq / (Hq / Hk);
+  const int t = threadIdx.x;
+  const int nt = blockDim.x;  // blockDim.x == d
+  const int kv_len = base_kv + row + 1;  // causal prefix for this row
+
+  extern __shared__ std::uint16_t smem[];
+  std::uint16_t* const sq = smem;              // [d]
+  std::uint16_t* const slog = smem + d;        // [kv_len] bf16 logits
+  std::uint16_t* const sp = smem + d + kv_len;  // [kv_len] bf16 probs
+  const std::size_t base_elems =
+      static_cast<std::size_t>(d) + 2u * static_cast<std::size_t>(kv_len);
+  const std::size_t exp_off = (base_elems + 3u) & ~std::size_t(3);  // 8B align
+  double* const dexp = (kv_len <= kGqaSoftmaxParallelMax)
+                           ? reinterpret_cast<double*>(smem + exp_off)
+                           : nullptr;
+  __shared__ float smax;
+  __shared__ double sdenom;
+
+  const std::uint16_t* const q_row =
+      q + static_cast<std::size_t>(row) * Hq * d;
+  for (int i = t; i < d; i += nt) sq[i] = q_row[hq * d + i];
+  __syncthreads();
+
+  for (int kv = t; kv < kv_len; kv += nt) {
+    const int kbase = (hkv * k_stride + kv) * d;
+    float acc = 0.0f;
+    for (int i = 0; i < d; ++i)
+      acc += bf16_to_f32(k[kbase + i]) * bf16_to_f32(sq[i]);
+    slog[kv] = f32_to_bf16(att_scale * acc);
+  }
+  __syncthreads();
+
+  if (t == 0) {
+    float m = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < kv_len; ++i)
+      m = fmaxf(m, 1.0f * bf16_to_f32(slog[i]));
+    smax = m;
+  }
+  __syncthreads();
+  if (dexp != nullptr) {
+    for (int kv = t; kv < kv_len; kv += nt)
+      dexp[kv] = std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[kv]) - smax));
+    __syncthreads();
+    if (t == 0) {
+      double s = 0.0;
+      for (int kv = 0; kv < kv_len; ++kv) s += dexp[kv];
+      sdenom = s;
+    }
+    __syncthreads();
+    for (int kv = t; kv < kv_len; kv += nt)
+      sp[kv] = f32_to_bf16(static_cast<float>(dexp[kv] / sdenom));
+  } else if (t == 0) {
+    double s = 0.0;
+    for (int kv = 0; kv < kv_len; ++kv)
+      s += std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[kv]) - smax));
+    for (int kv = 0; kv < kv_len; ++kv)
+      sp[kv] = f32_to_bf16(static_cast<float>(
+          std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[kv]) - smax)) / s));
+  }
+  __syncthreads();
+
+  const int i = t;
+  float acc = 0.0f;
+  for (int kv = 0; kv < kv_len; ++kv)
+    acc += bf16_to_f32(sp[kv]) * bf16_to_f32(v[(hkv * k_stride + kv) * d + i]);
+  out[static_cast<std::size_t>(row) * Hq * d + hq * d + i] = f32_to_bf16(acc);
+}
+
+// ---------------------------------------------------------------------------
 // FFN gate/up (SwiGLU): y[r] = silu(sg * Wg[r].x) * (su * Wu[r].x).
 // ---------------------------------------------------------------------------
 
@@ -564,6 +665,45 @@ int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k
       sizeof(std::uint16_t);
   granite4::gqa_fused_kernel<<<Hq, d, smem_bytes>>>(d_q, d_k, d_v, att_scale, Hq, Hk,
                                                      d, kv_len, k_stride, d_out);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
+int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
+                                      const std::uint16_t* d_src_v,
+                                      std::uint16_t* d_cache_k,
+                                      std::uint16_t* d_cache_v, int base_pos,
+                                      int rows, int stride, int Hk, int d) {
+  if (rows <= 0 || rows > 4 || stride < base_pos + rows || Hk <= 0 || d <= 0)
+    return -1;
+  granite4::kv_append_batched_kernel<<<dim3((Hk * d + 255) / 256, rows), 256>>>(
+      d_src_k, d_src_v, d_cache_k, d_cache_v, base_pos, rows, stride, Hk, d);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
+int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
+                                      const std::uint16_t* d_k,
+                                      const std::uint16_t* d_v, float att_scale,
+                                      int Hq, int Hk, int d, int base_kv,
+                                      int rows, int k_stride,
+                                      std::uint16_t* d_out) {
+  if (rows <= 0 || rows > 4 || Hq <= 0 || Hk <= 0 || Hq % Hk != 0 ||
+      k_stride < base_kv + rows)
+    return -1;
+  // Shared memory is sized for the longest row (base_kv + rows); each block
+  // row uses only its own causal prefix within that allocation.
+  const int kv_len_max = base_kv + rows;
+  const std::size_t base_elems =
+      static_cast<std::size_t>(d) + 2u * static_cast<std::size_t>(kv_len_max);
+  const std::size_t exp_elems =
+      (kv_len_max <= granite4::kGqaSoftmaxParallelMax) ? kv_len_max : 0u;
+  const std::size_t smem_bytes =
+      ((base_elems + exp_elems * (sizeof(double) / sizeof(std::uint16_t)) + 3u) &
+       ~std::size_t(3)) *
+      sizeof(std::uint16_t);
+  granite4::gqa_fused_batched_kernel<<<dim3(Hq, rows), d, smem_bytes>>>(
+      d_q, d_k, d_v, att_scale, Hq, Hk, d, base_kv, rows, k_stride, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }

@@ -56,6 +56,14 @@ extern "C" int granite4_kernel_paged_kv_compact(
     const std::uint8_t* d_paged, const std::size_t* d_block_table, int kv_len,
     int tokens_per_page, int num_layers, int Hk, int d, int layer, int which,
     std::uint16_t* d_out);
+extern "C" int granite4_kernel_kv_append_batched(
+    const std::uint16_t* d_src_k, const std::uint16_t* d_src_v,
+    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, int base_pos, int rows,
+    int stride, int Hk, int d);
+extern "C" int granite4_kernel_gqa_fused_batched(
+    const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
+    float att_scale, int Hq, int Hk, int d, int base_kv, int rows, int k_stride,
+    std::uint16_t* d_out);
 
 namespace {
 
@@ -455,6 +463,105 @@ static void test_gqa_fused_device() {
   cudaFree(dout2);
 }
 
+static void test_batched_verify_attention_device() {
+  // P4: the batched verify kernels must be bit-identical, row by row, to the
+  // single-row path. Row r appends its KV at position base+r and attends the
+  // causal prefix [0, base+r+1) - the speculative verify contract.
+  const int Hq = 32, Hk = 8, d = 128, base = 5, rows = 4, stride = 64;
+  Xorshift64 rng(0x4242);
+  std::vector<std::uint16_t> q(static_cast<std::size_t>(rows) * Hq * d);
+  for (auto& t : q) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  const std::size_t cache_elems = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> ck(cache_elems), cv(cache_elems);
+  for (auto& t : ck) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& t : cv) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  std::vector<std::uint16_t> sk(static_cast<std::size_t>(rows) * Hk * d);
+  std::vector<std::uint16_t> sv(sk.size());
+  for (auto& t : sk) t = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& t : sv) t = f32_to_bf16_host(rng.next_float_range(2.0));
+
+  // Host expectation for the append: positions base..base+rows-1 get the
+  // per-row projection, every other cache slot stays untouched.
+  std::vector<std::uint16_t> ek = ck, ev = cv;
+  for (int r = 0; r < rows; ++r)
+    for (int hkv = 0; hkv < Hk; ++hkv)
+      for (int i = 0; i < d; ++i) {
+        const std::size_t dst = static_cast<std::size_t>(hkv) * stride * d +
+                                static_cast<std::size_t>(base + r) * d + i;
+        const std::size_t src =
+            static_cast<std::size_t>(r) * Hk * d + hkv * d + i;
+        ek[dst] = sk[src];
+        ev[dst] = sv[src];
+      }
+
+  std::uint16_t *dq, *dsk, *dsv, *dak, *dav, *drk, *drv, *dout, *dref;
+  if (cudaMalloc(&dq, q.size() * 2) ||
+      cudaMalloc(&dsk, sk.size() * 2) || cudaMalloc(&dsv, sv.size() * 2) ||
+      cudaMalloc(&dak, ck.size() * 2) || cudaMalloc(&dav, cv.size() * 2) ||
+      cudaMalloc(&drk, ek.size() * 2) || cudaMalloc(&drv, ev.size() * 2) ||
+      cudaMalloc(&dout, static_cast<std::size_t>(rows) * Hq * d * 2) ||
+      cudaMalloc(&dref, static_cast<std::size_t>(rows) * Hq * d * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), q.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsk, sk.data(), sk.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsv, sv.data(), sv.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dak, ck.data(), ck.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dav, cv.data(), cv.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(drk, ek.data(), ek.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(drv, ev.data(), ev.size() * 2, cudaMemcpyHostToDevice));
+
+  expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, rows,
+                                           stride, Hk, d) == 0,
+         "batched kv append: launch");
+  expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, 5, stride,
+                                           Hk, d) == -1,
+         "batched kv append: rejects rows > 4");
+  expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, rows,
+                                           base + rows - 1, Hk, d) == -1,
+         "batched kv append: rejects stride < base+rows");
+
+  std::vector<std::uint16_t> gak(ck.size()), gav(cv.size());
+  CUDA_CHECK(cudaMemcpy(gak.data(), dak, gak.size() * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(gav.data(), dav, gav.size() * 2, cudaMemcpyDeviceToHost));
+  expect(gak == ek, "batched kv append: K cache bit-identical");
+  expect(gav == ev, "batched kv append: V cache bit-identical");
+
+  const float scale = 0.114456f;  // 1.0 / sqrt(128), the Granite value
+  expect(granite4_kernel_gqa_fused_batched(dq, drk, drv, scale, Hq, Hk, d, base,
+                                           rows, stride, dout) == 0,
+         "batched gqa: launch");
+  expect(granite4_kernel_gqa_fused_batched(dq, drk, drv, scale, Hq, Hk, d, base,
+                                           rows, base + rows - 1, dout) == -1,
+         "batched gqa: rejects k_stride < base+rows");
+  for (int r = 0; r < rows; ++r)
+    expect(granite4_kernel_gqa_fused(
+               dq + static_cast<std::size_t>(r) * Hq * d, drk, drv, scale, Hq,
+               Hk, d, base + r + 1, stride,
+               dref + static_cast<std::size_t>(r) * Hq * d) == 0,
+           "batched gqa: single-row reference launch");
+
+  std::vector<std::uint16_t> bout(static_cast<std::size_t>(rows) * Hq * d),
+      bref(bout.size());
+  CUDA_CHECK(cudaMemcpy(bout.data(), dout, bout.size() * 2,
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(bref.data(), dref, bref.size() * 2,
+                        cudaMemcpyDeviceToHost));
+  expect(bout == bref,
+         "batched gqa: bit-identical to per-row single-row calls");
+
+  cudaFree(dq);
+  cudaFree(dsk);
+  cudaFree(dsv);
+  cudaFree(dak);
+  cudaFree(dav);
+  cudaFree(drk);
+  cudaFree(drv);
+  cudaFree(dout);
+  cudaFree(dref);
+}
+
 static void test_paged_kv_compact_device() {
   // P3: gather one layer's K/V out of the paged FP8 pool into contiguous
   // [Hk, kv_len, d] BF16 and check it bit-exactly against the host reference
@@ -626,6 +733,7 @@ int main() {
   test_row_gemm_device();
   test_attention_device();
   test_gqa_fused_device();
+  test_batched_verify_attention_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();

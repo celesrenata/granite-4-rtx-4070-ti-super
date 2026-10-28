@@ -432,6 +432,17 @@ int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k
                                const std::uint16_t* d_v, float att_scale, int Hq,
                                int Hk, int d, int kv_len, int k_stride,
                                std::uint16_t* d_out);
+int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
+                                      const std::uint16_t* d_src_v,
+                                      std::uint16_t* d_cache_k,
+                                      std::uint16_t* d_cache_v, int base_pos,
+                                      int rows, int stride, int Hk, int d);
+int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
+                                      const std::uint16_t* d_k,
+                                      const std::uint16_t* d_v, float att_scale,
+                                      int Hq, int Hk, int d, int base_kv,
+                                      int rows, int k_stride,
+                                      std::uint16_t* d_out);
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out);
