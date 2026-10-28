@@ -420,6 +420,24 @@ __global__ void row_gemm_dequant_resid_kernel(const std::uint16_t* a,
                          residual, residual_scale);
 }
 
+// Batched residual projection: one block per (token, output row), preserving
+// the production row-GEMV arithmetic while eliminating the per-token launch
+// loop used by the single-position path.
+__global__ void row_gemm_dequant_resid_batched_kernel(
+    const std::uint16_t* a, const std::uint8_t* B, float scale,
+    const std::uint16_t* residual, float residual_scale, int tokens, int N, int K,
+    std::uint16_t* out) {
+  const int block = blockIdx.x;
+  const int token = block / N;
+  const int row = block % N;
+  if (token >= tokens) return;
+  gemv_row_dequant<true>(
+      a + static_cast<std::size_t>(token) * K,
+      B + static_cast<std::size_t>(row) * K, scale, K,
+      out + static_cast<std::size_t>(token) * N, row,
+      residual + static_cast<std::size_t>(token) * N, residual_scale);
+}
+
 // Fused Q/K/V decode GEMV: one launch for the three attention projections, so
 // the small k/v grids stop paying a separate ramp/drain and launch gap per
 // layer. Blocks are dispatched by range; per-row arithmetic is identical to
@@ -1041,12 +1059,8 @@ extern "C" int granite4_kernel_row_gemm_resid_dequant(
     const std::uint16_t* d_residual, float residual_scale, int tokens, int N, int K,
     std::uint16_t* d_out) {
   if (tokens <= 0 || N <= 0 || K <= 0) return -1;
-  for (int t = 0; t < tokens; ++t) {
-    row_gemm_dequant_resid_kernel<<<N, kRowGemvThreads>>>(
-        d_a + static_cast<std::size_t>(t) * K, d_B, scale,
-        d_residual + static_cast<std::size_t>(t) * N, residual_scale, N, K,
-        d_out + static_cast<std::size_t>(t) * N);
-  }
+  row_gemm_dequant_resid_batched_kernel<<<tokens * N, kRowGemvThreads>>>(
+      d_a, d_B, scale, d_residual, residual_scale, tokens, N, K, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
