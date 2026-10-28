@@ -547,6 +547,24 @@ static void test_verify_attention_validation_device() {
          "verify attention: rejects oversized batch");
 }
 
+static void test_verify_attention_layer_validation_device() {
+  expect(gpu_verify_attention_layer(
+              nullptr, nullptr, nullptr, nullptr, NAN, 1.0f, 1.0f, nullptr,
+              nullptr, 1.0f, 0, 1, 2, 1, 32, 64, 32, nullptr, nullptr,
+              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == -1,
+         "verify layer: rejects non-finite Q scale");
+  expect(gpu_verify_attention_layer(
+              nullptr, nullptr, nullptr, nullptr, 1.0f, INFINITY, 1.0f, nullptr,
+              nullptr, 1.0f, 0, 1, 2, 1, 32, 64, 32, nullptr, nullptr,
+              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == -1,
+         "verify layer: rejects non-finite K scale");
+  expect(gpu_verify_attention_layer(
+              nullptr, nullptr, nullptr, nullptr, 1.0f, 1.0f, 1.0f, nullptr,
+              nullptr, NAN, 0, 1, 2, 1, 32, 64, 32, nullptr, nullptr,
+              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == -1,
+         "verify layer: rejects non-finite attention scale");
+}
+
 static void test_verify_qkv_stage_device() {
   const int base = 5, rows = 4, Hq = 8, Hk = 2, d = 32, stride = 32, half = d / 2;
   Xorshift64 rng(0x9191);
@@ -1160,6 +1178,7 @@ int main() {
   test_batched_qkv_parity_device();
   test_batched_residual_projection_parity_device();
   test_verify_attention_validation_device();
+  test_verify_attention_layer_validation_device();
   test_verify_qkv_stage_device();
   test_verify_attention_stage_device();
   test_attention_device();
