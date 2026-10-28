@@ -99,6 +99,12 @@ extern "C" int granite4_kernel_verify_qkv_stage(
     const float* d_cos, const float* d_sin, int base_pos, int rows, int Hq, int Hk,
     int d, int cache_stride, std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v);
+extern "C" int granite4_kernel_verify_attention_stage(
+    const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
+    const float* d_cos, const float* d_sin, float att_scale, int base_pos, int rows,
+    int Hq, int Hk, int d, int cache_stride, std::uint16_t* d_q_rot,
+    std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
+    std::uint16_t* d_out);
 extern "C" int granite4_kernel_kv_append_batched(
     const std::uint16_t* d_src_k, const std::uint16_t* d_src_v,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, int base_pos, int rows,
@@ -551,6 +557,54 @@ static void test_verify_qkv_stage_device() {
   }
   cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dqr); cudaFree(dkr);
   cudaFree(dck); cudaFree(dcv); cudaFree(dc); cudaFree(ds);
+}
+
+static void test_verify_attention_stage_device() {
+  const int base = 5, rows = 4, Hq = 8, Hk = 2, d = 32, stride = 32, half = d / 2;
+  Xorshift64 rng(0xa1a1);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t kn = static_cast<std::size_t>(rows) * Hk * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), k(kn), v(kn), ck(cn), cv(cn), batch(qn), ref(qn);
+  std::vector<float> cs(static_cast<std::size_t>(rows) * half), sn(cs.size());
+  for (auto& x : q) x = gen_bf16(rng);
+  for (auto& x : k) x = gen_bf16(rng);
+  for (auto& x : v) x = gen_bf16(rng);
+  for (auto& x : ck) x = gen_bf16(rng);
+  for (auto& x : cv) x = gen_bf16(rng);
+  for (int r = 0; r < rows; ++r) for (int i = 0; i < half; ++i) {
+    const float th = 1.0f / std::pow(10000.0f, 2.0f * i / d);
+    cs[r * half + i] = std::cos((base + r) * th);
+    sn[r * half + i] = std::sin((base + r) * th);
+  }
+  std::uint16_t *dq, *dk, *dv, *dck, *dcv, *dqr, *dkr, *do_batch, *do_ref;
+  float *dc, *ds;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dk, kn * 2) || cudaMalloc(&dv, kn * 2) ||
+      cudaMalloc(&dck, cn * 2) || cudaMalloc(&dcv, cn * 2) || cudaMalloc(&dqr, qn * 2) ||
+      cudaMalloc(&dkr, kn * 2) || cudaMalloc(&do_batch, qn * 2) || cudaMalloc(&do_ref, qn * 2) ||
+      cudaMalloc(&dc, cs.size() * 4) || cudaMalloc(&ds, sn.size() * 4)) { ++g_failures; return; }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, k.data(), kn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, v.data(), kn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dck, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dcv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dc, cs.data(), cs.size() * 4, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(ds, sn.data(), sn.size() * 4, cudaMemcpyHostToDevice));
+  const float scale = 0.177f;
+  expect(granite4_kernel_verify_attention_stage(dq, dk, dv, dc, ds, scale, base, rows,
+      Hq, Hk, d, stride, dqr, dkr, dck, dcv, do_batch) == 0,
+      "verify attention stage: launch");
+  for (int r = 0; r < rows; ++r)
+    expect(granite4_kernel_gqa_fused(dqr + static_cast<std::size_t>(r) * Hq * d,
+      dck, dcv, scale, Hq, Hk, d, base + r + 1, stride,
+      do_ref + static_cast<std::size_t>(r) * Hq * d) == 0,
+      "verify attention stage: single-row reference");
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaMemcpy(batch.data(), do_batch, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(ref.data(), do_ref, qn * 2, cudaMemcpyDeviceToHost));
+  expect(batch == ref, "verify attention stage: batched GQA parity");
+  cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dck); cudaFree(dcv);
+  cudaFree(dqr); cudaFree(dkr); cudaFree(do_batch); cudaFree(do_ref); cudaFree(dc); cudaFree(ds);
 }
 
 static void test_attention_device() {
@@ -1069,6 +1123,7 @@ int main() {
   test_batched_qkv_parity_device();
   test_batched_residual_projection_parity_device();
   test_verify_qkv_stage_device();
+  test_verify_attention_stage_device();
   test_attention_device();
   test_gqa_fused_device();
   test_batched_verify_attention_device();

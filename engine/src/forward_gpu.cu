@@ -1112,4 +1112,21 @@ extern "C" int granite4_kernel_verify_qkv_stage(
       cache_stride, Hk, d);
 }
 
+// Complete attention-stage verify primitive. Q/K are already projected; this
+// composes position-aware RoPE, persistent KV append, and causal batched GQA.
+extern "C" int granite4_kernel_verify_attention_stage(
+    const std::uint16_t* d_q, const std::uint16_t* d_k,
+    const std::uint16_t* d_v, const float* d_cos, const float* d_sin,
+    float att_scale, int base_pos, int rows, int Hq, int Hk, int d,
+    int cache_stride, std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
+    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, std::uint16_t* d_out) {
+  const int staged = granite4_kernel_verify_qkv_stage(
+      d_q, d_k, d_v, d_cos, d_sin, base_pos, rows, Hq, Hk, d, cache_stride,
+      d_q_rot, d_k_rot, d_cache_k, d_cache_v);
+  if (staged != 0) return staged;
+  return granite4_kernel_gqa_fused_batched(
+      d_q_rot, d_cache_k, d_cache_v, att_scale, Hq, Hk, d, base_pos,
+      rows, cache_stride, d_out);
+}
+
 }  // namespace granite4
