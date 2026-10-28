@@ -745,6 +745,8 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
     return -1;
   };
 
+  if (g == nullptr || d_tokens == nullptr || d_logits == nullptr)
+    return seterr("invalid forward arguments");
   const int L = g->L, H = g->H, I = g->I, Hq = g->Hq, Hk = g->Hk;
   const int d = g->d, V = g->V, max_pos = g->max_pos;
   const int half = d / 2;
@@ -757,7 +759,11 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
 
   const GpuWeightsLayout lay{H, I, V, L, Hq, Hk, d};
 
-  if (end > max_pos) return seterr("sequence exceeds max_positions");
+  if (end <= 0 || end > max_pos) return seterr("invalid sequence length");
+  if (!std::isfinite(rms_eps) || rms_eps <= 0.0f ||
+      !std::isfinite(att_scale) || !std::isfinite(resid_scale) ||
+      !std::isfinite(emb_scale) || !std::isfinite(logits_scale))
+    return seterr("invalid forward scales");
   if (g->weights == nullptr || g->scales == nullptr)
     return seterr("weights not loaded (call gpu_weights_load first)");
 
