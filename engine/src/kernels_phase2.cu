@@ -786,7 +786,8 @@ int granite4_kernel_gemm_dequant(const std::uint16_t* d_a, const std::uint8_t* d
                                  float scale, int M, int N, int K, std::uint16_t* d_c) {
   if (d_a == nullptr || d_b == nullptr || d_c == nullptr ||
       !std::isfinite(scale) || M <= 0 || N <= 0 || K <= 0 ||
-      static_cast<long long>(M) * N > INT_MAX)
+      static_cast<long long>(M) * N > INT_MAX ||
+      static_cast<long long>(N) * K > INT_MAX)
     return -1;
   granite4::gemm_dequant_kernel<<<(M * N + 255) / 256, 256>>>(
       d_a, d_b, scale, M, N, K, d_c);
@@ -800,7 +801,9 @@ int granite4_kernel_gqa_logits(const std::uint16_t* d_q, const std::uint16_t* d_
   if (d_q == nullptr || d_k == nullptr || d_logits == nullptr ||
       !std::isfinite(scale) || Hq <= 0 || Hk <= 0 || d <= 0 || kv_len <= 0 ||
       Hq < Hk || Hq % Hk != 0 ||
-      static_cast<long long>(Hq) * kv_len > INT_MAX)
+      static_cast<long long>(Hq) * kv_len > INT_MAX ||
+      static_cast<long long>(Hq) * d > INT_MAX ||
+      static_cast<long long>(Hk) * d > INT_MAX)
     return -1;
   granite4::gqa_logits_kernel<<<(Hq * kv_len + 255) / 256, 256>>>(
       d_q, d_k, scale, Hq, Hk, d, kv_len, d_logits);
@@ -812,7 +815,8 @@ int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v
                               int Hq, int Hk, int d, int kv_len, std::uint16_t* d_out) {
   if (d_p == nullptr || d_v == nullptr || d_out == nullptr || Hq <= 0 ||
       Hk <= 0 || d <= 0 || kv_len <= 0 || Hq < Hk || Hq % Hk != 0 ||
-      static_cast<long long>(Hq) * d > INT_MAX)
+      static_cast<long long>(Hq) * d > INT_MAX ||
+      static_cast<long long>(Hk) * d > INT_MAX)
     return -1;
   granite4::gqa_value_kernel<<<(Hq * d + 255) / 256, 256>>>(
       d_p, d_v, Hq, Hk, d, kv_len, d_out);
