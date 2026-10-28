@@ -94,6 +94,11 @@ extern "C" int granite4_kernel_rope_at_pos(const std::uint16_t* d_x,
 extern "C" int granite4_kernel_rope_at_pos_batched(
     const std::uint16_t* d_x, const float* d_cos, const float* d_sin, int rows,
     int heads, int d, std::uint16_t* d_out);
+extern "C" int granite4_kernel_verify_qkv_stage(
+    const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
+    const float* d_cos, const float* d_sin, int base_pos, int rows, int Hq, int Hk,
+    int d, int cache_stride, std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
+    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v);
 extern "C" int granite4_kernel_kv_append_batched(
     const std::uint16_t* d_src_k, const std::uint16_t* d_src_v,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, int base_pos, int rows,
@@ -497,6 +502,55 @@ static void test_batched_residual_projection_parity_device() {
     }
   }
   cudaFree(da); cudaFree(dr); cudaFree(dw); cudaFree(do_batched); cudaFree(do_single);
+}
+
+static void test_verify_qkv_stage_device() {
+  const int base = 5, rows = 4, Hq = 8, Hk = 2, d = 32, stride = 32, half = d / 2;
+  Xorshift64 rng(0x9191);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t kn = static_cast<std::size_t>(rows) * Hk * d;
+  std::vector<std::uint16_t> q(qn), k(kn), v(kn), qrot(qn), krot(kn);
+  std::vector<float> cs(static_cast<std::size_t>(rows) * half), sn(cs.size());
+  for (auto& x : q) x = gen_bf16(rng);
+  for (auto& x : k) x = gen_bf16(rng);
+  for (auto& x : v) x = gen_bf16(rng);
+  for (int r = 0; r < rows; ++r)
+    for (int i = 0; i < half; ++i) {
+      const float th = 1.0f / std::pow(10000.0f, 2.0f * i / d);
+      cs[r * half + i] = std::cos((base + r) * th);
+      sn[r * half + i] = std::sin((base + r) * th);
+    }
+  const std::size_t cache_n = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> ck(cache_n), cv(cache_n);
+  std::uint16_t *dq, *dk, *dv, *dqr, *dkr, *dck, *dcv;
+  float *dc, *ds;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dk, kn * 2) || cudaMalloc(&dv, kn * 2) ||
+      cudaMalloc(&dqr, qn * 2) || cudaMalloc(&dkr, kn * 2) ||
+      cudaMalloc(&dck, cache_n * 2) || cudaMalloc(&dcv, cache_n * 2) ||
+      cudaMalloc(&dc, cs.size() * 4) || cudaMalloc(&ds, sn.size() * 4)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, k.data(), kn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, v.data(), kn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dc, cs.data(), cs.size() * 4, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(ds, sn.data(), sn.size() * 4, cudaMemcpyHostToDevice));
+  expect(granite4_kernel_verify_qkv_stage(dq, dk, dv, dc, ds, base, rows, Hq, Hk, d,
+                                          stride, dqr, dkr, dck, dcv) == 0,
+         "verify QKV stage: launch");
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaMemcpy(qrot.data(), dqr, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(krot.data(), dkr, kn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(ck.data(), dck, cache_n * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(cv.data(), dcv, cache_n * 2, cudaMemcpyDeviceToHost));
+  for (int r = 0; r < rows; ++r) for (int h = 0; h < Hk; ++h) for (int i = 0; i < d; ++i) {
+    const std::size_t src = (static_cast<std::size_t>(r) * Hk + h) * d + i;
+    const std::size_t dst = (static_cast<std::size_t>(h) * stride + base + r) * d + i;
+    expect(ck[dst] == krot[src] && cv[dst] == v[src], "verify QKV stage: cache append");
+  }
+  cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dqr); cudaFree(dkr);
+  cudaFree(dck); cudaFree(dcv); cudaFree(dc); cudaFree(ds);
 }
 
 static void test_attention_device() {
@@ -1014,6 +1068,7 @@ int main() {
   test_verify_gemv_production_parity_device();
   test_batched_qkv_parity_device();
   test_batched_residual_projection_parity_device();
+  test_verify_qkv_stage_device();
   test_attention_device();
   test_gqa_fused_device();
   test_batched_verify_attention_device();

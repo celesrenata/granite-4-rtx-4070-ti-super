@@ -1088,4 +1088,28 @@ extern "C" int granite4_kernel_rope_at_pos_batched(
   return 0;
 }
 
+// Verified attention staging for speculative rows: rotate projected Q/K using
+// position-specific tables, then append the rotated K and raw V atomically as
+// one host-visible operation. GQA consumes the resulting buffers afterwards.
+extern "C" int granite4_kernel_verify_qkv_stage(
+    const std::uint16_t* d_q, const std::uint16_t* d_k,
+    const std::uint16_t* d_v, const float* d_cos, const float* d_sin,
+    int base_pos, int rows, int Hq, int Hk, int d, int cache_stride,
+    std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
+    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v) {
+  if (rows <= 0 || rows > 4 || Hq <= 0 || Hk <= 0 || d <= 0 ||
+      (d & 1) != 0 || cache_stride <= base_pos + rows - 1) return -1;
+  const std::size_t nq = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t nk = static_cast<std::size_t>(rows) * Hk * d;
+  rope_at_pos_batched_kernel<<<(nq + 255) / 256, 256>>>(
+      d_q, d_cos, d_sin, rows, Hq, d, d_q_rot);
+  G4_CUDA_CHECK(cudaGetLastError());
+  rope_at_pos_batched_kernel<<<(nk + 255) / 256, 256>>>(
+      d_k, d_cos, d_sin, rows, Hk, d, d_k_rot);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return granite4_kernel_kv_append_batched(
+      d_k_rot, d_v, d_cache_k, d_cache_v, base_pos, rows,
+      cache_stride, Hk, d);
+}
+
 }  // namespace granite4
