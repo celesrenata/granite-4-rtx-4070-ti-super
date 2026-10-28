@@ -1075,6 +1075,8 @@ int gpu_verify_attention_layer(
       d_q == nullptr || d_k == nullptr || d_v == nullptr || d_cos == nullptr ||
       d_sin == nullptr || d_q_rot == nullptr || d_k_rot == nullptr ||
       d_cache_k == nullptr || d_cache_v == nullptr || d_attn_out == nullptr ||
+      !std::isfinite(q_scale) || !std::isfinite(k_scale) ||
+      !std::isfinite(v_scale) || !std::isfinite(attention_scale) ||
       hidden_size <= 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
       rows < 1 || rows > 4 || base_pos < 0 || cache_stride <= base_pos + rows - 1)
     return -1;
