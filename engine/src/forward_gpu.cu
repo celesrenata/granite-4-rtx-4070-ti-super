@@ -610,19 +610,43 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
   g->V = static_cast<int>(model.vocab_size);
   g->max_pos = max_positions;
 
-  const std::size_t kv_elems =
-      static_cast<std::size_t>(g->L) * g->Hk * max_positions * g->d;
-  const std::size_t compact_elems =
-      static_cast<std::size_t>(g->Hk) * max_positions * g->d;
+  const auto checked_mul = [](std::size_t a, std::size_t b, std::size_t* out) {
+    if (b != 0 && a > SIZE_MAX / b) return false;
+    *out = a * b;
+    return true;
+  };
+  const auto checked_add = [](std::size_t a, std::size_t b, std::size_t* out) {
+    if (a > SIZE_MAX - b) return false;
+    *out = a + b;
+    return true;
+  };
+  std::size_t kv_elems = 0;
+  std::size_t compact_elems = 0;
+  std::size_t scratch_elems = 0;
+  std::size_t term = 0;
+  if (!checked_mul(static_cast<std::size_t>(g->L), g->Hk, &term) ||
+      !checked_mul(term, static_cast<std::size_t>(max_positions), &term) ||
+      !checked_mul(term, static_cast<std::size_t>(g->d), &kv_elems) ||
+      !checked_mul(static_cast<std::size_t>(g->Hk), static_cast<std::size_t>(max_positions), &term) ||
+      !checked_mul(term, static_cast<std::size_t>(g->d), &compact_elems)) {
+    delete g;
+    return nullptr;
+  }
   // Scratch: hidden(H) + normed(H) + normed2(H) + qf(Hq*d) + k_new(Hk*d)
   //          + v_new(Hk*d) + attn_out(Hq*d) + o_out(H) + gate_out(I)
   //          + ffn_out(H) + qf_rot(Hq*d) + k_new_rot(Hk*d)
-  const std::size_t scratch_elems =
-      5 * static_cast<std::size_t>(g->H) +
-      2 * static_cast<std::size_t>(g->Hq) * g->d +
-      2 * static_cast<std::size_t>(g->Hk) * g->d +
-      static_cast<std::size_t>(g->I) +
-      (static_cast<std::size_t>(g->Hq) + g->Hk) * g->d;
+  if (!checked_mul(5, static_cast<std::size_t>(g->H), &scratch_elems) ||
+      !checked_mul(static_cast<std::size_t>(g->Hq), static_cast<std::size_t>(g->d), &term) ||
+      !checked_mul(term, 2, &term) || !checked_add(scratch_elems, term, &scratch_elems) ||
+      !checked_mul(static_cast<std::size_t>(g->Hk), static_cast<std::size_t>(g->d), &term) ||
+      !checked_mul(term, 2, &term) || !checked_add(scratch_elems, term, &scratch_elems) ||
+      !checked_add(scratch_elems, static_cast<std::size_t>(g->I), &scratch_elems) ||
+      !checked_add(static_cast<std::size_t>(g->Hq), static_cast<std::size_t>(g->Hk), &term) ||
+      !checked_mul(term, static_cast<std::size_t>(g->d), &term) ||
+      !checked_add(scratch_elems, term, &scratch_elems)) {
+    delete g;
+    return nullptr;
+  }
 
   cudaError_t e;
   e = cudaMalloc(&g->kv_k, kv_elems * sizeof(std::uint16_t));
