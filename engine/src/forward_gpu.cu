@@ -1045,8 +1045,12 @@ int gpu_weights_load(GpuCtx* ctx, const std::uint8_t* h_weights,
     return -1;
   };
   if (ctx == nullptr || h_weights == nullptr || bytes == 0 ||
-      h_scales == nullptr || n_scales == 0)
+      h_scales == nullptr || n_scales == 0 ||
+      n_scales > SIZE_MAX / sizeof(float))
     return seterr("invalid arguments");
+  for (std::size_t i = 0; i < n_scales; ++i) {
+    if (!std::isfinite(h_scales[i])) return seterr("non-finite scale");
+  }
   // Replacing existing weights: free first (idempotent semantics).
   gpu_weights_free(ctx);
   std::uint8_t* d_weights = nullptr;
