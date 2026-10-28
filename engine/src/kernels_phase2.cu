@@ -854,7 +854,8 @@ int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
   if (d_src_k == nullptr || d_src_v == nullptr || d_cache_k == nullptr ||
       d_cache_v == nullptr || base_pos < 0 || rows <= 0 || rows > 4 ||
       Hk <= 0 || d <= 0 || base_pos > INT_MAX - rows ||
-      stride < base_pos + rows || static_cast<long long>(Hk) * d > INT_MAX)
+      stride < base_pos + rows || static_cast<long long>(Hk) * d > INT_MAX ||
+      stride > INT_MAX / std::max(Hk, 1))
     return -1;
   granite4::kv_append_batched_kernel<<<dim3((Hk * d + 255) / 256, rows), 256>>>(
       d_src_k, d_src_v, d_cache_k, d_cache_v, base_pos, rows, stride, Hk, d);
@@ -872,7 +873,9 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
       !std::isfinite(att_scale) || rows <= 0 || rows > 4 || Hq <= 0 || Hk <= 0 ||
       d <= 0 || base_kv < 0 || Hq < Hk || Hq % Hk != 0 ||
       base_kv > INT_MAX - rows || k_stride < base_kv + rows ||
-      static_cast<std::size_t>(base_kv + rows) > granite4::kGqaSoftmaxParallelMax * 1024u)
+      static_cast<std::size_t>(base_kv + rows) > granite4::kGqaSoftmaxParallelMax * 1024u ||
+      static_cast<long long>(Hq) * d > INT_MAX ||
+      static_cast<long long>(Hk) * d > INT_MAX)
     return -1;
   // Shared memory is sized for the longest row (base_kv + rows); each block
   // row uses only its own causal prefix within that allocation.
@@ -895,7 +898,8 @@ int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out) {
   if (d_wg == nullptr || d_wu == nullptr || d_x == nullptr || d_out == nullptr ||
-      !std::isfinite(scale_g) || !std::isfinite(scale_u) || N <= 0 || K <= 0)
+      !std::isfinite(scale_g) || !std::isfinite(scale_u) || N <= 0 || K <= 0 ||
+      static_cast<long long>(N) * K > INT_MAX)
     return -1;
   granite4::silu_gate_up_kernel<<<N, 128>>>(d_wg, d_wu, d_x, scale_g, scale_u, N, K,
                                             d_out);
