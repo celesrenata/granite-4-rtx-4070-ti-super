@@ -1158,7 +1158,7 @@ int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
                       std::uint16_t* d_logits, char* error,
                       std::size_t error_size) {
   if (ctx == nullptr || d_tokens == nullptr || d_logits == nullptr ||
-      end <= 0) {
+      end <= 0 || end > INT_MAX / static_cast<int>(sizeof(std::uint16_t))) {
     if (error != nullptr && error_size > 0)
       std::snprintf(error, error_size, "invalid arguments");
     return -1;
