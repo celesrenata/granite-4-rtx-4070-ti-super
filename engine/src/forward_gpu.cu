@@ -494,6 +494,12 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
                                       int Hq, int Hk, int d, int base_kv,
                                       int rows, int k_stride,
                                       std::uint16_t* d_out);
+int granite4_kernel_verify_attention_stage(
+    const std::uint16_t* d_q, const std::uint16_t* d_k,
+    const std::uint16_t* d_v, const float* d_cos, const float* d_sin,
+    float att_scale, int base_pos, int rows, int Hq, int Hk, int d,
+    int cache_stride, std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
+    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, std::uint16_t* d_out);
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out);
@@ -1002,6 +1008,23 @@ void gpu_weights_free(GpuCtx* ctx) {
   if (ctx->scales != nullptr) cudaFreeHost(ctx->scales);
   ctx->scales = nullptr;
   ctx->scales_count = 0;
+}
+
+int gpu_verify_attention_stage(
+    const std::uint16_t* d_q, const std::uint16_t* d_k,
+    const std::uint16_t* d_v, const float* d_cos, const float* d_sin,
+    float attention_scale, int base_pos, int rows, int q_heads, int kv_heads,
+    int head_dim, int cache_stride, std::uint16_t* d_q_rot,
+    std::uint16_t* d_k_rot, std::uint16_t* d_cache_k,
+    std::uint16_t* d_cache_v, std::uint16_t* d_out) {
+  if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_cos == nullptr ||
+      d_sin == nullptr || d_q_rot == nullptr || d_k_rot == nullptr ||
+      d_cache_k == nullptr || d_cache_v == nullptr || d_out == nullptr)
+    return -1;
+  return granite4_kernel_verify_attention_stage(
+      d_q, d_k, d_v, d_cos, d_sin, attention_scale, base_pos, rows,
+      q_heads, kv_heads, head_dim, cache_stride, d_q_rot, d_k_rot,
+      d_cache_k, d_cache_v, d_out);
 }
 
 int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,

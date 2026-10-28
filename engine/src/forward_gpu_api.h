@@ -82,6 +82,20 @@ int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
                       std::uint16_t* d_logits, char* error,
                       std::size_t error_size);
 
+// Run the attention portion of speculative verification for `rows` consecutive
+// positions. Inputs and outputs are device memory. Q/K/V are token-major
+// projected tensors; cos/sin contain one [d/2] row per position. The stage
+// applies RoPE, appends K/V at base_pos..base_pos+rows, and writes causal GQA
+// outputs. The cache uses [Hk][cache_stride][d] layout. `rows` is currently
+// bounded to four, matching the verified batched kernels.
+int gpu_verify_attention_stage(
+    const std::uint16_t* d_q, const std::uint16_t* d_k,
+    const std::uint16_t* d_v, const float* d_cos, const float* d_sin,
+    float attention_scale, int base_pos, int rows, int q_heads, int kv_heads,
+    int head_dim, int cache_stride, std::uint16_t* d_q_rot,
+    std::uint16_t* d_k_rot, std::uint16_t* d_cache_k,
+    std::uint16_t* d_cache_v, std::uint16_t* d_out);
+
 }  // namespace granite4
 
 #endif  // GRANITE4_FORWARD_GPU_API_H
