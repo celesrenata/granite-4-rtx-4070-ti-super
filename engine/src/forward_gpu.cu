@@ -1107,6 +1107,8 @@ int gpu_verify_attention_stage(
       !std::isfinite(attention_scale) || rows < 1 || rows > 4 ||
       base_pos < 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
       q_heads < kv_heads || q_heads % kv_heads != 0 ||
+      static_cast<long long>(q_heads) * head_dim > INT_MAX ||
+      static_cast<long long>(kv_heads) * head_dim > INT_MAX ||
       base_pos > INT_MAX - rows + 1 ||
       cache_stride <= base_pos + rows - 1)
     return -1;
@@ -1132,6 +1134,8 @@ int gpu_verify_attention_layer(
       !std::isfinite(q_scale) || !std::isfinite(k_scale) ||
       !std::isfinite(v_scale) || !std::isfinite(attention_scale) ||
       hidden_size <= 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+      static_cast<long long>(q_heads) * head_dim > INT_MAX ||
+      static_cast<long long>(kv_heads) * head_dim > INT_MAX ||
       rows < 1 || rows > 4 || base_pos < 0 ||
       base_pos > INT_MAX - rows + 1 ||
       cache_stride <= base_pos + rows - 1)
