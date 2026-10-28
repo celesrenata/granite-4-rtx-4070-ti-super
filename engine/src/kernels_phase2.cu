@@ -732,7 +732,8 @@ int granite4_rope_tables_build(double theta, int head_dim, int max_pos,
 int granite4_kernel_rmsnorm(const std::uint16_t* d_x, const std::uint16_t* d_w,
                             float eps, int rows, int cols, std::uint16_t* d_out) {
   if (d_x == nullptr || d_w == nullptr || d_out == nullptr ||
-      !std::isfinite(eps) || eps <= 0.0f || rows <= 0 || cols <= 0)
+      !std::isfinite(eps) || eps <= 0.0f || rows <= 0 || cols <= 0 ||
+      static_cast<long long>(rows) * cols > INT_MAX)
     return -1;
   // One block per row (block-per-row reduction; blockDim <= 320).
   granite4::rmsnorm_kernel<<<rows, 256>>>(d_x, d_w, eps, rows, cols, d_out);
