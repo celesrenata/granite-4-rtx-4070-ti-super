@@ -1142,8 +1142,14 @@ extern "C" int granite4_kernel_qkv_dequant_batched(
     const std::uint8_t* d_wv, float sq, float sk, float sv, int tokens, int nq,
     int nk, int nv, int k, std::uint16_t* d_q, std::uint16_t* d_kk,
     std::uint16_t* d_v) {
-  if (tokens <= 0 || nq <= 0 || nk <= 0 || nv <= 0 || k <= 0) return -1;
-  row_gemm_dequant_qkv_batched_kernel<<<tokens * (nq + nk + nv), kRowGemvThreads>>>(
+  const long long total = static_cast<long long>(nq) + nk + nv;
+  if (d_a == nullptr || d_wq == nullptr || d_wk == nullptr || d_wv == nullptr ||
+      d_q == nullptr || d_kk == nullptr || d_v == nullptr ||
+      !std::isfinite(sq) || !std::isfinite(sk) || !std::isfinite(sv) ||
+      tokens <= 0 || nq <= 0 || nk <= 0 || nv <= 0 || k <= 0 ||
+      total > INT_MAX || static_cast<long long>(tokens) * total > INT_MAX)
+    return -1;
+  row_gemm_dequant_qkv_batched_kernel<<<tokens * static_cast<int>(total), kRowGemvThreads>>>(
       d_a, d_wq, d_wk, d_wv, sq, sk, sv, tokens, nq, nk, nv, k, d_q, d_kk, d_v);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
@@ -1153,8 +1159,13 @@ extern "C" int granite4_kernel_qkv_dequant(
     const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
     const std::uint8_t* d_wv, float sq, float sk, float sv, int nq, int nk, int k,
     std::uint16_t* d_q, std::uint16_t* d_kk, std::uint16_t* d_v) {
-  if (nq <= 0 || nk <= 0 || k <= 0) return -1;
-  row_gemm_dequant_qkv_kernel<<<nq + 2 * nk, kRowGemvThreads>>>(
+  const long long total = static_cast<long long>(nq) + 2 * nk;
+  if (d_a == nullptr || d_wq == nullptr || d_wk == nullptr || d_wv == nullptr ||
+      d_q == nullptr || d_kk == nullptr || d_v == nullptr ||
+      !std::isfinite(sq) || !std::isfinite(sk) || !std::isfinite(sv) ||
+      nq <= 0 || nk <= 0 || k <= 0 || total > INT_MAX)
+    return -1;
+  row_gemm_dequant_qkv_kernel<<<static_cast<int>(total), kRowGemvThreads>>>(
       d_a, d_wq, d_wk, d_wv, sq, sk, sv, nq, nk, nk, k, d_q, d_kk, d_v);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
@@ -1164,7 +1175,10 @@ extern "C" int granite4_kernel_row_gemm_resid_dequant(
     const std::uint16_t* d_a, const std::uint8_t* d_B, float scale,
     const std::uint16_t* d_residual, float residual_scale, int tokens, int N, int K,
     std::uint16_t* d_out) {
-  if (tokens <= 0 || N <= 0 || K <= 0) return -1;
+  if (d_a == nullptr || d_B == nullptr || d_residual == nullptr || d_out == nullptr ||
+      !std::isfinite(scale) || !std::isfinite(residual_scale) || tokens <= 0 ||
+      N <= 0 || K <= 0 || static_cast<long long>(tokens) * N > INT_MAX)
+    return -1;
   row_gemm_dequant_resid_batched_kernel<<<tokens * N, kRowGemvThreads>>>(
       d_a, d_B, scale, d_residual, residual_scale, tokens, N, K, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
