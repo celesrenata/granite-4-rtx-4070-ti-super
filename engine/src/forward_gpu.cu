@@ -1264,7 +1264,8 @@ extern "C" int granite4_kernel_rope_at_pos_batched(
     const std::uint16_t* d_x, const float* d_cos, const float* d_sin, int rows,
     int heads, int d, std::uint16_t* d_out) {
   if (d_x == nullptr || d_cos == nullptr || d_sin == nullptr || d_out == nullptr ||
-      rows <= 0 || rows > 4 || heads <= 0 || d <= 0 || (d & 1) != 0)
+      rows <= 0 || rows > 4 || heads <= 0 || d <= 0 || (d & 1) != 0 ||
+      static_cast<long long>(rows) * heads * d > INT_MAX)
     return -1;
   const std::size_t n = static_cast<std::size_t>(rows) * heads * d;
   rope_at_pos_batched_kernel<<<(n + 255) / 256, 256>>>(
