@@ -465,6 +465,32 @@ __global__ void row_gemm_dequant_qkv_kernel(const std::uint16_t* a,
 }
 
 
+__global__ void row_gemm_dequant_qkv_batched_kernel(
+    const std::uint16_t* a, const std::uint8_t* wq, const std::uint8_t* wk,
+    const std::uint8_t* wv, float sq, float sk, float sv, int tokens,
+    int Nq, int Nk, int Nv, int K, std::uint16_t* oq, std::uint16_t* ok,
+    std::uint16_t* ov) {
+  const int b = blockIdx.x;
+  const int total = Nq + Nk + Nv;
+  const int token = b / total;
+  const int row = b % total;
+  if (token >= tokens) return;
+  const std::uint16_t* at = a + static_cast<std::size_t>(token) * K;
+  if (row < Nq) {
+    gemv_row_dequant<false>(at, wq + static_cast<std::size_t>(row) * K, sq, K,
+                            oq + static_cast<std::size_t>(token) * Nq, row);
+  } else if (row < Nq + Nk) {
+    const int i = row - Nq;
+    gemv_row_dequant<false>(at, wk + static_cast<std::size_t>(i) * K, sk, K,
+                            ok + static_cast<std::size_t>(token) * Nk, i);
+  } else {
+    const int i = row - Nq - Nk;
+    if (i >= Nv) return;
+    gemv_row_dequant<false>(at, wv + static_cast<std::size_t>(i) * K, sv, K,
+                            ov + static_cast<std::size_t>(token) * Nv, i);
+  }
+}
+
 // P2 device-verified primitives (kernels_phase2.cu; no header, declared the
 // way test_kernels.cu does).
 extern "C" {
@@ -500,6 +526,11 @@ int granite4_kernel_verify_attention_stage(
     float att_scale, int base_pos, int rows, int Hq, int Hk, int d,
     int cache_stride, std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, std::uint16_t* d_out);
+int granite4_kernel_qkv_dequant_batched(
+    const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
+    const std::uint8_t* d_wv, float sq, float sk, float sv, int tokens,
+    int Nq, int Nk, int Nv, int K, std::uint16_t* d_q, std::uint16_t* d_k,
+    std::uint16_t* d_v);
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out);
@@ -1062,6 +1093,18 @@ extern "C" int granite4_kernel_row_gemm_dequant(const std::uint16_t* d_a,
                                                 float scale, int N, int K,
                                                 std::uint16_t* d_out) {
   row_gemm_dequant_kernel<<<N, kRowGemvThreads>>>(d_a, d_B, scale, N, K, d_out);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
+extern "C" int granite4_kernel_qkv_dequant_batched(
+    const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
+    const std::uint8_t* d_wv, float sq, float sk, float sv, int tokens, int nq,
+    int nk, int nv, int k, std::uint16_t* d_q, std::uint16_t* d_kk,
+    std::uint16_t* d_v) {
+  if (tokens <= 0 || nq <= 0 || nk <= 0 || nv <= 0 || k <= 0) return -1;
+  row_gemm_dequant_qkv_batched_kernel<<<tokens * (nq + nk + nv), kRowGemvThreads>>>(
+      d_a, d_wq, d_wk, d_wv, sq, sk, sv, tokens, nq, nk, nv, k, d_q, d_kk, d_v);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
