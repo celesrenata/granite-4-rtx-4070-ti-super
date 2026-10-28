@@ -1050,7 +1050,11 @@ int gpu_verify_attention_stage(
     std::uint16_t* d_cache_v, std::uint16_t* d_out) {
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_cos == nullptr ||
       d_sin == nullptr || d_q_rot == nullptr || d_k_rot == nullptr ||
-      d_cache_k == nullptr || d_cache_v == nullptr || d_out == nullptr)
+      d_cache_k == nullptr || d_cache_v == nullptr || d_out == nullptr ||
+      !std::isfinite(attention_scale) || rows < 1 || rows > 4 ||
+      base_pos < 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+      q_heads < kv_heads || q_heads % kv_heads != 0 ||
+      cache_stride <= base_pos + rows)
     return -1;
   return granite4_kernel_verify_attention_stage(
       d_q, d_k, d_v, d_cos, d_sin, attention_scale, base_pos, rows,
