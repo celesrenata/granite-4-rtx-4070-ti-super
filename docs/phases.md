@@ -305,14 +305,20 @@ last two are additionally token-identical end-to-end):
    (~0.55 ms/step).
 12. **Fused-k speculative verify GEMV primitive** — the standalone
    `granite4-verify-gemv-bench` streams each FP8 weight row once while
-   accumulating up to four BF16 activation rows. On `gremlin-1`, with a
-   4096×4096 FP8 projection and 30 iterations: k=2 is 1.85× faster than
-   two single-token launches, k=3 is 2.14×, and k=4 is 2.29× (32.2 →
-   14.0 µs/token). The device correctness test passes. This is not yet an
-   end-to-end speculative path: k-token RMSNorm, RoPE, causal GQA/KV append,
-   candidate generation, and the exact accept/reject gate remain to be
-   implemented; the primitive is deliberately not linked into production
-   decode.
+   accumulating up to four BF16 activation rows. The bench flushes the L2
+   cache before every timed launch, so each call reads its weights from HBM
+   like decode. On `gremlin-1`, with a 4096×4096 FP8 projection and 20
+   iterations: k=2 is 1.91× faster than two single-token launches, k=3 is
+   2.47×, k=4 is 3.05× (44.0 → 14.4 µs/token). `--model` runs the real
+   Granite 4.2 per-layer shapes (q/k/v/o/gate/up/down/lm_head, L=40,
+   V=100352): one k=4 verify round costs 27.22 ms of GEMV work against
+   80.43 ms for four single-token rounds, a 2.95× reduction; fused k=4
+   effective bandwidth is 307.8 GB/s (the k=4 path is activation/latency
+   bound, not at the 631.9 GB/s roofline). The device correctness test
+   passes. This is not yet an end-to-end speculative path: k-token RMSNorm,
+   RoPE, causal GQA/KV append, candidate generation, and the exact
+   accept/reject gate remain to be implemented; the primitive is
+   deliberately not linked into production decode.
 13. **Prompt-lookup drafter with measured acceptance** — `granite4-infer
    generate --draft-lookup K` (greedy only) proposes up to K tokens by
    copying the continuation of the most recent non-overlapping occurrence of
