@@ -585,6 +585,20 @@ struct GpuCtx {
 // ---------------------------------------------------------------------------
 GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
                        int max_positions) {
+  if (max_positions <= 0 || model.num_layers == 0 || model.hidden_size == 0 ||
+      model.intermediate_size == 0 || model.num_attention_heads == 0 ||
+      model.num_key_value_heads == 0 || model.head_dim == 0 ||
+      model.vocab_size == 0 || model.num_attention_heads < model.num_key_value_heads ||
+      model.num_attention_heads % model.num_key_value_heads != 0 ||
+      model.head_dim > static_cast<std::size_t>(INT_MAX) ||
+      model.hidden_size > static_cast<std::size_t>(INT_MAX) ||
+      model.intermediate_size > static_cast<std::size_t>(INT_MAX) ||
+      model.num_layers > static_cast<std::size_t>(INT_MAX) ||
+      model.num_attention_heads > static_cast<std::size_t>(INT_MAX) ||
+      model.num_key_value_heads > static_cast<std::size_t>(INT_MAX) ||
+      model.vocab_size > static_cast<std::size_t>(INT_MAX) ||
+      !std::isfinite(spec.rope_theta) || spec.rope_theta <= 0.0)
+    return nullptr;
   auto g = new GpuCtx();
   g->spec = spec;
   g->L = static_cast<int>(model.num_layers);
