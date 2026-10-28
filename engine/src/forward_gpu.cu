@@ -1240,7 +1240,9 @@ extern "C" int granite4_kernel_row_gemm_resid_dequant(
     std::uint16_t* d_out) {
   if (d_a == nullptr || d_B == nullptr || d_residual == nullptr || d_out == nullptr ||
       !std::isfinite(scale) || !std::isfinite(residual_scale) || tokens <= 0 ||
-      N <= 0 || K <= 0 || static_cast<long long>(tokens) * N > INT_MAX)
+      N <= 0 || K <= 0 || static_cast<long long>(tokens) * N > INT_MAX ||
+      static_cast<long long>(tokens) * K > INT_MAX ||
+      static_cast<long long>(N) * K > INT_MAX)
     return -1;
   row_gemm_dequant_resid_batched_kernel<<<tokens * N, kRowGemvThreads>>>(
       d_a, d_B, scale, d_residual, residual_scale, tokens, N, K, d_out);
@@ -1256,6 +1258,7 @@ extern "C" int granite4_kernel_rope_at_pos(const std::uint16_t* d_x,
                                            std::uint16_t* d_out) {
   if (d_x == nullptr || d_cos == nullptr || d_sin == nullptr || d_out == nullptr ||
       heads <= 0 || d <= 0 || (d & 1) != 0 ||
+      d > granite4::kMaxHeadDim ||
       static_cast<long long>(heads) * d > INT_MAX)
     return -1;
   rope_at_pos_kernel<<<(heads * d + 255) / 256, 256>>>(d_x, d_cos, d_sin,
@@ -1269,6 +1272,7 @@ extern "C" int granite4_kernel_rope_at_pos_batched(
     int heads, int d, std::uint16_t* d_out) {
   if (d_x == nullptr || d_cos == nullptr || d_sin == nullptr || d_out == nullptr ||
       rows <= 0 || rows > 4 || heads <= 0 || d <= 0 || (d & 1) != 0 ||
+      d > granite4::kMaxHeadDim ||
       static_cast<long long>(rows) * heads * d > INT_MAX)
     return -1;
   const std::size_t n = static_cast<std::size_t>(rows) * heads * d;
