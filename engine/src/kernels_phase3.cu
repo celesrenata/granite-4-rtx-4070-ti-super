@@ -91,7 +91,9 @@ extern "C" int granite4_kernel_paged_kv_compact(
     return 1;
   }
   const long long total64 = static_cast<long long>(Hk) * kv_len * d;
-  if (total64 > INT_MAX) return 1;
+  if (total64 <= 0 || total64 > INT_MAX ||
+      static_cast<long long>(tokens_per_page) * num_layers * 2 * Hk * d > INT_MAX)
+    return 1;
   const int total = static_cast<int>(total64);
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
