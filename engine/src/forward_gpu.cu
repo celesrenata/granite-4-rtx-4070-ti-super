@@ -648,23 +648,27 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
     return nullptr;
   }
 
+  std::size_t kv_bytes = 0;
+  std::size_t compact_bytes = 0;
+  std::size_t token_scratch_elems = 0;
+  std::size_t token_scratch_bytes = 0;
+  if (!checked_mul(kv_elems, sizeof(std::uint16_t), &kv_bytes) ||
+      !checked_mul(compact_elems, sizeof(std::uint16_t), &compact_bytes) ||
+      !checked_mul(static_cast<std::size_t>(g->Hq),
+                   static_cast<std::size_t>(max_positions), &token_scratch_elems) ||
+      !checked_mul(token_scratch_elems, sizeof(std::uint16_t), &token_scratch_bytes) ||
+      !checked_mul(scratch_elems, sizeof(std::uint16_t), &term)) {
+    delete g;
+    return nullptr;
+  }
   cudaError_t e;
-  e = cudaMalloc(&g->kv_k, kv_elems * sizeof(std::uint16_t));
-  if (e == cudaSuccess) e = cudaMalloc(&g->kv_v, kv_elems * sizeof(std::uint16_t));
-  if (e == cudaSuccess)
-    e = cudaMalloc(&g->compact_k, compact_elems * sizeof(std::uint16_t));
-  if (e == cudaSuccess)
-    e = cudaMalloc(&g->compact_v, compact_elems * sizeof(std::uint16_t));
-  if (e == cudaSuccess)
-    e = cudaMalloc(&g->logits_scratch,
-                   static_cast<std::size_t>(g->Hq) * max_positions *
-                       sizeof(std::uint16_t));
-  if (e == cudaSuccess)
-    e = cudaMalloc(&g->probs_scratch,
-                   static_cast<std::size_t>(g->Hq) * max_positions *
-                       sizeof(std::uint16_t));
-  if (e == cudaSuccess)
-    e = cudaMalloc(&g->scratch, scratch_elems * sizeof(std::uint16_t));
+  e = cudaMalloc(&g->kv_k, kv_bytes);
+  if (e == cudaSuccess) e = cudaMalloc(&g->kv_v, kv_bytes);
+  if (e == cudaSuccess) e = cudaMalloc(&g->compact_k, compact_bytes);
+  if (e == cudaSuccess) e = cudaMalloc(&g->compact_v, compact_bytes);
+  if (e == cudaSuccess) e = cudaMalloc(&g->logits_scratch, token_scratch_bytes);
+  if (e == cudaSuccess) e = cudaMalloc(&g->probs_scratch, token_scratch_bytes);
+  if (e == cudaSuccess) e = cudaMalloc(&g->scratch, term);
   // Fused decode GQA keeps [q row + logits + probs] in shared memory:
   // d + 2*max_positions bf16 elements. The default per-block limit is 48 KiB
   // (no attribute bump); beyond it the 3-kernel scratch path runs.
