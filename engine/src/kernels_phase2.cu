@@ -774,6 +774,7 @@ int granite4_kernel_softmax(const std::uint16_t* d_x, float scale, int rows,
                            int seq_len, std::uint16_t* d_out) {
   if (d_x == nullptr || d_out == nullptr || !std::isfinite(scale) ||
       rows <= 0 || seq_len <= 0 ||
+      seq_len > granite4::kGqaSoftmaxParallelMax * 1024 ||
       static_cast<long long>(rows) * seq_len > INT_MAX)
     return -1;
   granite4::softmax_kernel<<<(rows * seq_len + 255) / 256, 256>>>(
@@ -872,6 +873,9 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_out == nullptr ||
       !std::isfinite(att_scale) || rows <= 0 || rows > 4 || Hq <= 0 || Hk <= 0 ||
       d <= 0 || base_kv < 0 || Hq < Hk || Hq % Hk != 0 ||
+      d > granite4::kMaxHeadDim ||
+      static_cast<long long>(Hq) * d > INT_MAX ||
+      static_cast<long long>(Hk) * d > INT_MAX ||
       base_kv > INT_MAX - rows || k_stride < base_kv + rows ||
       static_cast<std::size_t>(base_kv + rows) > granite4::kGqaSoftmaxParallelMax * 1024u ||
       static_cast<long long>(Hq) * d > INT_MAX ||
