@@ -1071,7 +1071,11 @@ int gpu_verify_attention_layer(
       d_q == nullptr || d_k == nullptr || d_v == nullptr || d_cos == nullptr ||
       d_sin == nullptr || d_q_rot == nullptr || d_k_rot == nullptr ||
       d_cache_k == nullptr || d_cache_v == nullptr || d_attn_out == nullptr ||
-      hidden_size <= 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0)
+      hidden_size <= 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+      rows < 1 || rows > 4 || base_pos < 0 || cache_stride <= base_pos + rows)
+    return -1;
+  if (q_heads < kv_heads || q_heads % kv_heads != 0 ||
+      q_heads * head_dim <= 0 || kv_heads * head_dim <= 0)
     return -1;
   if (granite4_kernel_qkv_dequant_batched(
           d_normed, d_wq, d_wk, d_wv, q_scale, k_scale, v_scale, rows,
