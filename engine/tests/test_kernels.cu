@@ -64,6 +64,9 @@ extern "C" int granite4_kernel_silu_gate_up_batched(
     const std::uint8_t* d_wg, const std::uint8_t* d_wu,
     const std::uint16_t* d_x, float scale_g, float scale_u, int N, int K,
     int rows, std::uint16_t* d_out);
+extern "C" int granite4_kernel_rmsnorm_batched(
+    const std::uint16_t* d_x, const std::uint16_t* d_w, float eps, int rows,
+    int cols, std::uint16_t* d_out);
 extern "C" int granite4_kernel_kv_append_batched(
     const std::uint16_t* d_src_k, const std::uint16_t* d_src_v,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, int base_pos, int rows,
@@ -609,6 +612,37 @@ static void test_batched_silu_gate_up_device() {
   cudaFree(dwg); cudaFree(dwu); cudaFree(dx); cudaFree(db); cudaFree(ds);
 }
 
+static void test_batched_rmsnorm_device() {
+  const int rows = 4, cols = 4096;
+  Xorshift64 rng(0x6262);
+  std::vector<std::uint16_t> x(static_cast<std::size_t>(rows) * cols), w(cols);
+  for (auto& v : x) v = f32_to_bf16_host(rng.next_float_range(4.0));
+  for (auto& v : w) v = f32_to_bf16_host(rng.next_float_range(2.0));
+  std::uint16_t *dx, *dw, *db, *ds;
+  if (cudaMalloc(&dx, x.size() * 2) || cudaMalloc(&dw, w.size() * 2) ||
+      cudaMalloc(&db, x.size() * 2) || cudaMalloc(&ds, x.size() * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dw, w.data(), w.size() * 2, cudaMemcpyHostToDevice));
+  const float eps = 1e-5f;
+  expect(granite4_kernel_rmsnorm_batched(dx, dw, eps, rows, cols, db) == 0,
+         "batched rmsnorm: launch");
+  expect(granite4_kernel_rmsnorm_batched(dx, dw, eps, 5, cols, db) == -1,
+         "batched rmsnorm: rejects rows > 4");
+  for (int r = 0; r < rows; ++r)
+    expect(granite4_kernel_rmsnorm(dx + static_cast<std::size_t>(r) * cols, dw,
+                                   eps, 1, cols,
+                                   ds + static_cast<std::size_t>(r) * cols) == 0,
+           "batched rmsnorm: single-row reference launch");
+  std::vector<std::uint16_t> batch(x.size()), single(x.size());
+  CUDA_CHECK(cudaMemcpy(batch.data(), db, batch.size() * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(single.data(), ds, single.size() * 2, cudaMemcpyDeviceToHost));
+  expect(batch == single, "batched rmsnorm: bit-identical to single-row calls");
+  cudaFree(dx); cudaFree(dw); cudaFree(db); cudaFree(ds);
+}
+
 static void test_paged_kv_compact_device() {
   // P3: gather one layer's K/V out of the paged FP8 pool into contiguous
   // [Hk, kv_len, d] BF16 and check it bit-exactly against the host reference
@@ -782,6 +816,7 @@ int main() {
   test_gqa_fused_device();
   test_batched_verify_attention_device();
   test_batched_silu_gate_up_device();
+  test_batched_rmsnorm_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();

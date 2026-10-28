@@ -702,6 +702,18 @@ int granite4_kernel_rmsnorm(const std::uint16_t* d_x, const std::uint16_t* d_w,
   return 0;
 }
 
+int granite4_kernel_rmsnorm_batched(const std::uint16_t* d_x,
+                                    const std::uint16_t* d_w, float eps,
+                                    int rows, int cols, std::uint16_t* d_out) {
+  // rmsnorm_kernel is already row-batched (one block per row); this wrapper
+  // just pins the verify-path bounds. Reusing it keeps a single
+  // implementation, so a batched call cannot drift from the decode path.
+  if (rows <= 0 || rows > 4 || cols <= 0) return -1;
+  granite4::rmsnorm_kernel<<<rows, 256>>>(d_x, d_w, eps, rows, cols, d_out);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
 int granite4_kernel_rope(const std::uint16_t* d_x, const float* d_cos,
                          const float* d_sin, int rows, int head_dim,
                          std::uint16_t* d_out) {
