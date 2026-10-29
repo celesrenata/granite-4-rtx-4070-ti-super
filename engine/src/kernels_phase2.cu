@@ -882,9 +882,7 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
       static_cast<long long>(Hq) * d > INT_MAX ||
       static_cast<long long>(Hk) * d > INT_MAX ||
       base_kv > INT_MAX - rows || k_stride < base_kv + rows ||
-      static_cast<std::size_t>(base_kv + rows) > granite4::kGqaSoftmaxParallelMax * 1024u ||
-      static_cast<long long>(Hq) * d > INT_MAX ||
-      static_cast<long long>(Hk) * d > INT_MAX)
+      static_cast<std::size_t>(base_kv + rows) > kGqaSoftmaxParallelMaxSeqLen)
     return -1;
   // Shared memory is sized for the longest row (base_kv + rows); each block
   // row uses only its own causal prefix within that allocation.
