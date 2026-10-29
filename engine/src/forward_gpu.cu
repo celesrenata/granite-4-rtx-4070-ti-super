@@ -1111,7 +1111,7 @@ int gpu_verify_attention_stage(
       d_cache_k == nullptr || d_cache_v == nullptr || d_out == nullptr ||
       !std::isfinite(attention_scale) || rows < 1 || rows > 4 ||
       base_pos < 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
-      q_heads < kv_heads || q_heads % kv_heads != 0 ||
+      head_dim > kMaxHeadDim || q_heads < kv_heads || q_heads % kv_heads != 0 ||
       static_cast<long long>(q_heads) * head_dim > INT_MAX ||
       static_cast<long long>(kv_heads) * head_dim > INT_MAX ||
       base_pos > INT_MAX - rows + 1 ||
