@@ -1153,7 +1153,9 @@ int gpu_verify_attention_layer_batched(
       cache_stride <= base_pos + rows - 1)
     return -1;
   if (q_heads < kv_heads || q_heads % kv_heads != 0 ||
-      q_heads * head_dim <= 0 || kv_heads * head_dim <= 0)
+      q_heads * head_dim <= 0 || kv_heads * head_dim <= 0 ||
+      rows > 0 && static_cast<long long>(rows) * q_heads * head_dim > INT_MAX ||
+      rows > 0 && static_cast<long long>(rows) * kv_heads * head_dim > INT_MAX)
     return -1;
   if (granite4_kernel_qkv_dequant_batched(
           d_normed, d_wq, d_wk, d_wv, q_scale, k_scale, v_scale, rows,
