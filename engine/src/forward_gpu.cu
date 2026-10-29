@@ -591,7 +591,7 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
       model.vocab_size == 0 || model.num_attention_heads < model.num_key_value_heads ||
       model.num_attention_heads % model.num_key_value_heads != 0 ||
       model.head_dim > static_cast<std::size_t>(INT_MAX) ||
-      model.head_dim > static_cast<std::size_t>(kMaxHeadDim) ||
+      model.head_dim > static_cast<std::size_t>(granite4::kMaxHeadDim) ||
       model.hidden_size > static_cast<std::size_t>(INT_MAX) ||
       model.intermediate_size > static_cast<std::size_t>(INT_MAX) ||
       model.num_layers > static_cast<std::size_t>(INT_MAX) ||
@@ -1111,7 +1111,7 @@ int gpu_verify_attention_stage(
       d_cache_k == nullptr || d_cache_v == nullptr || d_out == nullptr ||
       !std::isfinite(attention_scale) || rows < 1 || rows > 4 ||
       base_pos < 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
-      head_dim > kMaxHeadDim || q_heads < kv_heads || q_heads % kv_heads != 0 ||
+      head_dim > granite4::kMaxHeadDim || q_heads < kv_heads || q_heads % kv_heads != 0 ||
       static_cast<long long>(q_heads) * head_dim > INT_MAX ||
       static_cast<long long>(kv_heads) * head_dim > INT_MAX ||
       base_pos > INT_MAX - rows + 1 ||

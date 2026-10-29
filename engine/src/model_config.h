@@ -47,6 +47,9 @@ inline constexpr int kCudaArchMajor = 8;   // compute capability 8.9
 inline constexpr int kCudaArchMinor = 9;  // RTX 4070 Ti Super (Ada)
 inline constexpr char kGpuTarget[] = "sm_89";
 
+// Upper bound accepted by the fixed-width CUDA attention launchers.
+inline constexpr int kMaxHeadDim = 256;
+
 }  // namespace granite4
 
 #endif  // GRANITE4_MODEL_CONFIG_H
