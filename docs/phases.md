@@ -385,6 +385,18 @@ across ~160 small kernels (80 RMSNorm, 40 rope, 40 KV append), which CUDA
 graphs would address; it was not pursued because uninstrumented wall time
 already tracks GPU event time (the CPU is not the limiter).
 
+P4 hardening validation (2026-10-29): the launcher-bound checks and shared
+`kMaxHeadDim` definition were rebuilt through `nix build --impure --no-link
+--builders '' .#engine-cuda` on gremlin-1. The resulting
+`granite4-kernel-test` reported `all device kernel tests passed`;
+`granite4-verify-gemv-test` reported `PASS (4 tokens x 9 rows x 256 K)`. A
+real-checkpoint GPU smoke test with `--gpu 1 --max-tokens 2` completed
+successfully; measured steps were 19.86 ms for the initial position and 15.02
+ms for the incremental position. The host suite remained 141 passed, 6 skipped,
+with CTest 9/9. `nvidia-smi` itself segfaulted on the host during this check,
+so GPU identity is established by the CUDA test binaries rather than that
+utility.
+
 Tried and rejected: 64-thread blocks for the small-grid QKV and O
 projections (they are latency-limited at 128 threads). Same-run A/B read
 15.13–15.17 ms/step vs 15.16–15.21 committed, and the bucket spans were
