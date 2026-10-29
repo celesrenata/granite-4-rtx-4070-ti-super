@@ -233,7 +233,6 @@ __global__ void gqa_value_kernel(const std::uint16_t* p, const std::uint16_t* v,
 // memory; beyond kGqaSoftmaxParallelMax the exact serial loop runs.
 // ---------------------------------------------------------------------------
 static constexpr int kGqaSoftmaxParallelMax = 512;
-static constexpr int kGqaSoftmaxParallelMaxSeqLen = kGqaSoftmaxParallelMax * 1024;
 
 __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
                                  const std::uint16_t* v, float att_scale, int Hq,
@@ -656,6 +655,10 @@ __global__ void fp8_decode_all_kernel(float* out) {
 
 }  // namespace granite4
 
+namespace granite4 {
+inline constexpr int kGqaSoftmaxParallelMaxSeqLen = kGqaSoftmaxParallelMax * 1024;
+}
+
 // ---------------------------------------------------------------------------
 // Host launchers (C ABI surface for the P3 scheduler). 0 on success, -1 on
 // CUDA error (diagnostic on stderr).
@@ -776,7 +779,7 @@ int granite4_kernel_softmax(const std::uint16_t* d_x, float scale, int rows,
                            int seq_len, std::uint16_t* d_out) {
   if (d_x == nullptr || d_out == nullptr || !std::isfinite(scale) ||
       rows <= 0 || seq_len <= 0 ||
-      seq_len > granite4::kGqaSoftmaxParallelMax * 1024 ||
+      seq_len > granite4::kGqaSoftmaxParallelMaxSeqLen ||
       static_cast<long long>(rows) * seq_len > INT_MAX)
     return -1;
   granite4::softmax_kernel<<<(rows * seq_len + 255) / 256, 256>>>(
@@ -839,7 +842,7 @@ int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k
       static_cast<long long>(Hq) * d > INT_MAX ||
       static_cast<long long>(Hk) * d > INT_MAX ||
       static_cast<long long>(kv_len) + d > INT_MAX ||
-      static_cast<std::size_t>(kv_len) > granite4::kGqaSoftmaxParallelMax * 1024u)
+      static_cast<std::size_t>(kv_len) > granite4::kGqaSoftmaxParallelMaxSeqLen)
     return -1;
   const std::size_t base_elems = static_cast<std::size_t>(d) + 2u * kv_len;
   const std::size_t exp_elems = (kv_len <= granite4::kGqaSoftmaxParallelMax) ? kv_len : 0u;
@@ -883,7 +886,8 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
       static_cast<long long>(Hq) * d > INT_MAX ||
       static_cast<long long>(Hk) * d > INT_MAX ||
       base_kv > INT_MAX - rows || k_stride < base_kv + rows ||
-      static_cast<std::size_t>(base_kv + rows) > kGqaSoftmaxParallelMaxSeqLen)
+      static_cast<std::size_t>(base_kv + rows) >
+          granite4::kGqaSoftmaxParallelMaxSeqLen)
     return -1;
   // Shared memory is sized for the longest row (base_kv + rows); each block
   // row uses only its own causal prefix within that allocation.
