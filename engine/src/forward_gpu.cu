@@ -532,6 +532,11 @@ int granite4_kernel_qkv_dequant_batched(
     const std::uint8_t* d_wv, float sq, float sk, float sv, int tokens,
     int Nq, int Nk, int Nv, int K, std::uint16_t* d_q, std::uint16_t* d_k,
     std::uint16_t* d_v);
+int granite4_verify_qkv(
+    const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
+    const std::uint8_t* d_wv, float sq, float sk, float sv, int tokens, int Nq,
+    int Nk, int K, std::uint16_t* d_q, std::uint16_t* d_k,
+    std::uint16_t* d_v);
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out);
@@ -1123,7 +1128,7 @@ int gpu_verify_attention_stage(
       d_cache_k, d_cache_v, d_out);
 }
 
-int gpu_verify_attention_layer(
+int gpu_verify_attention_layer_batched(
     const std::uint16_t* d_normed, const std::uint8_t* d_wq,
     const std::uint8_t* d_wk, const std::uint8_t* d_wv, float q_scale,
     float k_scale, float v_scale, const float* d_cos, const float* d_sin,
@@ -1157,6 +1162,22 @@ int gpu_verify_attention_layer(
       d_q, d_k, d_v, d_cos, d_sin, attention_scale, base_pos, rows,
       q_heads, kv_heads, head_dim, cache_stride, d_q_rot, d_k_rot,
       d_cache_k, d_cache_v, d_attn_out);
+}
+
+int gpu_verify_attention_layer(
+    const std::uint16_t* d_normed, const std::uint8_t* d_wq,
+    const std::uint8_t* d_wk, const std::uint8_t* d_wv, float q_scale,
+    float k_scale, float v_scale, const float* d_cos, const float* d_sin,
+    float attention_scale, int base_pos, int rows, int q_heads, int kv_heads,
+    int head_dim, int hidden_size, int cache_stride, std::uint16_t* d_q,
+    std::uint16_t* d_k, std::uint16_t* d_v, std::uint16_t* d_q_rot,
+    std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
+    std::uint16_t* d_attn_out) {
+  return gpu_verify_attention_layer_batched(
+      d_normed, d_wq, d_wk, d_wv, q_scale, k_scale, v_scale, d_cos, d_sin,
+      attention_scale, base_pos, rows, q_heads, kv_heads, head_dim, hidden_size,
+      cache_stride, d_q, d_k, d_v, d_q_rot, d_k_rot, d_cache_k, d_cache_v,
+      d_attn_out);
 }
 
 int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,

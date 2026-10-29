@@ -108,6 +108,19 @@ int gpu_verify_attention_layer(
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
     std::uint16_t* d_attn_out);
 
+// Batched speculative attention block for already-normalized rows. This is
+// intentionally limited to one transformer attention block; the full model
+// forward and accept/reject loop remain separate integration work.
+int gpu_verify_attention_layer_batched(
+    const std::uint16_t* d_normed, const std::uint8_t* d_wq,
+    const std::uint8_t* d_wk, const std::uint8_t* d_wv, float q_scale,
+    float k_scale, float v_scale, const float* d_cos, const float* d_sin,
+    float attention_scale, int base_pos, int rows, int q_heads, int kv_heads,
+    int head_dim, int hidden_size, int cache_stride, std::uint16_t* d_q,
+    std::uint16_t* d_k, std::uint16_t* d_v, std::uint16_t* d_q_rot,
+    std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
+    std::uint16_t* d_attn_out);
+
 }  // namespace granite4
 
 #endif  // GRANITE4_FORWARD_GPU_API_H
