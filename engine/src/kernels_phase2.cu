@@ -892,7 +892,7 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
   const std::size_t base_elems =
       static_cast<std::size_t>(d) + 2u * static_cast<std::size_t>(kv_len_max);
   const std::size_t exp_elems =
-      (kv_len_max <= granite4::kGqaSoftmaxParallelMax) ? kv_len_max : 0u;
+      (kv_len_max <= kGqaSoftmaxParallelMax) ? kv_len_max : 0u;
   const std::size_t smem_bytes =
       ((base_elems + exp_elems * (sizeof(double) / sizeof(std::uint16_t)) + 3u) &
        ~std::size_t(3)) *
