@@ -1149,6 +1149,8 @@ int gpu_verify_attention_layer_batched(
       static_cast<long long>(rows) * hidden_size * static_cast<long long>(sizeof(std::uint16_t)) > INT_MAX ||
       static_cast<long long>(q_heads) * head_dim > INT_MAX ||
       static_cast<long long>(kv_heads) * head_dim > INT_MAX ||
+      static_cast<long long>(rows) * q_heads * head_dim * sizeof(std::uint16_t) > INT_MAX ||
+      static_cast<long long>(rows) * kv_heads * head_dim * sizeof(std::uint16_t) > INT_MAX ||
       rows < 1 || rows > 4 || base_pos < 0 ||
       base_pos > INT_MAX - rows + 1 ||
       cache_stride <= base_pos + rows - 1)
