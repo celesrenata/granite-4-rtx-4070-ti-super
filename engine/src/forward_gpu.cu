@@ -1145,6 +1145,7 @@ int gpu_verify_attention_layer_batched(
       !std::isfinite(v_scale) || !std::isfinite(attention_scale) ||
       hidden_size <= 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
       head_dim > granite4::kMaxHeadDim ||
+      static_cast<long long>(rows) * hidden_size > INT_MAX ||
       static_cast<long long>(q_heads) * head_dim > INT_MAX ||
       static_cast<long long>(kv_heads) * head_dim > INT_MAX ||
       rows < 1 || rows > 4 || base_pos < 0 ||
