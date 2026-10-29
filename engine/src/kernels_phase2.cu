@@ -233,6 +233,7 @@ __global__ void gqa_value_kernel(const std::uint16_t* p, const std::uint16_t* v,
 // memory; beyond kGqaSoftmaxParallelMax the exact serial loop runs.
 // ---------------------------------------------------------------------------
 static constexpr int kGqaSoftmaxParallelMax = 512;
+static constexpr int kGqaSoftmaxParallelMaxSeqLen = kGqaSoftmaxParallelMax * 1024;
 
 __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
                                  const std::uint16_t* v, float att_scale, int Hq,
