@@ -33,6 +33,7 @@
 #include "checkpoint.h"
 #include "draft_lookup.h"
 #include "kernel_math.h"
+#include "speculative_verify.h"
 #include "weights.h"
 
 #include <algorithm>
@@ -448,69 +449,78 @@ int main(int argc, char** argv) {
         }
         long proposed_total = 0, accepted_total = 0;
         int steps = 0;
+        std::vector<float> row_f(V);
+        std::vector<std::int32_t> target_arg;
+        auto argmax_f32 = [](const float* p, int n) {
+          int best = 0;
+          for (int c = 1; c < n; ++c)
+            if (p[c] > p[best]) best = c;
+          return best;
+        };
         while (static_cast<int>(generated.size()) < max_tokens) {
-          // Replay the accepted prefix from position 0. The verification
-          // forwards below advance the KV watermark; reset discards them.
+          // Replay the accepted prefix from position 0; the forwards below
+          // advance the KV watermark, and reset discards it.
           session.reset();
-          if (!session.step(seq.data(), static_cast<int>(seq.size()), &logits, &err)) {
+          const int len = static_cast<int>(seq.size());
+
+          // Never propose past the output budget or the ctx's position limit.
+          const int room =
+              std::min(draft_k, max_tokens - static_cast<int>(generated.size()));
+          const int pos_room = max_pos - static_cast<int>(seq.size());
+          const int k = std::min(room, pos_room);
+          const std::vector<std::int32_t> proposal =
+              (k > 0) ? draft_lookup(seq, k) : std::vector<std::int32_t>();
+          const int nprop = static_cast<int>(proposal.size());
+          proposed_total += nprop;
+
+          // One target forward over accepted prefix + draft proposals. The
+          // rows at positions [len, len+nprop) verify each proposal; row
+          // len+nprop is the target's own next token (correction when the
+          // draft is rejected, bonus when it is fully accepted).
+          std::vector<std::int32_t> cand(seq);
+          cand.insert(cand.end(), proposal.begin(), proposal.end());
+          if (!session.step(cand.data(), static_cast<int>(cand.size()), &logits, &err)) {
             std::fprintf(stderr, "%s\n", err.c_str());
             return 1;
           }
-          const int len = static_cast<int>(seq.size());
-          const std::uint16_t* row =
-              logits.data() + static_cast<std::size_t>(len - 1) * V;
-          const int next = sample_row(row, 0);
-          seq.push_back(next);
-          generated.push_back(next);
+          target_arg.assign(nprop + 1, 0);
+          for (int i = 0; i <= nprop; ++i) {
+            const std::uint16_t* row =
+                logits.data() + static_cast<std::size_t>(len - 1 + i) * V;
+            for (int c = 0; c < V; ++c) row_f[c] = bf16_to_f32_host(row[c]);
+            target_arg[i] = argmax_f32(row_f.data(), V);
+          }
+          // The unit-tested gate: accept the longest prefix where the target
+          // agrees with the draft, plus one correction (or bonus) token.
+          const speculative::VerifyResult v =
+              speculative::verify_greedy(target_arg.data(), proposal.data(),
+                                         nprop);
+          (void)logits;  // rows already consumed via target_arg
+          // Commit the accepted prefix, then the gate's tail token: the
+          // correction on rejection, the target's own row (bonus) when the
+          // draft was fully accepted.
+          // Clamp the commit to the output budget (the tail token is the
+          // first to drop when the draft over-shoots it).
+          const int budget = max_tokens - static_cast<int>(generated.size());
+          const int commit = std::min(v.accepted + 1, budget);
+          for (int i = 0; i < commit; ++i) {
+            const int tok = (i < v.accepted)
+                                ? proposal[i]
+                                : (v.correction >= 0 ? v.correction
+                                                    : target_arg[nprop]);
+            seq.push_back(tok);
+            generated.push_back(tok);
+          }
+          accepted_total += v.accepted;
           ++steps;
-          if (static_cast<int>(generated.size()) >= max_tokens) break;
-
-          // Never propose past the output budget or the ctx's position limit.
-          const int room = std::min(draft_k, max_tokens - static_cast<int>(generated.size()));
-          const int pos_room = max_pos - static_cast<int>(seq.size());
-          const int k = std::min(room, pos_room);
-          const std::vector<std::int32_t> proposal = draft_lookup(seq, k);
-          proposed_total += static_cast<long>(proposal.size());
-          std::vector<std::int32_t> cand = seq;
-          int accepted = 0;
-          bool rejected = false;
-          std::int32_t correction = 0;
-          for (std::size_t j = 0; j < proposal.size(); ++j) {
-            if (!session.step(cand.data(), static_cast<int>(cand.size()), &logits, &err)) {
-              std::fprintf(stderr, "%s\n", err.c_str());
-              return 1;
-            }
-            const int pos = static_cast<int>(cand.size()) - 1;
-            const std::uint16_t* prow = logits.data() + static_cast<std::size_t>(pos) * V;
-            const int target = sample_row(prow, 0);
-            if (target != proposal[j]) {
-              // Greedy speculative decoding emits the target correction at
-              // the first rejection; dropping it would change the sequence.
-              correction = target;
-              rejected = true;
-              break;
-            }
-            cand.push_back(proposal[j]);
-            ++accepted;
-          }
-          accepted_total += accepted;
-          if (accepted > 0) {
-            const std::vector<std::int32_t> accepted_tokens(
-                cand.begin() + static_cast<long>(seq.size()), cand.end());
-            seq.insert(seq.end(), accepted_tokens.begin(), accepted_tokens.end());
-            generated.insert(generated.end(), accepted_tokens.begin(),
-                             accepted_tokens.end());
-          }
-          if (rejected && static_cast<int>(generated.size()) < max_tokens) {
-            seq.push_back(correction);
-            generated.push_back(correction);
-          }
+          session.reset();
         }
         std::fprintf(stderr,
                      "G4_DRAFT steps=%d proposed=%ld accepted=%ld rate=%.3f\n",
                      steps, proposed_total, accepted_total,
                      proposed_total > 0
-                         ? static_cast<double>(accepted_total) / static_cast<double>(proposed_total)
+                         ? static_cast<double>(accepted_total) /
+                               static_cast<double>(proposed_total)
                          : 0.0);
         std::printf("{\"generated\":[");
         for (std::size_t i = 0; i < generated.size(); ++i) {
