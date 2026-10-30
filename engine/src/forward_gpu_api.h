@@ -98,6 +98,7 @@ int gpu_verify_attention_stage(
     std::uint16_t* d_cache_v, std::uint16_t* d_out);
 
 // Project normalized speculative rows and run one transformer's attention block.
+// This compatibility name delegates to the explicitly batched helper below.
 // Q/K/V weights are row-major FP8 device matrices with one scale per matrix.
 int gpu_verify_attention_layer(
     const std::uint16_t* d_normed, const std::uint8_t* d_wq,
