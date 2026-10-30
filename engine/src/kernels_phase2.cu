@@ -926,7 +926,9 @@ int granite4_kernel_silu_gate_up_batched(const std::uint8_t* d_wg,
                                          std::uint16_t* d_out) {
   if (d_wg == nullptr || d_wu == nullptr || d_x == nullptr || d_out == nullptr ||
       !std::isfinite(scale_g) || !std::isfinite(scale_u) || rows <= 0 || rows > 4 ||
-      N <= 0 || K <= 0 || static_cast<long long>(N) * K > INT_MAX)
+      N <= 0 || K <= 0 || static_cast<long long>(N) * K > INT_MAX ||
+      static_cast<long long>(rows) * K > INT_MAX ||
+      static_cast<long long>(rows) * N > INT_MAX)
     return -1;
   granite4::silu_gate_up_batched_kernel<<<N, 128>>>(
       d_wg, d_wu, d_x, scale_g, scale_u, N, K, rows, d_out);
