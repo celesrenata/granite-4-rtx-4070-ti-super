@@ -394,9 +394,9 @@ real-checkpoint GPU smoke test with `--gpu 1 --max-tokens 2` completed
 successfully; measured steps were 19.86 ms for the initial position and 15.02
 ms for the incremental position. A fresh rebuild and smoke run on 2026-10-29
 reported 77.80 ms for the five-token prefill, then 15.11 ms and 15.09 ms for
-incremental steps, with generated IDs `[12366, 1210, 198]`. The host suite remained 141 passed,
-6 skipped, with host-only CTest 8/8; the gremlin CUDA derivation separately
-ran the device kernel and verify-GEMV tests successfully. `nvidia-smi` itself
+incremental steps, with generated IDs `[12366, 1210, 198]`. The host suite
+remained 141 passed, 6 skipped, with host-only CTest 8/8; the gremlin CUDA
+derivation separately ran the device kernel and verify-GEMV tests successfully. `nvidia-smi` itself
 segfaulted on the host during this check, so GPU identity is established by the
 CUDA test binaries rather than that utility. After centralizing the GQA
 softmax limits, the latest gremlin-1 rebuild again passed both device tests;
