@@ -111,8 +111,8 @@ int gpu_verify_attention_layer(
 
 // Batched speculative attention block for already-normalized rows. This is
 // intentionally limited to one transformer attention block; it does not yet
-// run the FFN/final norm/lm-head stages or the accept/reject loop.
-// Runs one already-normalized transformer attention block over 1..4 rows.
+// run the FFN/final norm/lm-head stages or the accept/reject loop. It runs one
+// already-normalized transformer attention block over 1..4 rows.
 // It projects Q/K/V, applies position-specific RoPE, appends K/V, and runs
 // causal GQA. All pointers are device memory; weights are row-major FP8 and
 // outputs are token-major [rows][heads * head_dim].
