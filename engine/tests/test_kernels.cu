@@ -115,6 +115,11 @@ int gpu_verify_attention_layer(
     float, float, float, const float*, const float*, float, int, int, int, int, int,
     int, int, std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*,
     std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*);
+int gpu_verify_attention_layer_batched(
+    const std::uint16_t*, const std::uint8_t*, const std::uint8_t*, const std::uint8_t*,
+    float, float, float, const float*, const float*, float, int, int, int, int, int,
+    int, int, std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*,
+    std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*);
 }
 extern "C" int granite4_kernel_gqa_fused_batched(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
@@ -550,17 +555,17 @@ static void test_verify_attention_validation_device() {
 }
 
 static void test_verify_attention_layer_validation_device() {
-  expect(gpu_verify_attention_layer(
+  expect(gpu_verify_attention_layer_batched(
               nullptr, nullptr, nullptr, nullptr, NAN, 1.0f, 1.0f, nullptr,
               nullptr, 1.0f, 0, 1, 2, 1, 32, 64, 32, nullptr, nullptr,
               nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == -1,
          "verify layer: rejects non-finite Q scale");
-  expect(gpu_verify_attention_layer(
+  expect(gpu_verify_attention_layer_batched(
               nullptr, nullptr, nullptr, nullptr, 1.0f, INFINITY, 1.0f, nullptr,
               nullptr, 1.0f, 0, 1, 2, 1, 32, 64, 32, nullptr, nullptr,
               nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == -1,
          "verify layer: rejects non-finite K scale");
-  expect(gpu_verify_attention_layer(
+  expect(gpu_verify_attention_layer_batched(
               nullptr, nullptr, nullptr, nullptr, 1.0f, 1.0f, 1.0f, nullptr,
               nullptr, NAN, 0, 1, 2, 1, 32, 64, 32, nullptr, nullptr,
               nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == -1,
