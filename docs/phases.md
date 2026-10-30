@@ -392,10 +392,12 @@ P4 hardening validation (2026-10-29): the launcher-bound checks and shared
 `granite4-verify-gemv-test` reported `PASS (4 tokens x 9 rows x 256 K)`. A
 real-checkpoint GPU smoke test with `--gpu 1 --max-tokens 2` completed
 successfully; measured steps were 19.86 ms for the initial position and 15.02
-ms for the incremental position. The host suite remained 141 passed, 6 skipped,
-with CTest 9/9. `nvidia-smi` itself segfaulted on the host during this check,
-so GPU identity is established by the CUDA test binaries rather than that
-utility.
+ms for the incremental position. A fresh rebuild and smoke run on 2026-10-29
+reported 77.80 ms for the five-token prefill, then 15.11 ms and 15.09 ms for
+incremental steps, with generated IDs `[12366, 1210, 198]`. The host suite
+remained 141 passed, 6 skipped, with CTest 9/9. `nvidia-smi` itself segfaulted
+on the host during this check, so GPU identity is established by the CUDA test
+binaries rather than that utility.
 
 Tried and rejected: 64-thread blocks for the small-grid QKV and O
 projections (they are latency-limited at 128 threads). Same-run A/B read
