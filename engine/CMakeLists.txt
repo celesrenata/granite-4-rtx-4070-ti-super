@@ -20,6 +20,8 @@ set(GRANITE_ENGINE_SOURCES
   src/kv_pool.cc
   src/draft_lookup.h
   src/draft_lookup.cc
+  src/speculative_verify.h
+  src/speculative_verify.cc
   src/weights.h
   src/weights.cc)
 
@@ -93,6 +95,13 @@ add_test(NAME kv_pool COMMAND granite4-kv-pool-test)
 add_executable(granite4-draft-lookup-test tests/test_draft_lookup.cc)
 target_link_libraries(granite4-draft-lookup-test PRIVATE granite4_static)
 add_test(NAME draft_lookup COMMAND granite4-draft-lookup-test)
+
+# Greedy speculative accept/reject gate (host-only, no weights): the token
+# decision the inline verification loop makes, factored into a unit-tested
+# contract so the end-to-end path can delegate to it.
+add_executable(granite4-speculative-verify-test tests/test_speculative_verify.cc)
+target_link_libraries(granite4-speculative-verify-test PRIVATE granite4_static)
+add_test(NAME speculative_verify COMMAND granite4-speculative-verify-test)
 
 if(GRANITE_ENABLE_CUDA)
   add_executable(granite4-kernel-test tests/test_kernels.cu)
