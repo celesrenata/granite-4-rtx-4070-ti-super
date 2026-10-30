@@ -898,7 +898,9 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
       if (granite4_kernel_rmsnorm(d_hidden, attn_norm, rms_eps, 1, H, d_normed) != 0)
         return seterr("rmsnorm (attention) failed");
       gstamp(0, layer, 0);
-      row_gemm_dequant_qkv_kernel<<<Hq * d + 2 * Hk * d, kRowGemvThreads>>>(
+      row_gemm_dequant_qkv_kernel<<<static_cast<int>(static_cast<std::size_t>(Hq) * d +
+                                                     2u * static_cast<std::size_t>(Hk) * d),
+                                    kRowGemvThreads>>>(
           d_normed, wq, wk, wv, sl[0], sl[1], sl[2], Hq * d, Hk * d, Hk * d, H,
           d_qf, d_k_new, d_v_new);
       G4_CUDA_CHECK(cudaGetLastError());
@@ -908,7 +910,9 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
       stamp(2, layer, 0);
       const float* const cos_t = g->cos_tbl + static_cast<std::size_t>(t) * half;
       const float* const sin_t = g->sin_tbl + static_cast<std::size_t>(t) * half;
-      rope_at_pos_qk_kernel<<<(Hq * d + Hk * d + 255) / 256, 256>>>(
+      rope_at_pos_qk_kernel<<<static_cast<int>((static_cast<std::size_t>(Hq) * d +
+                                                 static_cast<std::size_t>(Hk) * d + 255u) / 256u),
+                               256>>>(
           d_qf, d_k_new, cos_t, sin_t, Hq, Hk, d, d_qf_rot, d_k_new_rot);
       G4_CUDA_CHECK(cudaGetLastError());
 
@@ -919,11 +923,13 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
       const int kv_len = t + 1;
       const bool direct_kv = g->direct_kv && g->gqa_fusable;
       if (direct_kv) {
-        kv_append_kernel<<<(Hk * d + 255) / 256, 256>>>(
+        kv_append_kernel<<<static_cast<int>((static_cast<std::size_t>(Hk) * d + 255u) / 256u),
+                           256>>>(
             d_k_new_rot, d_v_new, g->kv_k + kv_layer, g->kv_v + kv_layer, t, max_pos,
             Hk, d);
       } else {
-        kv_append_compact_kernel<<<(Hk * d + 255) / 256, 256>>>(
+        kv_append_compact_kernel<<<static_cast<int>((static_cast<std::size_t>(Hk) * d + 255u) / 256u),
+                                   256>>>(
             d_k_new_rot, d_v_new, g->kv_k + kv_layer, g->kv_v + kv_layer,
             g->compact_k, g->compact_v, kv_len, t, max_pos, Hk, d);
       }
