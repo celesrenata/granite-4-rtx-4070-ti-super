@@ -867,8 +867,10 @@ int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
       stride < base_pos + rows || static_cast<long long>(Hk) * d > INT_MAX ||
       stride > INT_MAX / std::max(Hk, 1))
     return -1;
-  granite4::kv_append_batched_kernel<<<dim3((Hk * d + 255) / 256, rows), 256>>>(
-      d_src_k, d_src_v, d_cache_k, d_cache_v, base_pos, rows, stride, Hk, d);
+  granite4::kv_append_batched_kernel<<<
+      dim3(static_cast<unsigned int>((static_cast<std::size_t>(Hk) * d + 255u) / 256u),
+           static_cast<unsigned int>(rows)),
+      256>>>(d_src_k, d_src_v, d_cache_k, d_cache_v, base_pos, rows, stride, Hk, d);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
