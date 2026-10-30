@@ -111,6 +111,9 @@ int gpu_verify_attention_layer(
 // Batched speculative attention block for already-normalized rows. This is
 // intentionally limited to one transformer attention block; the full model
 // forward and accept/reject loop remain separate integration work.
+// Runs one already-normalized transformer attention block over 1..4 rows.
+// It projects Q/K/V, applies position-specific RoPE, appends K/V, and runs
+// causal GQA. All pointers are device memory; weights are row-major FP8.
 int gpu_verify_attention_layer_batched(
     const std::uint16_t* d_normed, const std::uint8_t* d_wq,
     const std::uint8_t* d_wk, const std::uint8_t* d_wv, float q_scale,
