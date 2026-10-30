@@ -532,6 +532,10 @@ int granite4_kernel_qkv_dequant_batched(
     const std::uint8_t* d_wv, float sq, float sk, float sv, int tokens,
     int Nq, int Nk, int Nv, int K, std::uint16_t* d_q, std::uint16_t* d_k,
     std::uint16_t* d_v);
+int granite4_kernel_silu_gate_up_batched(
+    const std::uint8_t* d_wg, const std::uint8_t* d_wu,
+    const std::uint16_t* d_x, float scale_g, float scale_u, int N, int K,
+    int rows, std::uint16_t* d_out);
 int granite4_verify_qkv(
     const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
     const std::uint8_t* d_wv, float sq, float sk, float sv, int tokens, int Nq,
