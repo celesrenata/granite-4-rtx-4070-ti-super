@@ -500,20 +500,29 @@ int main(int argc, char** argv) {
           (void)logits;  // rows already consumed via target_arg
           // Commit the accepted prefix, then the gate's tail token: the
           // correction on rejection, the target's own row (bonus) when the
-          // draft was fully accepted.
-          // Clamp the commit to the output budget (the tail token is the
-          // first to drop when the draft over-shoots it).
-          const int budget = max_tokens - static_cast<int>(generated.size());
-          const int commit = std::min(v.accepted + 1, budget);
-          for (int i = 0; i < commit; ++i) {
-            const int tok = (i < v.accepted)
-                                ? proposal[i]
-                                : (v.correction >= 0 ? v.correction
-                                                    : target_arg[nprop]);
-            seq.push_back(tok);
-            generated.push_back(tok);
+          // draft was fully accepted. Clamp the commit to the output budget.
+          // When the budget is 0 (only reachable in the draft path, since the
+          // greedy loop checks the budget before each step) nothing is
+          // committed and the loop exits; when it is exactly 1, the tail is
+          // kept and the accepted prefix dropped — on a rejection that tail is
+          // the correction, which is what greedy semantics dictate.
+          const int budget = max_tokens -
+                             static_cast<int>(generated.size());
+          const int commit = (budget > 0)
+                                 ? std::min(v.accepted + 1, budget)
+                                 : 0;
+          if (commit > 0) {
+            const int prefix = std::min(v.accepted, commit);
+            for (int i = 0; i < commit; ++i) {
+              const int tok = (i < prefix)
+                                  ? proposal[i]
+                                  : (v.correction >= 0 ? v.correction
+                                                      : target_arg[nprop]);
+              seq.push_back(tok);
+              generated.push_back(tok);
+            }
+            accepted_total += v.accepted;
           }
-          accepted_total += v.accepted;
           ++steps;
           session.reset();
         }
@@ -630,20 +639,28 @@ int main(int argc, char** argv) {
             verify_greedy(target_arg.data(), proposal.data(), nprop);
         // Commit the accepted prefix, then the gate's tail token: the
         // correction on rejection, the target's own row (bonus) when the
-        // draft was fully accepted.
-        // Clamp the commit to the output budget (the tail token is the
-        // first to drop when the draft over-shoots it).
+        // draft was fully accepted. Clamp the commit to the output budget.
+        // When the budget is 0 (only reachable in the draft path, since the
+        // greedy loop checks the budget before each step) nothing is
+        // committed and the loop exits; when it is exactly 1, the tail is
+        // kept and the accepted prefix dropped — on a rejection that tail is
+        // the correction, which is what greedy semantics dictate.
         const int budget = max_tokens - static_cast<int>(generated.size());
-        const int commit = std::min(v.accepted + 1, budget);
-        for (int i = 0; i < commit; ++i) {
-          const int tok = (i < v.accepted)
-                              ? proposal[i]
-                              : (v.correction >= 0 ? v.correction
-                                                   : target_arg[nprop]);
-          seq.push_back(tok);
-          generated.push_back(tok);
+        const int commit = (budget > 0)
+                               ? std::min(v.accepted + 1, budget)
+                               : 0;
+        if (commit > 0) {
+          const int prefix = std::min(v.accepted, commit);
+          for (int i = 0; i < commit; ++i) {
+            const int tok = (i < prefix)
+                                ? proposal[i]
+                                : (v.correction >= 0 ? v.correction
+                                                     : target_arg[nprop]);
+            seq.push_back(tok);
+            generated.push_back(tok);
+          }
+          accepted_total += v.accepted;
         }
-        accepted_total += v.accepted;
         ++steps;
       }
       std::fprintf(stderr,
