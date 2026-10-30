@@ -49,6 +49,8 @@ inline constexpr char kGpuTarget[] = "sm_89";
 
 // Upper bound accepted by the fixed-width CUDA attention launchers.
 inline constexpr int kMaxHeadDim = 256;
+inline constexpr int kGqaSoftmaxParallelMax = 512;
+inline constexpr int kGqaSoftmaxParallelMaxSeqLen = kGqaSoftmaxParallelMax * 1024;
 
 }  // namespace granite4
 

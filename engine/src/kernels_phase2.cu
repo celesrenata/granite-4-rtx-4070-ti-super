@@ -230,9 +230,8 @@ __global__ void gqa_value_kernel(const std::uint16_t* p, const std::uint16_t* v,
 // kv order by one thread: the sequence of double additions is identical to
 // the serial reference, so the denominator and probabilities stay
 // bit-identical. The parallel form needs kv_len doubles of extra shared
-// memory; beyond kGqaSoftmaxParallelMax the exact serial loop runs.
+// memory; beyond granite4::kGqaSoftmaxParallelMax the exact serial loop runs.
 // ---------------------------------------------------------------------------
-static constexpr int kGqaSoftmaxParallelMax = 512;
 
 __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
                                  const std::uint16_t* v, float att_scale, int Hq,
@@ -250,7 +249,7 @@ __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
   const std::size_t base_elems =
       static_cast<std::size_t>(d) + 2u * static_cast<std::size_t>(kv_len);
   const std::size_t exp_off = (base_elems + 3u) & ~std::size_t(3);  // 8B align
-  double* const dexp = (kv_len <= kGqaSoftmaxParallelMax)
+  double* const dexp = (kv_len <= granite4::kGqaSoftmaxParallelMax)
                            ? reinterpret_cast<double*>(smem + exp_off)
                            : nullptr;
   __shared__ float smax;     // row max (Phase B)
@@ -355,7 +354,7 @@ __global__ void gqa_fused_batched_kernel(const std::uint16_t* q,
   const std::size_t base_elems =
       static_cast<std::size_t>(d) + 2u * static_cast<std::size_t>(kv_len);
   const std::size_t exp_off = (base_elems + 3u) & ~std::size_t(3);  // 8B align
-  double* const dexp = (kv_len <= kGqaSoftmaxParallelMax)
+  double* const dexp = (kv_len <= granite4::kGqaSoftmaxParallelMax)
                            ? reinterpret_cast<double*>(smem + exp_off)
                            : nullptr;
   __shared__ float smax;
@@ -656,7 +655,6 @@ __global__ void fp8_decode_all_kernel(float* out) {
 }  // namespace granite4
 
 namespace granite4 {
-inline constexpr int kGqaSoftmaxParallelMaxSeqLen = kGqaSoftmaxParallelMax * 1024;
 }
 
 // ---------------------------------------------------------------------------
