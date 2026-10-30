@@ -54,11 +54,82 @@ bool run_case(const TestCase& c) {
   return true;
 }
 
+// Exercises commit_speculative: given a gate verdict plus the remaining
+// output budget, which tokens actually get appended. `target`/`draft` are
+// the K sequences (verify_greedy decides the verdict), `bonus` is the
+// target's own next token (used only on full acceptance), and
+// want_tokens[0..want_commit-1] is the expected committed list in append
+// order.
+struct CommitCase {
+  const char* name;
+  int K;
+  int target[16];
+  int draft[16];
+  int bonus;
+  int budget;
+  int want_commit;
+  int want_tokens[16];
+};
+
+const CommitCase kCommitCases[] = {
+    // Full acceptance, generous budget: all K draft tokens + the bonus.
+    {"full accept, budget>need", 3, {10, 20, 30}, {10, 20, 30}, 99, 5, 4,
+     {10, 20, 30, 99}},
+    // Full acceptance, budget exactly == accepted: no room for the bonus.
+    {"full accept, budget==accepted", 3, {10, 20, 30}, {10, 20, 30}, 99, 3, 3,
+     {10, 20, 30}},
+    // Full acceptance, budget<accepted: only the prefix up to budget.
+    {"full accept, budget<accepted", 3, {10, 20, 30}, {10, 20, 30}, 99, 2, 2,
+     {10, 20}},
+    // Full acceptance, budget=1: first draft token only.
+    {"full accept, budget=1", 3, {10, 20, 30}, {10, 20, 30}, 99, 1, 1, {10}},
+    // Full acceptance, budget=0: nothing committed.
+    {"full accept, budget=0", 3, {10, 20, 30}, {10, 20, 30}, 99, 0, 0, {}},
+    // Rejection, generous budget: accepted prefix + correction.
+    {"reject, budget>need", 4, {10, 20, 77, 88}, {10, 20, 30, 40}, 99, 10, 3,
+     {10, 20, 77}},
+    // Rejection, budget==accepted: correction is clamped away.
+    {"reject, budget==accepted", 4, {10, 20, 77, 88}, {10, 20, 30, 40}, 99, 2,
+     2, {10, 20}},
+    // Rejection, budget=1: first prefix token only.
+    {"reject, budget=1", 4, {10, 20, 77, 88}, {10, 20, 30, 40}, 99, 1, 1,
+     {10}},
+    // Rejection at j=0, budget=1: only the correction (prefix empty).
+    {"reject j=0, budget=1", 3, {9, 1, 2}, {5, 6, 7}, 99, 1, 1, {9}},
+    // Rejection at j=0, budget=0: nothing committed.
+    {"reject j=0, budget=0", 3, {9, 1, 2}, {5, 6, 7}, 99, 0, 0, {}},
+};
+
+bool run_commit_case(const CommitCase& c) {
+  gv::VerifyResult v = gv::verify_greedy(c.target, c.draft, c.K);
+  gv::CommitPlan p =
+      gv::commit_speculative(v, c.draft, c.K, c.bonus, c.budget);
+  if (p.commit != c.want_commit) {
+    std::fprintf(stderr, "FAIL(commit) %s: commit=%d (want %d)\n", c.name,
+                 p.commit, c.want_commit);
+    return false;
+  }
+  if (static_cast<int>(p.tokens.size()) != c.want_commit) {
+    std::fprintf(stderr, "FAIL(commit) %s: size=%zu (want %d)\n", c.name,
+                 p.tokens.size(), c.want_commit);
+    return false;
+  }
+  for (int i = 0; i < c.want_commit; ++i) {
+    if (p.tokens[i] != c.want_tokens[i]) {
+      std::fprintf(stderr, "FAIL(commit) %s: tokens[%d]=%d (want %d)\n",
+                   c.name, i, (int)p.tokens[i], c.want_tokens[i]);
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 int main() {
   bool ok = true;
   for (const auto& c : kCases) ok = run_case(c) && ok;
+  for (const auto& c : kCommitCases) ok = run_commit_case(c) && ok;
 
   // K=0 degenerate case: nothing to verify, no correction.
   {

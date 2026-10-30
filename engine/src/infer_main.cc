@@ -498,26 +498,15 @@ int main(int argc, char** argv) {
           const VerifyResult v =
               verify_greedy(target_arg.data(), proposal.data(), nprop);
           (void)logits;  // rows already consumed via target_arg
-          // Commit the accepted prefix, then the gate's tail token: the
-          // correction on rejection, the target's own row (bonus) when the
-          // draft was fully accepted. Clamp the commit to the output budget.
-          // When the budget is 0 (only reachable in the draft path, since the
-          // greedy loop checks the budget before each step) nothing is
-          // committed and the loop exits; when it is exactly 1, the tail is
-          // kept and the accepted prefix dropped — on a rejection that tail is
-          // the correction, which is what greedy semantics dictate.
+          // Commit the accepted prefix, then the gate's tail token, clamped
+          // to the output budget (unit-tested in commit_speculative).
           const int budget = max_tokens -
                              static_cast<int>(generated.size());
-          const int commit = (budget > 0)
-                                 ? std::min(v.accepted + 1, budget)
-                                 : 0;
-          if (commit > 0) {
-            const int prefix = std::min(v.accepted, commit);
-            for (int i = 0; i < commit; ++i) {
-              const int tok = (i < prefix)
-                                  ? proposal[i]
-                                  : (v.correction >= 0 ? v.correction
-                                                      : target_arg[nprop]);
+          const CommitPlan plan =
+              commit_speculative(v, proposal.data(), nprop,
+                                 target_arg[nprop], budget);
+          if (plan.commit > 0) {
+            for (std::int32_t tok : plan.tokens) {
               seq.push_back(tok);
               generated.push_back(tok);
             }
@@ -637,25 +626,14 @@ int main(int argc, char** argv) {
         // agrees with the draft, plus one correction (or bonus) token.
         const VerifyResult v =
             verify_greedy(target_arg.data(), proposal.data(), nprop);
-        // Commit the accepted prefix, then the gate's tail token: the
-        // correction on rejection, the target's own row (bonus) when the
-        // draft was fully accepted. Clamp the commit to the output budget.
-        // When the budget is 0 (only reachable in the draft path, since the
-        // greedy loop checks the budget before each step) nothing is
-        // committed and the loop exits; when it is exactly 1, the tail is
-        // kept and the accepted prefix dropped — on a rejection that tail is
-        // the correction, which is what greedy semantics dictate.
+        // Commit the accepted prefix, then the gate's tail token, clamped
+        // to the output budget (unit-tested in commit_speculative).
         const int budget = max_tokens - static_cast<int>(generated.size());
-        const int commit = (budget > 0)
-                               ? std::min(v.accepted + 1, budget)
-                               : 0;
-        if (commit > 0) {
-          const int prefix = std::min(v.accepted, commit);
-          for (int i = 0; i < commit; ++i) {
-            const int tok = (i < prefix)
-                                ? proposal[i]
-                                : (v.correction >= 0 ? v.correction
-                                                     : target_arg[nprop]);
+        const CommitPlan plan =
+            commit_speculative(v, proposal.data(), nprop,
+                               target_arg[nprop], budget);
+        if (plan.commit > 0) {
+          for (std::int32_t tok : plan.tokens) {
             seq.push_back(tok);
             generated.push_back(tok);
           }
