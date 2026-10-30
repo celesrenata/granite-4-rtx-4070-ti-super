@@ -401,7 +401,11 @@ segfaulted on the host during this check, so GPU identity is established by the
 CUDA test binaries rather than that utility. After centralizing the GQA
 softmax limits, the latest gremlin-1 rebuild again passed both device tests;
 the standalone 4096x4096 verify-GEMV benchmark measured k=4 at 3.02x speedup
-and 14.67 us/token (k=2 1.92x, k=3 2.54x).
+and 14.67 us/token (k=2 1.92x, k=3 2.54x). On 2026-10-30 a further gremlin-1
+rebuild (after the API doc and cleanup commits) again passed both device
+tests; the same 791,6864,315,9822,374 smoke prompt generated the same IDs
+[12366, 1210, 198] with 76.39 ms prefill and 15.09 ms / 15.09 ms incremental
+steps, matching the 2026-10-29 figures within measurement noise.
 
 Tried and rejected: 64-thread blocks for the small-grid QKV and O
 projections (they are latency-limited at 128 threads). Same-run A/B read
