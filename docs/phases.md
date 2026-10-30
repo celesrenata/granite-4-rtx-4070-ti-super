@@ -398,7 +398,10 @@ incremental steps, with generated IDs `[12366, 1210, 198]`. The host suite remai
 6 skipped, with host-only CTest 8/8; the gremlin CUDA derivation separately
 ran the device kernel and verify-GEMV tests successfully. `nvidia-smi` itself
 segfaulted on the host during this check, so GPU identity is established by the
-CUDA test binaries rather than that utility.
+CUDA test binaries rather than that utility. After centralizing the GQA
+softmax limits, the latest gremlin-1 rebuild again passed both device tests;
+the standalone 4096x4096 verify-GEMV benchmark measured k=4 at 3.02x speedup
+and 14.67 us/token (k=2 1.92x, k=3 2.54x).
 
 Tried and rejected: 64-thread blocks for the small-grid QKV and O
 projections (they are latency-limited at 128 threads). Same-run A/B read
