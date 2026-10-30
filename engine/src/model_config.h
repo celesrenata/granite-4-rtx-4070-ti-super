@@ -48,6 +48,8 @@ inline constexpr int kCudaArchMinor = 9;  // RTX 4070 Ti Super (Ada)
 inline constexpr char kGpuTarget[] = "sm_89";
 
 // Upper bound accepted by the fixed-width CUDA attention launchers.
+// CUDA attention launch limits. These are intentionally model-independent
+// safety ceilings, not Granite's runtime dimensions.
 inline constexpr int kMaxHeadDim = 256;
 inline constexpr int kGqaSoftmaxParallelMax = 512;
 inline constexpr int kGqaSoftmaxParallelMaxSeqLen = kGqaSoftmaxParallelMax * 1024;
