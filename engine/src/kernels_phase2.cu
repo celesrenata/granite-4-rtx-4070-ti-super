@@ -230,7 +230,7 @@ __global__ void gqa_value_kernel(const std::uint16_t* p, const std::uint16_t* v,
 // kv order by one thread: the sequence of double additions is identical to
 // the serial reference, so the denominator and probabilities stay
 // bit-identical. The parallel form needs kv_len doubles of extra shared
-// memory; beyond granite4::kGqaSoftmaxParallelMax the exact serial loop runs.
+// memory; beyond the shared parallel-softmax limit the exact serial loop runs.
 // ---------------------------------------------------------------------------
 
 __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
