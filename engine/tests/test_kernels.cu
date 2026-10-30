@@ -58,10 +58,7 @@ extern "C" int granite4_kernel_qkv_dequant(
     const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
     const std::uint8_t* d_wv, float sq, float sk, float sv, int nq, int nk, int k,
     std::uint16_t* d_q, std::uint16_t* d_kk, std::uint16_t* d_v);
-extern "C" int granite4_verify_qkv(
-    const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
-    const std::uint8_t* d_wv, float sq, float sk, float sv, int tokens, int nq,
-    int nk, int k, std::uint16_t* d_q, std::uint16_t* d_k, std::uint16_t* d_v);
+
 extern "C" int granite4_kernel_qkv_dequant(
     const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
     const std::uint8_t* d_wv, float sq, float sk, float sv, int nq, int nk, int k,
@@ -459,9 +456,12 @@ static void test_batched_qkv_parity_device() {
   CUDA_CHECK(cudaMemcpy(dwq, wq.data(), wq.size(), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(dwk, wk.data(), wk.size(), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(dwv, wv.data(), wv.size(), cudaMemcpyHostToDevice));
-  expect(granite4_verify_qkv(da, dwq, dwk, dwv, .0007f, .0008f, .0009f,
-                             tokens, nq, nk, k, dq, dk, dv) == 0,
-         "batched QKV: launch");
+  expect(granite4_verify_gemv(da, dwq, .0007f, tokens, nq, k, dq) == 0,
+         "batched QKV: Q launch");
+  expect(granite4_verify_gemv(da, dwk, .0008f, tokens, nk, k, dk) == 0,
+         "batched QKV: K launch");
+  expect(granite4_verify_gemv(da, dwv, .0009f, tokens, nk, k, dv) == 0,
+         "batched QKV: V launch");
   for (int t = 0; t < tokens; ++t)
     expect(granite4_kernel_qkv_dequant(
                da + static_cast<std::size_t>(t) * k, dwq, dwk, dwv,

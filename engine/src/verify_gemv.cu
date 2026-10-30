@@ -120,13 +120,3 @@ extern "C" int granite4_verify_gemv(const std::uint16_t* d_a, const std::uint8_t
   verify_gemv_kernel<<<rows, 128>>>(d_a, d_b, scale, tokens, rows, k, d_c);
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
-
-extern "C" int granite4_verify_qkv(
-    const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
-    const std::uint8_t* d_wv, float sq, float sk, float sv, int tokens, int nq,
-    int nk, int k, std::uint16_t* d_q, std::uint16_t* d_k, std::uint16_t* d_v) {
-  if (granite4_verify_gemv(d_a, d_wq, sq, tokens, nq, k, d_q) != 0) return -1;
-  if (granite4_verify_gemv(d_a, d_wk, sk, tokens, nk, k, d_k) != 0) return -1;
-  if (granite4_verify_gemv(d_a, d_wv, sv, tokens, nk, k, d_v) != 0) return -1;
-  return 0;
-}
