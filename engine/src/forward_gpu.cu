@@ -900,7 +900,7 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
       gstamp(0, layer, 0);
       row_gemm_dequant_qkv_kernel<<<static_cast<int>(static_cast<std::size_t>(Hq) * d +
                                                      2u * static_cast<std::size_t>(Hk) * d),
-                                    kRowGemvThreads>>>
+                                    kRowGemvThreads>>>(
           d_normed, wq, wk, wv, sl[0], sl[1], sl[2], Hq * d, Hk * d, Hk * d, H,
           d_qf, d_k_new, d_v_new);
       G4_CUDA_CHECK(cudaGetLastError());
