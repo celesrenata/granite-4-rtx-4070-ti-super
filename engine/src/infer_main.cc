@@ -24,7 +24,10 @@
 //     argmax one position at a time, and commits the accepted prefix. It
 //     prints `G4_DRAFT steps=... proposed=... accepted=...` to stderr so the
 //     acceptance rate can be measured before the fused k-token verify path
-//     is integrated.
+//     is integrated. Works on the CUDA path (draft-verify against the
+//     device logits) and on the host oracle path (draft-verify against the
+//     f32 host logits); each step replays the full accepted prefix because
+//     the host oracle has no incremental KV watermark.
 //
 // Tokenization is intentionally NOT done here: the checkpoint ships an HF
 // `tokenizer.json` that the Python harness loads with the `tokenizers`
@@ -492,9 +495,8 @@ int main(int argc, char** argv) {
           }
           // The unit-tested gate: accept the longest prefix where the target
           // agrees with the draft, plus one correction (or bonus) token.
-          const speculative::VerifyResult v =
-              speculative::verify_greedy(target_arg.data(), proposal.data(),
-                                         nprop);
+          const VerifyResult v =
+              verify_greedy(target_arg.data(), proposal.data(), nprop);
           (void)logits;  // rows already consumed via target_arg
           // Commit the accepted prefix, then the gate's tail token: the
           // correction on rejection, the target's own row (bonus) when the
@@ -578,6 +580,87 @@ int main(int argc, char** argv) {
     std::vector<std::int32_t> seq = tokens;
     std::vector<std::int32_t> generated;
     std::vector<float> logits;
+    if (draft_k > 0) {
+      if (seed != 0) {
+        std::fprintf(stderr, "draft-lookup: greedy only (omit --seed)\n");
+        return 2;
+      }
+      // Host mirror of the CUDA draft-verify-commit loop. forward_logits_f32
+      // returns f32 logits for every position, so verification is the same
+      // argmax rows; there is no KV watermark, so each step replays the whole
+      // accepted prefix from position 0.
+      long proposed_total = 0, accepted_total = 0;
+      int steps = 0;
+      const int V = static_cast<int>(w.model.vocab_size);
+      auto argmax_f32 = [](const float* p, int n) {
+        int best = 0;
+        for (int c = 1; c < n; ++c)
+          if (p[c] > p[best]) best = c;
+        return best;
+      };
+      while (static_cast<int>(generated.size()) < max_tokens) {
+        const int len = static_cast<int>(seq.size());
+
+        // Never propose past the output budget (no ctx watermark on the host
+        // path, so the position cap is the output budget alone).
+        const int room =
+            std::min(draft_k, max_tokens - static_cast<int>(generated.size()));
+        const std::vector<std::int32_t> proposal =
+            (room > 0) ? draft_lookup(seq, room) : std::vector<std::int32_t>();
+        const int nprop = static_cast<int>(proposal.size());
+        proposed_total += nprop;
+
+        // One target forward over accepted prefix + draft proposals. The
+        // rows at positions [len, len+nprop) verify each proposal; row
+        // len+nprop is the target's own next token (correction when the
+        // draft is rejected, bonus when it is fully accepted).
+        std::vector<std::int32_t> cand(seq);
+        cand.insert(cand.end(), proposal.begin(), proposal.end());
+        forward_logits_f32(cand, w.embed, w.layers, w.final_norm.data(),
+                           w.lm_head.data(), w.model, kForwardSpec, &logits);
+        std::vector<std::int32_t> target_arg(nprop + 1, 0);
+        for (int i = 0; i <= nprop; ++i) {
+          const float* row =
+              logits.data() + static_cast<std::size_t>(len - 1 + i) * V;
+          target_arg[i] = argmax_f32(row, V);
+        }
+        // The unit-tested gate: accept the longest prefix where the target
+        // agrees with the draft, plus one correction (or bonus) token.
+        const VerifyResult v =
+            verify_greedy(target_arg.data(), proposal.data(), nprop);
+        // Commit the accepted prefix, then the gate's tail token: the
+        // correction on rejection, the target's own row (bonus) when the
+        // draft was fully accepted.
+        // Clamp the commit to the output budget (the tail token is the
+        // first to drop when the draft over-shoots it).
+        const int budget = max_tokens - static_cast<int>(generated.size());
+        const int commit = std::min(v.accepted + 1, budget);
+        for (int i = 0; i < commit; ++i) {
+          const int tok = (i < v.accepted)
+                              ? proposal[i]
+                              : (v.correction >= 0 ? v.correction
+                                                   : target_arg[nprop]);
+          seq.push_back(tok);
+          generated.push_back(tok);
+        }
+        accepted_total += v.accepted;
+        ++steps;
+      }
+      std::fprintf(stderr,
+                   "G4_DRAFT steps=%d proposed=%ld accepted=%ld rate=%.3f\n",
+                   steps, proposed_total, accepted_total,
+                   proposed_total > 0
+                       ? static_cast<double>(accepted_total) /
+                             static_cast<double>(proposed_total)
+                       : 0.0);
+      std::printf("{\"generated\":[");
+      for (std::size_t i = 0; i < generated.size(); ++i) {
+        if (i) std::printf(",");
+        std::printf("%d", generated[i]);
+      }
+      std::printf("]}\n");
+      return 0;
+    }
     for (int step = 0; step < max_tokens; ++step) {
       forward_logits_f32(seq, w.embed, w.layers, w.final_norm.data(),
                          w.lm_head.data(), w.model, kForwardSpec, &logits);

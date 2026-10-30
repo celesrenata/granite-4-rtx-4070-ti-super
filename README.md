@@ -5,12 +5,15 @@ Super (16 GB, sm_89), written in C++20 / CUDA with a dependency-light Python
 stdlib API in front. It is not a general engine: the constants, memory plan and
 kernels are written for this one model on this one GPU.
 
-**Status: P4 engine / speculative-decoding preparation.** The CUDA engine loads
+**Status: P4 engine / speculative-decoding wired in.** The CUDA engine loads
 FP8 weights, runs the full Granite 4.2 8B forward pass, and serves deterministic
 GPU generation through the native inference binary. Phase 4 launcher hardening
-has been rebuilt and device-tested on gremlin-1; the fused speculative GEMV
-primitive and attention/QKV staging APIs are verified, but full batched
-speculative generation is not yet wired into the production decode loop. On an RTX 4070 Ti Super,
+has been rebuilt and device-tested on gremlin-1; the prompt-lookup drafter is
+now wired into the production decode loop (`generate --draft-lookup K`, greedy
+only, acceptance measured via `G4_DRAFT`). The fused speculative GEMV primitive
+and attention/QKV staging APIs are verified, but the one-position-at-a-time
+verify path still runs per position, so the fused-k verify GEMV and batched
+causal attention are the next integration step. On an RTX 4070 Ti Super,
 steady batch-1 decode is currently about **15.2 ms/token (~65 tps)** for the
 5-token prompt benchmark; see [`docs/phases.md`](docs/phases.md) for commands
 and conditions. The Python HTTP layer remains a thin API scaffold while the
