@@ -87,7 +87,8 @@ int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
 // projected tensors; cos/sin contain one [d/2] row per position. The stage
 // applies RoPE, appends K/V at base_pos..base_pos+rows, and writes causal GQA
 // outputs. The cache uses [Hk][cache_stride][d] layout. `rows` is currently
-// bounded to four, matching the verified batched kernels.
+// bounded to four, matching the verified batched kernels. All device pointers
+// must belong to the current CUDA device; cos/sin are [rows][head_dim/2].
 int gpu_verify_attention_stage(
     const std::uint16_t* d_q, const std::uint16_t* d_k,
     const std::uint16_t* d_v, const float* d_cos, const float* d_sin,
@@ -113,7 +114,8 @@ int gpu_verify_attention_layer(
 // run the FFN/final norm/lm-head stages or the accept/reject loop.
 // Runs one already-normalized transformer attention block over 1..4 rows.
 // It projects Q/K/V, applies position-specific RoPE, appends K/V, and runs
-// causal GQA. All pointers are device memory; weights are row-major FP8.
+// causal GQA. All pointers are device memory; weights are row-major FP8 and
+// outputs are token-major [rows][heads * head_dim].
 int gpu_verify_attention_layer_batched(
     const std::uint16_t* d_normed, const std::uint8_t* d_wq,
     const std::uint8_t* d_wk, const std::uint8_t* d_wv, float q_scale,
