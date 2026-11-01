@@ -65,31 +65,50 @@ git commit -m "phase0: deployment runbook and dry-run script"
 # git push origin <branch>
 ```
 
-## Step 4 — Copy to the remote staging directory
+## Step 4 — Copy the pushed commit to the remote staging directory
 
-Fresh, clearly named directory per copy:
+Fresh, clearly named directory per copy. Ship **only the git-tracked tree
+of the pushed commit**, via `git archive` (≈ 1 MB). This is deterministic
+and structurally excludes everything else in the local checkout — the local
+`.gt/` checkpoint (~34 GB, "Never stage this", `.gitignore:12`), `build/`,
+and any future junk directory:
 
 ```sh
 STAMP=$(date +%Y%m%d-%H%M%S)
 REMOTE_STAGING=/opt/granite4-rtx-4070-ti-super/staging-$STAMP
 
 ssh root@10.1.1.12 "mkdir -p '$REMOTE_STAGING'"
-rsync -avz --delete --exclude '.git' --exclude 'build/' --exclude 'reference/' \
-  ./ root@10.1.1.12:"$REMOTE_STAGING/"
-# (if rsync is unavailable on the remote: scp -r ./ root@10.1.1.12:"$REMOTE_STAGING/"
-#  then remove .git/, build/, reference/ inside the staging dir)
+git archive --format=tar HEAD \
+  | ssh root@10.1.1.12 "tar -x -C '$REMOTE_STAGING'"
 ```
 
 - **Do not** copy into `/etc/nixos/` and **do not overwrite
   `/etc/nixos/flake.nix`**. The only write target in this step is
   `$REMOTE_STAGING`.
-- `--exclude reference/` — that subtree is a different model/GPU kept for
-  layout conventions only and is not part of the deployable artifact.
-- Verify the copy (read-only, on the remote):
+- The `reference/qwen3-27b-5090` submodule is a different model/GPU kept
+  for layout conventions only; it is not expanded by `git archive` and is
+  not needed on the RTX host. The small tracked `reference/granite/`
+  Python files do ship.
+- **Do not** use a raw `rsync ./` here. This checkout contains `.gt/`
+  (34 GB) and the old `--exclude '.git' --exclude 'build/' --exclude
+  'reference/'` list did not cover it — a plain copy hangs (observed:
+  10-minute timeout killed mid-transfer, 32 GB already sent).
+- Verify the copy (read-only): sentinels plus a byte-exact sha256
+  manifest, computed identically on both ends:
 
 ```sh
 ssh root@10.1.1.12 "test -f '$REMOTE_STAGING/CMakeLists.txt' && test -f '$REMOTE_STAGING/frontend/api.py' && echo copy-ok"
+
+TMP=$(mktemp -d); git archive --format=tar HEAD | tar -x -C "$TMP"
+( cd "$TMP" && find . -type f | sort | xargs -n50 shasum -a 256 | sort ) > /tmp/m_local.txt
+ssh root@10.1.1.12 "( cd '$REMOTE_STAGING' && find . -type f | sort | xargs -n50 sha256sum | sort )" > /tmp/m_remote.txt
+diff /tmp/m_local.txt /tmp/m_remote.txt && echo manifest-ok
+rm -rf "$TMP"
 ```
+
+Expected: 90 files (91 tracked entries = 90 files + 1 gitlink for the
+`reference/qwen3-27b-5090` submodule, which `git archive` does not expand).
+`diff` must be empty.
 
 ## Step 5 — Flake integration (separate step, only after explicit user approval)
 
