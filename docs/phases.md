@@ -315,10 +315,13 @@ last two are additionally token-identical end-to-end):
    80.43 ms for four single-token rounds, a 2.95× reduction; fused k=4
    effective bandwidth is 307.8 GB/s (the k=4 path is activation/latency
    bound, not at the 631.9 GB/s roofline). The device correctness test
-   passes. This is not yet an end-to-end speculative path: k-token RMSNorm,
-   RoPE, causal GQA/KV append, candidate generation, and the exact
-   accept/reject gate remain to be implemented; the primitive is
-   deliberately not linked into production decode.
+   passes. This is a measured primitive, not the production path: the live
+   `--draft-lookup K` path (item 13) already runs candidate generation and
+   the exact greedy accept/reject gate, and is linked into production
+   decode. The fused-k GEMV is not yet switched into that loop — the verify
+   still runs one position at a time over the full causal prefix — so its
+   2.95× GEMV reduction has not been converted into an end-to-end
+   speedup.
 13. **Prompt-lookup drafter with measured acceptance** — `granite4-infer
    generate --draft-lookup K` (greedy only) proposes up to K tokens by
    copying the continuation of the most recent non-overlapping occurrence of
@@ -336,8 +339,8 @@ last two are additionally token-identical end-to-end):
    and measured identical acceptance, so the simpler most-recent copy is
    kept. This is an acceptance measurement, not a throughput win: the
    verifications still run one position at a time, so the fused-k GEMV
-   (2.29× at k=4) and batched causal attention/KV append are the next
-   integration step.
+   (2.95× at k=4 on the real Granite 4.2 shapes, item 12) and batched
+   causal attention/KV append are the next integration step.
 
    Granite 4.2 chat-template prompts (rendered from the checkpoint's
    `<|im_start|>…<|im_end|>` template with `enable_thinking`, tokenized by
