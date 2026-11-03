@@ -452,6 +452,18 @@ int main(int argc, char** argv) {
           std::fprintf(stderr, "draft-lookup: greedy only (omit --seed)\n");
           return 2;
         }
+        // Prefill the prompt once: compute the KV cache and the anchor row
+        // (the last prompt position's row, which predicts the first generated
+        // token). The draft-verify loop below then keeps this watermark and
+        // advances it by only the committed tokens each step, so a step costs
+        // O(draft_k) instead of re-replaying the whole accepted prefix.
+        {
+          const int plen = static_cast<int>(seq.size());
+          if (!session.step(seq.data(), plen, &logits, &err)) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return 1;
+          }
+        }
         DraftReport report;
         std::vector<float> row_f(V);
         std::vector<std::int32_t> target_arg;
@@ -462,28 +474,29 @@ int main(int argc, char** argv) {
           return best;
         };
         while (static_cast<int>(generated.size()) < max_tokens) {
-          // Replay the accepted prefix from position 0; the forwards below
-          // advance the KV watermark, and reset discards it.
-          session.reset();
-          const int len = static_cast<int>(seq.size());
+          const int len = static_cast<int>(seq.size());  // == KV watermark
 
           // Never propose past the output budget or the ctx's position limit.
+          // Reserve one ctx slot for the committed tail token (correction /
+          // bonus), so its KV always fits.
           const int room =
               std::min(draft_k, max_tokens - static_cast<int>(generated.size()));
-          const int pos_room = max_pos - static_cast<int>(seq.size());
+          const int pos_room = max_pos - len - 1;
           const int k = std::min(room, pos_room);
           const std::vector<std::int32_t> proposal =
               (k > 0) ? draft_lookup(seq, k) : std::vector<std::int32_t>();
           const int nprop = static_cast<int>(proposal.size());
           report.proposed += nprop;
 
-          // One target forward over accepted prefix + draft proposals. The
-          // rows at positions [len, len+nprop) verify each proposal; row
-          // len+nprop is the target's own next token (correction when the
-          // draft is rejected, bonus when it is fully accepted).
+          // One incremental target forward over the new draft rows only. The
+          // KV watermark is at `len`, so positions [0, len) are reused and rows
+          // [len, len+nprop) are computed. The anchor row (len-1) stays in
+          // `logits`. Row len-1+i is the target's greedy argmax for the (i+1)-th
+          // proposal; row len+nprop-1 is the target's own next token (the
+          // correction on rejection, the bonus on full acceptance).
           std::vector<std::int32_t> cand(seq);
           cand.insert(cand.end(), proposal.begin(), proposal.end());
-          if (!session.step(cand.data(), static_cast<int>(cand.size()), &logits, &err)) {
+          if (!session.step(cand.data(), len + nprop, &logits, &err)) {
             std::fprintf(stderr, "%s\n", err.c_str());
             return 1;
           }
@@ -498,23 +511,43 @@ int main(int argc, char** argv) {
           // agrees with the draft, plus one correction (or bonus) token.
           const VerifyResult v =
               verify_greedy(target_arg.data(), proposal.data(), nprop);
-          (void)logits;  // rows already consumed via target_arg
           // Commit the accepted prefix, then the gate's tail token, clamped
-          // to the output budget (unit-tested in commit_speculative).
-          const int budget = max_tokens -
-                             static_cast<int>(generated.size());
+          // to the output budget (unit-tested in commit_speculative) and to the
+          // ctx's remaining capacity so the tail KV always fits.
+          const int budget =
+              std::min(max_tokens - static_cast<int>(generated.size()),
+                       max_pos - len);
           const CommitPlan plan =
               commit_speculative(v, proposal.data(), nprop,
                                  target_arg[nprop], budget);
-          if (plan.commit > 0) {
-            for (std::int32_t tok : plan.tokens) {
-              seq.push_back(tok);
-              generated.push_back(tok);
+          for (std::int32_t tok : plan.tokens) {
+            seq.push_back(tok);
+            generated.push_back(tok);
+          }
+          report.accepted += v.accepted;
+
+          // The accepted draft prefix has valid KV (the forward wrote those
+          // positions with the committed draft tokens). The tail token (the
+          // correction on rejection, the bonus on full acceptance) does not: its
+          // KV was written with the draft token, or is absent for the bonus.
+          // Recompute the tail (0 or 1 position) with the committed tokens, then
+          // leave the watermark at the committed length for the next step.
+          const int valid_kv = len + v.accepted;
+          const int newlen = static_cast<int>(seq.size());
+          if (newlen > valid_kv) {
+            if (!session.truncate(valid_kv)) {
+              std::fprintf(stderr, "kv truncate failed\n");
+              return 1;
             }
-            report.accepted += v.accepted;
+            if (!session.step(seq.data(), newlen, &logits, &err)) {
+              std::fprintf(stderr, "%s\n", err.c_str());
+              return 1;
+            }
+          } else if (!session.truncate(newlen)) {
+            std::fprintf(stderr, "kv truncate failed\n");
+            return 1;
           }
           ++report.steps;
-          session.reset();
         }
         const double accept_rate = draft_accept_rate(report);
         // The stderr line stays for human/G4_-prefixed grepping; the same
