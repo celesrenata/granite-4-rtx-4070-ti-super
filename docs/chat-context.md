@@ -90,20 +90,31 @@ proposing up to K tokens that the target then verifies in one forward pass.
   draft-loop rejection path. Verified on gremlin-1: full device suite passes;
   `G4_TIMESTEP` shows the batched path taken at widths 4/3/3/2 plus the
   truncate redos, including `start=0` prefill.
+- Measured end-to-end on gremlin-1 (2026-11-03): K=4, 24-token
+  repeated-list chat prompt, `G4_TIMESTEP` device time.
+  - **Batched vs per-position** (`G4_BATCH_VERIFY=0`): each width-4
+    verify round 60.5 ms → 36.1 ms (**1.67× per round**); whole
+    generation 409 ms → 365 ms (**~1.12×** — only 2 of 21 rounds are
+    width-4, the rest are single-token decode that batching does not
+    touch).
+  - **Token identity**: batched-draft == per-position-draft == no-draft
+    (24/24 tokens, identical `G4_DRAFT` counters 18/8/6). The
+    draft-verify gate preserves exact greedy output through the
+    truncate+recompute rejection path.
+  - **GPU-vs-host oracle diverges on this prompt even without
+    drafting** (first generated token after the shared prefix: 578 vs
+    34863) — bf16 GPU vs f32 host logits within ~1 bf16 of each other.
+    Each side is self-consistent under `--draft-lookup` (draft ==
+    no-draft on both, 24/24). The parity claim that matters for the
+    draft work is **GPU-side self-consistency**, which holds.
 - Candidate next actions (ordered by effort):
-  1. **End-to-end speedup of the batched verify**: `generate --draft-lookup K`
-     on a repeated prompt, `G4_BATCH_VERIFY=0` (per-position) vs default
-     (batched), wall time + `G4_DRAFT` counters on gremlin-1; confirm the
-     generated tokens are identical between the two. The per-step verify is now
-     O(suffix) instead of O(suffix positions over the full prefix), so the
-     win should show up as step wall time at K=4 / high accept rate.
-  2. **CUDA-vs-host token comparison under `--draft-lookup`**: run `generate
-     --draft-lookup K` on both `--gpu 0` and `--gpu 1` over a fixed repeated
-     prompt and diff the `generated` token lists, to confirm the GPU draft path
-     reproduces the oracle. Needs gremlin-1; the stdout `draft` metric now makes
-     acceptance-rate comparison a one-line JSON parse.
-  3. Optionally extend the `draft` JSON object with per-step timing (wall clock
-     per verify round) once the end-to-end path is measured.
+  1. Optionally extend the `draft` JSON object with per-step timing
+     (device ms per verify round) so a benchmark harness can parse the
+     per-round batched speedup without `G4_TIMESTEP`.
+  2. If end-to-end draft speedup matters beyond ~1.1× at K=4, the
+     remaining levers are the single-token decode cost (the dominant
+     term when acceptance is moderate) — e.g. wider draft spans, better
+     drafter, or prefill overlap — not the batched verify itself.
 
 ## Key files (engine/src/)
 

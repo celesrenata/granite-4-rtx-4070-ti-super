@@ -324,16 +324,26 @@ last two are additionally token-identical end-to-end):
    loop (the batched GQA stage is bit-identical; the batched QKV-dequant,
    residual projection, and fused-K GEMV are each within 2 ULP of their
    single-token twins, and greedy argmax is stable — see
-   `test_batched_forward_range_parity_device`); an end-to-end
-   `--draft-lookup K` speedup measurement against the per-position loop is
-   still open (item 13).
+   `test_batched_forward_range_parity_device`). Measured end-to-end on
+   `gremlin-1` (K=4, 24-token budget, repeated-list chat prompt,
+   `G4_TIMESTEP` device time): each width-4 verify round drops from 60.5 ms
+   (per-position) to 36.1 ms (batched), **1.67×** per round; over a whole
+   24-token generation the batched draft path is 365 ms of device time
+   versus 409 ms for the per-position draft path (**~1.12×**, diluted
+   because only 2 of 21 rounds are width-4). The whole-round speedup is
+   below the standalone 2.95× GEMV number on purpose: a verify round is
+   attention + FFN + RoPE + GEMV, not GEMV alone. Token output is identical
+   across batched / per-position / no-draft (24/24), so the draft-verify
+   gate preserves exact greedy output through the truncate+recompute
+   rejection path.
 13. **Prompt-lookup drafter with measured acceptance** — `granite4-infer
    generate --draft-lookup K` (greedy only) proposes up to K tokens by
    copying the continuation of the most recent non-overlapping occurrence of
-   the longest repeated suffix (≥2 tokens), then verifies each proposal
-   against the target's greedy argmax one position at a time. It carries no
-   weights and no extra VRAM, and emits `G4_DRAFT steps=... proposed=...
-   accepted=... rate=...` on stderr, and mirrors the same counters in the stdout
+   the longest repeated suffix (≥2 tokens), then verifies the proposals
+   against the target's greedy argmax rows in one batched suffix forward.
+   It carries no weights and no extra VRAM, and emits `G4_DRAFT steps=...
+   proposed=... accepted=... rate=...` on stderr, and mirrors the same
+   counters in the stdout
    JSON (`{"generated":[...],"draft":{"steps":S,"proposed":P,"accepted":A,
    "accept_rate":R}}`) so a benchmark harness parses one document; that shape
    is produced by the unit-tested `generate_document` in `speculative_verify`.
@@ -349,9 +359,13 @@ last two are additionally token-identical end-to-end):
    kept. Verification is now batched: the 2–4-row suffix forward
    (`forward_range_batched_impl`) is numerically equivalent to the
    per-position loop (greedy argmax stable; see item 12 and
-   `test_batched_forward_range_parity_device`), but the end-to-end
-   `--draft-lookup K` speedup from that batching has not yet been measured
-   against the per-position path.
+   `test_batched_forward_range_parity_device`). Measured end-to-end on
+   `gremlin-1` (K=4, 24-token budget, repeated-list chat prompt): a
+   width-4 verify round is 60.5 ms per-position vs 36.1 ms batched
+   (**1.67×** per round); over a whole generation the batched draft path is
+   365 ms device time vs 409 ms for the per-position draft path
+   (**~1.12×** — only 2 of 21 rounds are width-4, the rest are single-token
+   decode that the batching does not touch).
 
    Granite 4.2 chat-template prompts (rendered from the checkpoint's
    `<|im_start|>…<|im_end|>` template with `enable_thinking`, tokenized by
@@ -374,6 +388,18 @@ GEMV, branchless decode, 16-byte GEMV). The
 token-6 tie vs the BF16 checkpoint reference (7754 vs 1217, both rounding
 to 17.625) is bounded bf16 quantization noise within the spec's allowed
 band, not an arithmetic defect.
+
+On longer / more repetitive prompts the bf16-vs-f32 gap can flip a greedy
+argmax: on the repeated-list chat prompt above (24 tokens) the GPU
+(bf16) and host (f32) oracle diverge at the first generated token
+after the shared prefix (578 vs 34863) even with **no draft at all** —
+the divergence is in the base decode loop, not the draft-verify gate.
+Each side is self-consistent under `--draft-lookup 4`
+(GPU draft == GPU no-draft; host draft == host no-draft, 24/24),
+so the draft loop faithfully reproduces its own oracle on both
+paths; what it cannot do is make bf16 and f32 agree where the logits
+are within ~1 bf16 of each other. The parity claim that matters for
+the draft work is therefore GPU-side self-consistency, which holds.
 
 Reproduction (GPU host, from the flake checkout):
 ```
