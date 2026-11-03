@@ -12,10 +12,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "kernel_math.h"
+#include "forward_gpu.h"    // GpuWeightsLayout, kGpuScalesPerLayer
+#include "forward_gpu_api.h" // public gpu_ctx_* / gpu_forward_range
+#include "model_config.h"   // ModelConfig, ForwardSpec
 
 using namespace granite4;
 
@@ -1168,6 +1173,245 @@ static void test_sampling_device() {
   cudaFree(du);
 }
 
+// Full-model parity: the batched suffix forward (forward_range_batched_impl,
+// auto-selected for 2-4-row incremental suffixes) must be bit-identical to
+// the per-position single-token loop, which the draft-verify loop relies on
+// for an exact greedy gate. Covers:
+//   * batch widths 3, 4, 3, 2 in one ctx with single-token decode,
+//   * batched attention reading the persistent KV written by single-token
+//     prefills (mixed KV provenance),
+//   * truncate + recompute: batched rows appended then rolled back and
+//     rewritten by a later forward (the draft-loop rejection path).
+static void test_batched_forward_range_parity_device() {
+  ModelConfig model;
+  model.num_layers = 2;
+  model.hidden_size = 128;
+  model.intermediate_size = 96;
+  model.num_attention_heads = 4;
+  model.num_key_value_heads = 2;
+  model.head_dim = 32;
+  model.vocab_size = 512;
+  model.max_context_length = 131072;
+  ForwardSpec spec;  // defaults
+
+  const int L = static_cast<int>(model.num_layers);
+  const int H = static_cast<int>(model.hidden_size);
+  const int I = static_cast<int>(model.intermediate_size);
+  const int Hq = static_cast<int>(model.num_attention_heads);
+  const int Hk = static_cast<int>(model.num_key_value_heads);
+  const int d = static_cast<int>(model.head_dim);
+  const int V = static_cast<int>(model.vocab_size);
+  const int max_pos = 32;
+  const int seq_len = 13;
+
+  const GpuWeightsLayout lay{H, I, V, L, Hq, Hk, d};
+  Xorshift64 rng(0xF0F0);
+  auto gen_bf16v = [&]() { return gen_bf16(rng); };
+  auto gen_fp8 = [&]() { return fp8_e4m3_encode(rng.next_float_range(2.0), nullptr); };
+
+  // Packed host weights in GpuWeightsLayout order.
+  std::vector<std::uint8_t> weights(lay.total_bytes());
+  auto fill_bf16 = [&](std::size_t off, std::size_t elems) {
+    for (std::size_t i = 0; i < elems; ++i) {
+      std::uint16_t v = gen_bf16v();
+      weights[off + 2 * i] = static_cast<std::uint8_t>(v & 0xffu);
+      weights[off + 2 * i + 1] = static_cast<std::uint8_t>(v >> 8);
+    }
+  };
+  auto fill_fp8 = [&](std::size_t off, std::size_t elems) {
+    for (std::size_t i = 0; i < elems; ++i) weights[off + i] = gen_fp8();
+  };
+  // embedding
+  fill_bf16(0, static_cast<std::size_t>(V) * H);
+  for (int layer = 0; layer < L; ++layer) {
+    const std::size_t base =
+        lay.embed_bytes() + static_cast<std::size_t>(layer) * lay.layer_bytes();
+    fill_bf16(base + lay.off_attn_norm(), H);
+    fill_bf16(base + lay.off_ffn_norm(), H);
+    fill_fp8(base + lay.off_q(), static_cast<std::size_t>(H) * H);
+    fill_fp8(base + lay.off_k(), static_cast<std::size_t>(Hk) * d * H);
+    fill_fp8(base + lay.off_v(), static_cast<std::size_t>(Hk) * d * H);
+    fill_fp8(base + lay.off_o(), static_cast<std::size_t>(H) * H);
+    fill_fp8(base + lay.off_gate(), static_cast<std::size_t>(I) * H);
+    fill_fp8(base + lay.off_up(), static_cast<std::size_t>(I) * H);
+    fill_fp8(base + lay.off_down(), static_cast<std::size_t>(H) * I);
+  }
+  fill_bf16(lay.final_norm_off(), H);
+  fill_fp8(lay.lm_head_off(), static_cast<std::size_t>(V) * H);
+  std::vector<float> scales(lay.num_scales());
+  for (auto& s : scales) s = 0.1f + 0.9f * rng.next_float_range(1.0);
+
+  // Token sequence (ids < V).
+  std::vector<std::int32_t> tokens(seq_len);
+  for (int i = 0; i < seq_len; ++i) tokens[i] = (i * 97 + 13) % V;
+
+  std::int32_t* d_tokens;
+  if (cudaMalloc(&d_tokens, seq_len * sizeof(std::int32_t)) != cudaSuccess) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(d_tokens, tokens.data(), seq_len * sizeof(std::int32_t),
+                        cudaMemcpyHostToDevice));
+
+  // The per-position loop is the reference; the batched suffix forward is
+  // what the draft-verify loop relies on. G4_BATCH_VERIFY is read at forward
+  // time and is toggled around each forward in the step loop below.
+  GpuCtx* ref_ctx = gpu_ctx_create(model, spec, max_pos);
+  expect(ref_ctx != nullptr, "parity: ref ctx created");
+  char err[256];
+  if (ref_ctx != nullptr)
+    expect(gpu_weights_load(ref_ctx, weights.data(), weights.size(),
+                            scales.data(), scales.size(), err, sizeof(err)) == 0,
+           "parity: ref weights loaded");
+  GpuCtx* batch_ctx = gpu_ctx_create(model, spec, max_pos);
+  expect(batch_ctx != nullptr, "parity: batch ctx created");
+  if (batch_ctx != nullptr)
+    expect(gpu_weights_load(batch_ctx, weights.data(), weights.size(),
+                            scales.data(), scales.size(), err, sizeof(err)) == 0,
+           "parity: batch weights loaded");
+  if (ref_ctx == nullptr || batch_ctx == nullptr) {
+    gpu_ctx_free(ref_ctx);
+    gpu_ctx_free(batch_ctx);
+    cudaFree(d_tokens);
+    return;
+  }
+
+  std::uint16_t* d_logits;
+  if (cudaMalloc(&d_logits, static_cast<std::size_t>(max_pos) * V * 2) != cudaSuccess) {
+    ++g_failures;
+    gpu_ctx_free(ref_ctx);
+    gpu_ctx_free(batch_ctx);
+    cudaFree(d_tokens);
+    return;
+  }
+
+  // Step plan mirroring the draft loop: a long single-token prefill (end 3,
+  // the watermark the verify loop starts from), then incremental suffix
+  // forwards of widths 4, 3, 2 (end 7, 10, 12) - the batched widths - with a
+  // final rows==1 decode (end 13) that stays on the per-position path in both
+  // ctxs. Both ctxs share one d_logits buffer, so capture each step's fresh
+  // rows immediately after the forward that wrote them (before the other ctx
+  // overwrites them).
+  const int ends[5] = {3, 7, 10, 12, 13};
+  std::vector<std::uint16_t> ref_rows, batch_rows;  // accumulated logit rows
+  for (int e = 0; e < 5; ++e) {
+    const int end = ends[e];
+    const int prev = e > 0 ? ends[e - 1] : 0;
+    const std::size_t rows = static_cast<std::size_t>(end - prev) * V;
+    std::vector<std::uint16_t> chunk(rows);
+    // G4_BATCH_VERIFY is read at forward time (forward_range_impl), so
+    // toggle it per call: '0' forces the per-position loop for the ref ctx.
+    setenv("G4_BATCH_VERIFY", "0", 1);
+    const bool ref_ok =
+        gpu_forward_range(ref_ctx, d_tokens, end, d_logits, err, sizeof(err)) == 0;
+    expect(ref_ok, "parity: ref forward step");
+    if (ref_ok && rows > 0) {
+      CUDA_CHECK(cudaMemcpy(chunk.data(), d_logits + prev * V, rows * 2,
+                            cudaMemcpyDeviceToHost));
+      ref_rows.insert(ref_rows.end(), chunk.begin(), chunk.end());
+    }
+    // Back to the default (batched) for the batch ctx.
+    unsetenv("G4_BATCH_VERIFY");
+    const bool batch_ok =
+        gpu_forward_range(batch_ctx, d_tokens, end, d_logits, err, sizeof(err)) == 0;
+    expect(batch_ok, "parity: batch forward step");
+    if (batch_ok && rows > 0) {
+      CUDA_CHECK(cudaMemcpy(chunk.data(), d_logits + prev * V, rows * 2,
+                            cudaMemcpyDeviceToHost));
+      batch_rows.insert(batch_rows.end(), chunk.begin(), chunk.end());
+    }
+  }
+
+  // The batched suffix forwards (widths 4, 3, 2) must reproduce the
+  // per-position loop's logits. Most primitives are bit-identical (same
+  // embed / rmsnorm kernel, same RoPE formula, same row_gemm_resid kernel,
+  // bit-identical fused GQA), but the batched QKV-dequant and fused-K
+  // verify_gemv are each 2-ULP-tolerant vs their single-token counterparts
+  // (see test_batched_qkv_parity_device,
+  // test_verify_gemv_production_parity_device), and that tolerance
+  // compounds across layers. A *structural* defect (wrong position, KV row,
+  // or scale) shows up as thousands of ULP, so a generous band still catches
+  // it. The invariant the draft-verify loop actually relies on - a stable
+  // greedy argmax - is asserted separately and is the decisive check.
+  constexpr int kUlpTol = 32;
+  expect(ref_rows.size() == batch_rows.size(), "parity: row counts match");
+  if (ref_rows.size() == batch_rows.size()) {
+    std::size_t bad = 0, bad_argmax = 0;
+    const int ulp = kUlpTol;
+    auto argmax = [](const std::uint16_t* p, int V) {
+      int bi = 0; float bv = -std::numeric_limits<float>::infinity();
+      for (int i = 0; i < V; ++i) {
+        const float f = bf16_to_f32_host(p[i]);
+        if (f > bv || (f == bv && i < bi)) { bv = f; bi = i; }
+      }
+      return bi;
+    };
+    for (int r = 0; r < static_cast<int>(ref_rows.size() / V); ++r) {
+      const std::uint16_t* a = ref_rows.data() + static_cast<std::size_t>(r) * V;
+      const std::uint16_t* b = batch_rows.data() + static_cast<std::size_t>(r) * V;
+      for (int i = 0; i < V; ++i)
+        if (!bf16_close(a[i], b[i], ulp)) ++bad;
+      if (argmax(a, V) != argmax(b, V)) ++bad_argmax;
+    }
+    expect(bad == 0, "parity: batched suffix forward within ULP of per-position");
+    expect(bad_argmax == 0,
+           "parity: greedy argmax stable (batched vs per-position)");
+  }
+
+  // Rollback: drop the KV rows [10, 13) the previous step wrote and
+  // re-forward [10, 12) - the batch ctx takes the batched path again
+  // (rows == 2), overwriting its stale KV, exactly the draft-loop rejection
+  // sequence. Then roll back further (to 9) and re-forward the width-3
+  // suffix [9, 12) the same way.
+  expect(gpu_ctx_truncate(ref_ctx, 10) == 0, "parity: ref truncate to 10");
+  expect(gpu_ctx_truncate(batch_ctx, 10) == 0, "parity: batch truncate to 10");
+  std::vector<std::uint16_t> ref_redo(2 * V), batch_redo(2 * V);
+  setenv("G4_BATCH_VERIFY", "0", 1);
+  expect(gpu_forward_range(ref_ctx, d_tokens, 12, d_logits, err, sizeof(err)) == 0,
+         "parity: ref recompute to 12");
+  unsetenv("G4_BATCH_VERIFY");
+  expect(gpu_forward_range(batch_ctx, d_tokens, 12, d_logits, err, sizeof(err)) == 0,
+         "parity: batch recompute to 12");
+  CUDA_CHECK(cudaMemcpy(ref_redo.data(), d_logits + 10 * V, 2 * V * 2,
+                         cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(batch_redo.data(), d_logits + 10 * V, 2 * V * 2,
+                         cudaMemcpyDeviceToHost));
+  {
+    int bad = 0;
+    for (int i = 0; i < 2 * V; ++i)
+      if (!bf16_close(ref_redo[i], batch_redo[i], kUlpTol)) ++bad;
+    expect(bad == 0,
+           "parity: truncate + batched recompute (width 2) within ULP");
+  }
+  expect(gpu_ctx_truncate(ref_ctx, 9) == 0, "parity: ref truncate to 9");
+  expect(gpu_ctx_truncate(batch_ctx, 9) == 0, "parity: batch truncate to 9");
+  setenv("G4_BATCH_VERIFY", "0", 1);
+  expect(gpu_forward_range(ref_ctx, d_tokens, 12, d_logits, err, sizeof(err)) == 0,
+         "parity: ref recompute to 12 (width 3)");
+  unsetenv("G4_BATCH_VERIFY");
+  expect(gpu_forward_range(batch_ctx, d_tokens, 12, d_logits, err, sizeof(err)) == 0,
+         "parity: batch recompute to 12 (width 3)");
+  CUDA_CHECK(cudaMemcpy(ref_redo.data(), d_logits + 10 * V, 2 * V * 2,
+                         cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(batch_redo.data(), d_logits + 10 * V, 2 * V * 2,
+                         cudaMemcpyDeviceToHost));
+  {
+    int bad = 0;
+    for (int i = 0; i < 2 * V; ++i)
+      if (!bf16_close(ref_redo[i], batch_redo[i], kUlpTol)) ++bad;
+    expect(bad == 0,
+           "parity: truncate + batched recompute (width 3) within ULP");
+  }
+
+  expect(gpu_ctx_written(ref_ctx) == 12, "parity: ref watermark");
+  expect(gpu_ctx_written(batch_ctx) == 12, "parity: batch watermark");
+
+  cudaFree(d_logits);
+  cudaFree(d_tokens);
+  gpu_ctx_free(ref_ctx);
+  gpu_ctx_free(batch_ctx);
+}
+
 int main() {
   int n = 0;
   if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -1194,6 +1438,7 @@ int main() {
   test_batched_silu_gate_up_device();
   test_batched_rmsnorm_device();
   test_batched_rope_device();
+  test_batched_forward_range_parity_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();

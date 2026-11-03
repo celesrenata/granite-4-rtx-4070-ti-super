@@ -41,6 +41,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <climits>
 
@@ -539,6 +540,14 @@ int granite4_kernel_silu_gate_up_batched(
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out);
+int granite4_kernel_rmsnorm_batched(const std::uint16_t* d_x,
+                                    const std::uint16_t* d_w, float eps, int rows,
+                                    int cols, std::uint16_t* d_out);
+int granite4_kernel_row_gemm_resid_dequant(const std::uint16_t* d_a,
+                                           const std::uint8_t* d_B, float scale,
+                                           const std::uint16_t* d_residual,
+                                           float residual_scale, int tokens, int N, int K,
+                                           std::uint16_t* d_out);
 }  // extern "C"
 
 #define G4_CUDA_CHECK(expr)                                                   \
@@ -569,6 +578,7 @@ struct GpuCtx {
   std::uint16_t* logits_scratch = nullptr;  // [Hq][max_pos] (fallback path)
   std::uint16_t* probs_scratch = nullptr;   // [Hq][max_pos] (fallback path)
   std::uint16_t* scratch = nullptr;
+  std::uint16_t* scratch_batched = nullptr;  // token-major [4 rows][...], batched verify forward
   bool gqa_fusable = true;  // fused GQA fits in the default smem limit
   bool direct_kv = false;   // A/B: fused GQA indexes the persistent cache
 
@@ -657,16 +667,38 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
     return nullptr;
   }
 
+  // Batched verify scratch: token-major [rows][...] for rows <= kMaxVerifyRows.
+  // Per row: hidden(H) + normed(H) + normed2(H) + qf(Hq*d) + k_new(Hk*d)
+  //          + v_new(Hk*d) + qf_rot(Hq*d) + k_new_rot(Hk*d) + attn_out(Hq*d)
+  //          + gate_out(I) = 3*H + 3*(Hq*d) + 3*(Hk*d) + I.
+  constexpr int kMaxVerifyRows = 4;
+  std::size_t scratch_batched_elems = 0;
+  if (!checked_mul(static_cast<std::size_t>(g->H), 3, &term) ||
+      !checked_add(term, static_cast<std::size_t>(g->I), &term) ||
+      !checked_mul(static_cast<std::size_t>(g->Hq), static_cast<std::size_t>(g->d), &scratch_batched_elems) ||
+      !checked_mul(scratch_batched_elems, 3, &scratch_batched_elems) ||
+      !checked_add(term, scratch_batched_elems, &term) ||
+      !checked_mul(static_cast<std::size_t>(g->Hk), static_cast<std::size_t>(g->d), &scratch_batched_elems) ||
+      !checked_mul(scratch_batched_elems, 3, &scratch_batched_elems) ||
+      !checked_add(term, scratch_batched_elems, &term) ||
+      !checked_mul(term, kMaxVerifyRows, &scratch_batched_elems)) {
+    delete g;
+    return nullptr;
+  }
+
   std::size_t kv_bytes = 0;
   std::size_t compact_bytes = 0;
   std::size_t token_scratch_elems = 0;
   std::size_t token_scratch_bytes = 0;
+  std::size_t scratch_batched_bytes = 0;
   if (!checked_mul(kv_elems, sizeof(std::uint16_t), &kv_bytes) ||
       !checked_mul(compact_elems, sizeof(std::uint16_t), &compact_bytes) ||
       !checked_mul(static_cast<std::size_t>(g->Hq),
                    static_cast<std::size_t>(max_positions), &token_scratch_elems) ||
       !checked_mul(token_scratch_elems, sizeof(std::uint16_t), &token_scratch_bytes) ||
-      !checked_mul(scratch_elems, sizeof(std::uint16_t), &term)) {
+      !checked_mul(scratch_elems, sizeof(std::uint16_t), &term) ||
+      !checked_mul(scratch_batched_elems, sizeof(std::uint16_t),
+                   &scratch_batched_bytes)) {
     delete g;
     return nullptr;
   }
@@ -678,6 +710,7 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
   if (e == cudaSuccess) e = cudaMalloc(&g->logits_scratch, token_scratch_bytes);
   if (e == cudaSuccess) e = cudaMalloc(&g->probs_scratch, token_scratch_bytes);
   if (e == cudaSuccess) e = cudaMalloc(&g->scratch, term);
+  if (e == cudaSuccess) e = cudaMalloc(&g->scratch_batched, scratch_batched_bytes);
   // Fused decode GQA keeps [q row + logits + probs] in shared memory:
   // d + 2*max_positions bf16 elements. The default per-block limit is 48 KiB
   // (no attribute bump); beyond it the 3-kernel scratch path runs.
@@ -727,6 +760,7 @@ void gpu_ctx_free(GpuCtx* ctx) {
   cudaFree(ctx->logits_scratch);
   cudaFree(ctx->probs_scratch);
   cudaFree(ctx->scratch);
+  cudaFree(ctx->scratch_batched);
   cudaFree(ctx->cos_tbl);
   cudaFree(ctx->sin_tbl);
   gpu_weights_free(ctx);
@@ -734,6 +768,182 @@ void gpu_ctx_free(GpuCtx* ctx) {
 }
 
 namespace {
+
+// Fused-K lm_head GEMV (verify_gemv.cu): streams each FP8 weight row once
+// while accumulating up to 4 activation rows, so each token's logits are
+// bit-identical to the single-token row_gemm_dequant. Declared here because it
+// is a standalone TU linked into the same library (no shared header).
+extern "C" int granite4_verify_gemv(const std::uint16_t* d_a,
+                                    const std::uint8_t* d_b, float scale,
+                                    int tokens, int rows, int k,
+                                    std::uint16_t* d_c);
+
+// Batched suffix forward: runs positions [start, end) as one token-major batch
+// of rows = end - start rows (2..4) using the device-verified batched
+// primitives. When the per-position loop takes the direct fused-attention
+// branch (g->direct_kv && g->gqa_fusable) it reads the same persistent KV rows
+// the batched path writes, so the two are numerically equivalent: the batched
+// GQA stage is bit-identical to its single-token twin, and the batched QKV
+// dequant, O/down residual GEMV, SiLU, and fused-K lm_head GEMV are each
+// within 2 ULP of their single-token counterparts (see test_kernels.cu).
+// Greedy argmax is stable across the two paths in practice; that invariant is
+// what the draft-verify loop relies on. It appends the same KV rows
+// [start, end) to the persistent cache and advances g->written identically, so
+// the draft loop's watermark/rollback semantics are unchanged. Returns 0 on
+// success; -1 (with error) if the direct fused branch is inactive - the caller
+// then falls back to the per-position loop.
+int forward_range_batched_impl(GpuCtx* g, const std::int32_t* d_tokens,
+                               int start, int end, std::uint16_t* d_logits,
+                               char* error, std::size_t error_size) {
+  cudaEvent_t ev0 = nullptr, ev1 = nullptr;  // G4_TIMESTEP timing
+  auto seterr = [&](const char* what) {
+    if (ev0 != nullptr) {
+      cudaEventDestroy(ev0);
+      cudaEventDestroy(ev1);
+    }
+    if (error != nullptr && error_size > 0)
+      std::snprintf(error, error_size, "%s", what);
+    return -1;
+  };
+  if (g == nullptr || d_tokens == nullptr || d_logits == nullptr)
+    return seterr("invalid forward arguments");
+  const int rows = end - start;
+  const int L = g->L, H = g->H, I = g->I, Hq = g->Hq, Hk = g->Hk;
+  const int d = g->d, V = g->V, max_pos = g->max_pos;
+  const int half = d / 2;
+  const float rms_eps = g->spec.rms_norm_eps;
+  const float att_scale = g->spec.attention_multiplier;
+  const float resid_scale = g->spec.residual_multiplier;
+  const float emb_scale = g->spec.embedding_multiplier;
+  const float logits_scale = g->spec.logits_scaling;
+  const GpuWeightsLayout lay{H, I, V, L, Hq, Hk, d};
+  if (rows < 2 || rows > 4) return seterr("batched width out of range");
+  if (start < 0 || end <= start || end > max_pos) return seterr("invalid range");
+  if (!std::isfinite(rms_eps) || rms_eps <= 0.0f ||
+      !std::isfinite(att_scale) || !std::isfinite(resid_scale) ||
+      !std::isfinite(emb_scale) || !std::isfinite(logits_scale))
+    return seterr("invalid forward scales");
+  if (g->weights == nullptr || g->scales == nullptr)
+    return seterr("weights not loaded (call gpu_weights_load first)");
+  // The batched attention stage reads the persistent cache directly; the
+  // per-position loop takes that branch exactly when direct_kv && gqa_fusable.
+  if (!g->direct_kv || !g->gqa_fusable)
+    return seterr("batched path unavailable");
+  if (g->scratch_batched == nullptr) return seterr("batched scratch missing");
+
+  // G4_TIMESTEP=1 timing (the per-bucket breakdown is single-token-only).
+  const char* const ts_env = std::getenv("G4_TIMESTEP");
+  if (ts_env != nullptr) {
+    if (cudaEventCreate(&ev0) != cudaSuccess ||
+        cudaEventCreate(&ev1) != cudaSuccess)
+      return seterr("cudaEventCreate failed");
+    G4_CUDA_CHECK(cudaEventRecord(ev0));
+  }
+
+  // Token-major scratch for `rows` rows (allocated at ctx create time).
+  const std::size_t nq = static_cast<std::size_t>(Hq) * d;
+  const std::size_t nk = static_cast<std::size_t>(Hk) * d;
+  std::uint16_t* const sb = g->scratch_batched;
+  std::uint16_t* const d_hidden = sb;              // [rows][H]
+  std::uint16_t* const d_normed = d_hidden + rows * H;
+  std::uint16_t* const d_normed2 = d_normed + rows * H;
+  std::uint16_t* const d_qf = d_normed2 + rows * H;
+  std::uint16_t* const d_k_new = d_qf + rows * nq;
+  std::uint16_t* const d_v_new = d_k_new + rows * nk;
+  std::uint16_t* const d_qf_rot = d_v_new + rows * nk;
+  std::uint16_t* const d_k_new_rot = d_qf_rot + rows * nq;
+  std::uint16_t* const d_attn_out = d_k_new_rot + rows * nk;
+  std::uint16_t* const d_gate_out = d_attn_out + rows * nq;
+
+  const std::uint16_t* const d_embed_tbl =
+      reinterpret_cast<const std::uint16_t*>(g->weights);
+
+  // Embedding: one row per position (rows <= 4 small launches), token-major.
+  for (int r = 0; r < rows; ++r) {
+    const int t = start + r;
+    embed_kernel<<<(H + 255) / 256, 256>>>(
+        d_tokens, d_embed_tbl, t, emb_scale, d_hidden + static_cast<std::size_t>(r) * H,
+        H);
+    G4_CUDA_CHECK(cudaGetLastError());
+  }
+
+  for (int layer = 0; layer < L; ++layer) {
+    const std::size_t lay_off =
+        lay.embed_bytes() + static_cast<std::size_t>(layer) * lay.layer_bytes();
+    const std::uint16_t* const attn_norm =
+        reinterpret_cast<const std::uint16_t*>(g->weights + lay_off);
+    const std::uint16_t* const ffn_norm = attn_norm + H;
+    const std::uint8_t* const wq = g->weights + lay_off + lay.off_q();
+    const std::uint8_t* const wk = g->weights + lay_off + lay.off_k();
+    const std::uint8_t* const wv = g->weights + lay_off + lay.off_v();
+    const std::uint8_t* const wo = g->weights + lay_off + lay.off_o();
+    const std::uint8_t* const wg = g->weights + lay_off + lay.off_gate();
+    const std::uint8_t* const wu = g->weights + lay_off + lay.off_up();
+    const std::uint8_t* const wd = g->weights + lay_off + lay.off_down();
+    const float* const sl =
+        g->scales + static_cast<std::size_t>(layer) * kGpuScalesPerLayer;
+    const std::size_t kv_layer = static_cast<std::size_t>(layer) * Hk * max_pos * d;
+
+    // ---- attention block (causal, all rows at once) ----
+    if (granite4_kernel_rmsnorm_batched(d_hidden, attn_norm, rms_eps, rows, H,
+                                        d_normed) != 0)
+      return seterr("rmsnorm (attention) failed");
+    // QKV dequant + position-aware RoPE + persistent KV append + causal GQA,
+    // one fused pass over the whole batch (row r attends to [0, start+r+1)).
+    if (gpu_verify_attention_layer_batched(
+            d_normed, wq, wk, wv, sl[0], sl[1], sl[2],
+            g->cos_tbl + static_cast<std::size_t>(start) * half,
+            g->sin_tbl + static_cast<std::size_t>(start) * half, att_scale, start,
+            rows, Hq, Hk, d, H, max_pos, d_qf, d_k_new, d_v_new, d_qf_rot,
+            d_k_new_rot, g->kv_k + kv_layer, g->kv_v + kv_layer, d_attn_out) != 0)
+      return seterr("attention failed");
+    // O projection + residual (in-place into d_hidden).
+    if (granite4_kernel_row_gemm_resid_dequant(d_attn_out, wo, sl[3], d_hidden,
+                                               resid_scale, rows, H, H,
+                                               d_hidden) != 0)
+      return seterr("o projection failed");
+
+    // ---- FFN block ----
+    if (granite4_kernel_rmsnorm_batched(d_hidden, ffn_norm, rms_eps, rows, H,
+                                        d_normed2) != 0)
+      return seterr("rmsnorm (ffn) failed");
+    if (granite4_kernel_silu_gate_up_batched(wg, wu, d_normed2, sl[4], sl[5], I, H,
+                                             rows, d_gate_out) != 0)
+      return seterr("silu_gate_up failed");
+    // down projection + residual (in-place into d_hidden).
+    if (granite4_kernel_row_gemm_resid_dequant(d_gate_out, wd, sl[6], d_hidden,
+                                               resid_scale, rows, H, I,
+                                               d_hidden) != 0)
+      return seterr("down projection failed");
+  }
+
+  // ---------- final RMSNorm + lm_head (fused-K, all rows) ----------
+  const std::uint16_t* const d_final_norm =
+      reinterpret_cast<const std::uint16_t*>(g->weights + lay.final_norm_off());
+  const std::uint8_t* const d_lm_head = g->weights + lay.lm_head_off();
+  const float lm_scale = g->scales[L * kGpuScalesPerLayer] * logits_scale;
+  if (granite4_kernel_rmsnorm_batched(d_hidden, d_final_norm, rms_eps, rows, H,
+                                      d_normed) != 0)
+    return seterr("final rmsnorm failed");
+  if (granite4_verify_gemv(d_normed, d_lm_head, lm_scale, rows, V, H,
+                           d_logits + static_cast<std::size_t>(start) * V) != 0)
+    return seterr("lm_head failed");
+
+  if (ev0 != nullptr) {
+    G4_CUDA_CHECK(cudaEventRecord(ev1));
+    G4_CUDA_CHECK(cudaEventSynchronize(ev1));
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev0, ev1);
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    std::fprintf(stderr,
+                 "G4_TIMESTEP end=%d start=%d gpu_ms=%.2f (batched rows=%d)\n",
+                 end, start, ms, rows);
+  }
+
+  if (end > g->written) g->written = end;
+  return 0;
+}
 
 // The forward for positions [start, end), where start = min(g->written, end):
 // positions below start already have their KV entries cached and are skipped
@@ -781,6 +991,30 @@ int forward_range_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
   // sequence per ctx.) If end <= written the call recomputes the whole
   // prefix (KV appends are idempotent), so start = 0 then.
   const int start = (end > g->written) ? g->written : 0;
+
+  // Speculative-verify speedup: a short new suffix (2-4 rows) under the
+  // direct fused-attention branch is forwarded in one token-major batch,
+  // numerically equivalent to the per-position loop below (each batched
+  // primitive is device-verified against its single-token twin; the batched
+  // GQA stage is bit-identical, the others within a few ULP, and greedy
+  // argmax is stable - see test_batched_forward_range_parity_device).
+  // Single-row decode (rows == 1) stays on the per-position path: it is
+  // already optimal and the batched attention stage costs one extra RoPE
+  // launch at rows == 1. Longer suffixes (prefill / replay, rows > 4) must
+  // use the loop. If the batched forward fails, fall through to the loop,
+  // which recomputes from the embedding and re-appends the same KV rows
+  // idempotently.
+  const int batch_rows = end - start;
+  // G4_BATCH_VERIFY=0 forces the per-position loop (A/B + parity testing);
+  // default (unset or '1') enables the batched suffix forward.
+  const char* const bv_env = std::getenv("G4_BATCH_VERIFY");
+  const bool batch_enabled = bv_env == nullptr || bv_env[0] == '1';
+  if (batch_enabled && batch_rows >= 2 && batch_rows <= 4 && g->direct_kv &&
+      g->gqa_fusable && g->scratch_batched != nullptr) {
+    const int rc = forward_range_batched_impl(g, d_tokens, start, end, d_logits,
+                                              error, error_size);
+    if (rc == 0) return 0;
+  }
 
   // Optional per-call GPU timing: G4_TIMESTEP=1 prints the device-side
   // duration of this call; G4_TIMESTEP=2 additionally prints a per-bucket
