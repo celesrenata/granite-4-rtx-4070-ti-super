@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <string>
 #include <vector>
 
 namespace granite4 {
@@ -61,6 +62,30 @@ struct CommitPlan {
 CommitPlan commit_speculative(const VerifyResult& v,
                               const std::int32_t* draft, int K,
                               std::int32_t bonus, int budget);
+
+// Cumulative draft-lookup counters over a `generate --draft-lookup` run.
+// `proposed` counts every token the drafter proposed; `accepted` counts the
+// ones the gate kept; `steps` counts verification rounds.
+struct DraftReport {
+  long steps = 0;
+  long proposed = 0;
+  long accepted = 0;
+};
+
+// `accepted / proposed` (0.0 when nothing was proposed).
+inline double draft_accept_rate(const DraftReport& r) {
+  return r.proposed > 0
+             ? static_cast<double>(r.accepted) / static_cast<double>(r.proposed)
+             : 0.0;
+}
+
+// Assemble the `generate` stdout JSON document: the produced token ids
+// followed, when `report` is non-null, by the draft-verify counters
+// (`{"generated":[...],"draft":{"steps":S,"proposed":P,"accepted":A,
+// "accept_rate":R}}`). One canonical producer so the CUDA and host emit sites
+// stay in lockstep; the exact shape is pinned by a unit test.
+std::string generate_document(const std::vector<std::int32_t>& generated,
+                              const DraftReport* report);
 
 }  // namespace granite4
 

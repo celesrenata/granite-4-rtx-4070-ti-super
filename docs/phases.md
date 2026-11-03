@@ -328,7 +328,11 @@ last two are additionally token-identical end-to-end):
    the longest repeated suffix (≥2 tokens), then verifies each proposal
    against the target's greedy argmax one position at a time. It carries no
    weights and no extra VRAM, and emits `G4_DRAFT steps=... proposed=...
-   accepted=... rate=...`. Measured on `gremlin-1` with a 24-token budget
+   accepted=... rate=...` on stderr, and mirrors the same counters in the stdout
+   JSON (`{"generated":[...],"draft":{"steps":S,"proposed":P,"accepted":A,
+   "accept_rate":R}}`) so a benchmark harness parses one document; that shape
+   is produced by the unit-tested `generate_document` in `speculative_verify`.
+   Measured on `gremlin-1` with a 24-token budget
    and K=4: repeated text/list 7/8 accepted (0.875) in 16 steps, repeated
    Python code 13/17 (0.765) in 9 steps, repeated JSON 11/12 (0.917) in 12
    steps; ordinary chat produced no proposals (0/0) because the suffix never

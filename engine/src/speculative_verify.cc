@@ -1,6 +1,7 @@
 #include "speculative_verify.h"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace granite4 {
 
@@ -36,6 +37,27 @@ CommitPlan commit_speculative(const VerifyResult& v,
     plan.tokens.push_back(static_cast<std::int32_t>(tok));
   }
   return plan;
+}
+
+std::string generate_document(const std::vector<std::int32_t>& generated,
+                              const DraftReport* report) {
+  std::string doc = "{\"generated\":[";
+  for (std::size_t i = 0; i < generated.size(); ++i) {
+    if (i) doc += ",";
+    doc += std::to_string(generated[i]);
+  }
+  if (report != nullptr) {
+    char rate[32];
+    std::snprintf(rate, sizeof(rate), "%.9g", draft_accept_rate(*report));
+    doc +=
+        "],\"draft\":{\"steps\":" + std::to_string(report->steps) +
+        ",\"proposed\":" + std::to_string(report->proposed) +
+        ",\"accepted\":" + std::to_string(report->accepted) +
+        ",\"accept_rate\":" + rate + "}";
+  } else {
+    doc += "]";
+  }
+  return doc + "}\n";
 }
 
 }  // namespace granite4

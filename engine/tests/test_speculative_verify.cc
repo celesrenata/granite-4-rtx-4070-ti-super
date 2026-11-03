@@ -8,6 +8,8 @@
 #include "speculative_verify.h"
 
 #include <cstdio>
+#include <string>
+#include <vector>
 
 namespace gv = granite4;
 
@@ -124,12 +126,49 @@ bool run_commit_case(const CommitCase& c) {
   return true;
 }
 
+// Pin the exact shape of the `generate` stdout document a benchmark harness
+// parses. `generate_document` is the single producer for both the CUDA and
+// host emit sites, so a change here is a contract change.
+struct DocCase {
+  const char* name;
+  std::vector<std::int32_t> generated;
+  const gv::DraftReport* report;  // null -> no draft key
+  const char* want;
+};
+
+bool run_doc_case(const DocCase& c) {
+  const std::string got = gv::generate_document(c.generated, c.report);
+  if (got != c.want) {
+    std::fprintf(stderr, "FAIL(doc) %s:\n got: %s\n want: %s", c.name,
+                 got.c_str(), c.want);
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int main() {
   bool ok = true;
   for (const auto& c : kCases) ok = run_case(c) && ok;
   for (const auto& c : kCommitCases) ok = run_commit_case(c) && ok;
+
+  // The `generate` stdout document contract (both emit sites share this
+  // producer). Null report -> no draft key; non-null -> the counters.
+  const gv::DraftReport empty = {0, 0, 0};
+  const gv::DraftReport some = {16, 12, 8};
+  const DocCase kDocCases[] = {
+      {"no report", {7, 9, 3}, nullptr,
+       "{\"generated\":[7,9,3]}\n"},
+      {"empty generated, no report", {}, nullptr, "{\"generated\":[]}\n"},
+      {"report, zero proposed", {7, 9}, &empty,
+       "{\"generated\":[7,9],\"draft\":{\"steps\":0,\"proposed\":0,"
+       "\"accepted\":0,\"accept_rate\":0}}\n"},
+      {"report, rate 2/3", {7, 9, 3}, &some,
+       "{\"generated\":[7,9,3],\"draft\":{\"steps\":16,\"proposed\":12,"
+       "\"accepted\":8,\"accept_rate\":0.666666667}}\n"},
+  };
+  for (const auto& c : kDocCases) ok = run_doc_case(c) && ok;
 
   // K=0 degenerate case: nothing to verify, no correction.
   {

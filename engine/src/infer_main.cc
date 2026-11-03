@@ -22,12 +22,14 @@
 //     `--draft-lookup K` (greedy only) proposes up to K repeated spans from
 //     the token history, verifies each proposal against the target's greedy
 //     argmax one position at a time, and commits the accepted prefix. It
-//     prints `G4_DRAFT steps=... proposed=... accepted=...` to stderr so the
-//     acceptance rate can be measured before the fused k-token verify path
-//     is integrated. Works on the CUDA path (draft-verify against the
-//     device logits) and on the host oracle path (draft-verify against the
-//     f32 host logits); each step replays the full accepted prefix because
-//     the host oracle has no incremental KV watermark.
+//     reports `G4_DRAFT steps=... proposed=... accepted=...` to stderr, and
+//     echoes the same counters in the stdout JSON as
+//     `{"generated":[...],"draft":{"steps":S,"proposed":P,"accepted":A,
+//     "accept_rate":R}}` so a benchmark harness can parse one document.
+//     Works on the CUDA path (draft-verify against the device logits) and on
+//     the host oracle path (draft-verify against the f32 host logits); each
+//     step replays the full accepted prefix because the host oracle has no
+//     incremental KV watermark.
 //
 // Tokenization is intentionally NOT done here: the checkpoint ships an HF
 // `tokenizer.json` that the Python harness loads with the `tokenizers`
@@ -450,8 +452,7 @@ int main(int argc, char** argv) {
           std::fprintf(stderr, "draft-lookup: greedy only (omit --seed)\n");
           return 2;
         }
-        long proposed_total = 0, accepted_total = 0;
-        int steps = 0;
+        DraftReport report;
         std::vector<float> row_f(V);
         std::vector<std::int32_t> target_arg;
         auto argmax_f32 = [](const float* p, int n) {
@@ -474,7 +475,7 @@ int main(int argc, char** argv) {
           const std::vector<std::int32_t> proposal =
               (k > 0) ? draft_lookup(seq, k) : std::vector<std::int32_t>();
           const int nprop = static_cast<int>(proposal.size());
-          proposed_total += nprop;
+          report.proposed += nprop;
 
           // One target forward over accepted prefix + draft proposals. The
           // rows at positions [len, len+nprop) verify each proposal; row
@@ -510,24 +511,20 @@ int main(int argc, char** argv) {
               seq.push_back(tok);
               generated.push_back(tok);
             }
-            accepted_total += v.accepted;
+            report.accepted += v.accepted;
           }
-          ++steps;
+          ++report.steps;
           session.reset();
         }
-        std::fprintf(stderr,
-                     "G4_DRAFT steps=%d proposed=%ld accepted=%ld rate=%.3f\n",
-                     steps, proposed_total, accepted_total,
-                     proposed_total > 0
-                         ? static_cast<double>(accepted_total) /
-                               static_cast<double>(proposed_total)
-                         : 0.0);
-        std::printf("{\"generated\":[");
-        for (std::size_t i = 0; i < generated.size(); ++i) {
-          if (i) std::printf(",");
-          std::printf("%d", generated[i]);
-        }
-        std::printf("]}\n");
+        const double accept_rate = draft_accept_rate(report);
+        // The stderr line stays for human/G4_-prefixed grepping; the same
+        // counters ride along in the stdout JSON so a benchmark harness can
+        // parse one document.
+        std::fprintf(stderr, "G4_DRAFT steps=%ld proposed=%ld accepted=%ld "
+                             "rate=%.3f\n",
+                     report.steps, report.proposed, report.accepted,
+                     accept_rate);
+        std::printf("%s", generate_document(generated, &report).c_str());
         return 0;
       }
 
@@ -560,12 +557,8 @@ int main(int argc, char** argv) {
           }
         }
       }
-      std::printf("{\"generated\":[");
-      for (std::size_t i = 0; i < generated.size(); ++i) {
-        if (i) std::printf(",");
-        std::printf("%d", generated[i]);
-      }
-      std::printf("]}\n");
+      // No draft path: emit the token ids only (no draft counters).
+      std::printf("%s", generate_document(generated, nullptr).c_str());
       return 0;
     }
 #endif  // GRANITE_CUDA
@@ -587,8 +580,7 @@ int main(int argc, char** argv) {
       // returns f32 logits for every position, so verification is the same
       // argmax rows; there is no KV watermark, so each step replays the whole
       // accepted prefix from position 0.
-      long proposed_total = 0, accepted_total = 0;
-      int steps = 0;
+      DraftReport report;
       const int V = static_cast<int>(w.model.vocab_size);
       auto argmax_f32 = [](const float* p, int n) {
         int best = 0;
@@ -606,7 +598,7 @@ int main(int argc, char** argv) {
         const std::vector<std::int32_t> proposal =
             (room > 0) ? draft_lookup(seq, room) : std::vector<std::int32_t>();
         const int nprop = static_cast<int>(proposal.size());
-        proposed_total += nprop;
+        report.proposed += nprop;
 
         // One target forward over accepted prefix + draft proposals. The
         // rows at positions [len, len+nprop) verify each proposal; row
@@ -637,23 +629,16 @@ int main(int argc, char** argv) {
             seq.push_back(tok);
             generated.push_back(tok);
           }
-          accepted_total += v.accepted;
+          report.accepted += v.accepted;
         }
-        ++steps;
+        ++report.steps;
       }
-      std::fprintf(stderr,
-                   "G4_DRAFT steps=%d proposed=%ld accepted=%ld rate=%.3f\n",
-                   steps, proposed_total, accepted_total,
-                   proposed_total > 0
-                       ? static_cast<double>(accepted_total) /
-                             static_cast<double>(proposed_total)
-                       : 0.0);
-      std::printf("{\"generated\":[");
-      for (std::size_t i = 0; i < generated.size(); ++i) {
-        if (i) std::printf(",");
-        std::printf("%d", generated[i]);
-      }
-      std::printf("]}\n");
+      const double accept_rate = draft_accept_rate(report);
+      std::fprintf(stderr, "G4_DRAFT steps=%ld proposed=%ld accepted=%ld "
+                           "rate=%.3f\n",
+                   report.steps, report.proposed, report.accepted,
+                   accept_rate);
+      std::printf("%s", generate_document(generated, &report).c_str());
       return 0;
     }
     for (int step = 0; step < max_tokens; ++step) {
@@ -675,12 +660,8 @@ int main(int argc, char** argv) {
       seq.push_back(next);
       generated.push_back(next);
     }
-    std::printf("{\"generated\":[");
-    for (std::size_t i = 0; i < generated.size(); ++i) {
-      if (i) std::printf(",");
-      std::printf("%d", generated[i]);
-    }
-    std::printf("]}\n");
+    // No draft path: emit the token ids only (no draft counters).
+    std::printf("%s", generate_document(generated, nullptr).c_str());
     return 0;
   }
 
