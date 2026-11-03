@@ -488,17 +488,22 @@ int main(int argc, char** argv) {
           const int nprop = static_cast<int>(proposal.size());
           report.proposed += nprop;
 
-          // One incremental target forward over the new draft rows only. The
-          // KV watermark is at `len`, so positions [0, len) are reused and rows
-          // [len, len+nprop) are computed. The anchor row (len-1) stays in
-          // `logits`. Row len-1+i is the target's greedy argmax for the (i+1)-th
-          // proposal; row len+nprop-1 is the target's own next token (the
-          // correction on rejection, the bonus on full acceptance).
-          std::vector<std::int32_t> cand(seq);
-          cand.insert(cand.end(), proposal.begin(), proposal.end());
-          if (!session.step(cand.data(), len + nprop, &logits, &err)) {
-            std::fprintf(stderr, "%s\n", err.c_str());
-            return 1;
+          // One incremental target forward over the new draft rows only. With
+          // `nprop > 0` the KV watermark is at `len`, so positions [0, len) are
+          // reused and only rows [len, len+nprop) are computed; the anchor row
+          // (len-1) stays in `logits`. Row len-1+i is the target's greedy
+          // argmax for the (i+1)-th proposal; row len+nprop-1 is the target's
+          // own next token (the correction on rejection, the bonus on full
+          // acceptance). With `nprop == 0` there is nothing to forward - the
+          // anchor row is already valid from the previous step - so the forward
+          // is skipped entirely rather than replaying the prefix.
+          if (nprop > 0) {
+            std::vector<std::int32_t> cand(seq);
+            cand.insert(cand.end(), proposal.begin(), proposal.end());
+            if (!session.step(cand.data(), len + nprop, &logits, &err)) {
+              std::fprintf(stderr, "%s\n", err.c_str());
+              return 1;
+            }
           }
           target_arg.assign(nprop + 1, 0);
           for (int i = 0; i <= nprop; ++i) {
