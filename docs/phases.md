@@ -315,13 +315,18 @@ last two are additionally token-identical end-to-end):
    80.43 ms for four single-token rounds, a 2.95× reduction; fused k=4
    effective bandwidth is 307.8 GB/s (the k=4 path is activation/latency
    bound, not at the 631.9 GB/s roofline). The device correctness test
-   passes. This is a measured primitive, not the production path: the live
-   `--draft-lookup K` path (item 13) already runs candidate generation and
-   the exact greedy accept/reject gate, and is linked into production
-   decode. The fused-k GEMV is not yet switched into that loop — the verify
-   still runs one position at a time over the full causal prefix — so its
-   2.95× GEMV reduction has not been converted into an end-to-end
-   speedup.
+   passes. The fused-k GEMV is now switched into the production path:
+   `forward_range_batched_impl` forwards a 2–4-row suffix in one
+   token-major batch (batched rmsnorm / QKV dequant + position-aware RoPE /
+   persistent KV append / fused causal GQA / O-down residual GEMV / fused-K
+   lm_head GEMV), so the verify no longer replays the prefix position by
+   position. Numerically the batched path is equivalent to the per-position
+   loop (the batched GQA stage is bit-identical; the batched QKV-dequant,
+   residual projection, and fused-K GEMV are each within 2 ULP of their
+   single-token twins, and greedy argmax is stable — see
+   `test_batched_forward_range_parity_device`); an end-to-end
+   `--draft-lookup K` speedup measurement against the per-position loop is
+   still open (item 13).
 13. **Prompt-lookup drafter with measured acceptance** — `granite4-infer
    generate --draft-lookup K` (greedy only) proposes up to K tokens by
    copying the continuation of the most recent non-overlapping occurrence of
@@ -341,10 +346,12 @@ last two are additionally token-identical end-to-end):
    token at the first mismatch (previously it was dropped and recomputed,
    which cost extra steps); consensus voting across occurrences was tried
    and measured identical acceptance, so the simpler most-recent copy is
-   kept. This is an acceptance measurement, not a throughput win: the
-   verifications still run one position at a time, so the fused-k GEMV
-   (2.95× at k=4 on the real Granite 4.2 shapes, item 12) and batched
-   causal attention/KV append are the next integration step.
+   kept. Verification is now batched: the 2–4-row suffix forward
+   (`forward_range_batched_impl`) is numerically equivalent to the
+   per-position loop (greedy argmax stable; see item 12 and
+   `test_batched_forward_range_parity_device`), but the end-to-end
+   `--draft-lookup K` speedup from that batching has not yet been measured
+   against the per-position path.
 
    Granite 4.2 chat-template prompts (rendered from the checkpoint's
    `<|im_start|>…<|im_end|>` template with `enable_thinking`, tokenized by
