@@ -182,11 +182,11 @@ def _validate_chat_request(raw: bytes) -> dict[str, Any]:
         if not isinstance(msg, dict):
             raise ApiError(400, "invalid_message", f"messages[{i}] must be an object")
         role = msg.get("role")
-        if role not in ("system", "user", "assistant"):
+        if role not in ("system", "user", "assistant", "tool"):
             raise ApiError(
                 400,
                 "invalid_role",
-                f"messages[{i}].role must be one of system|user|assistant, got {role!r}",
+                f"messages[{i}].role must be one of system|user|assistant|tool, got {role!r}",
             )
         content = msg.get("content")
         if content is not None and not isinstance(content, str):

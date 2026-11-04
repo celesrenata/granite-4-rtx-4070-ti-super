@@ -243,10 +243,27 @@ def test_non_object_message_is_400(server):
 
 
 def test_bad_role_is_400(server):
-    body = _valid_body(messages=[{"role": "tool", "content": "x"}])
+    body = _valid_body(messages=[{"role": "function", "content": "x"}])
     status, _, data = _post(server, body)
     assert status == 400
     assert _code(data) == "invalid_role"
+
+
+def test_tool_role_is_accepted(server):
+    # Agent traffic (OpenCode, Cline, ...) sends tool-role turns; the chat
+    # template renders them as  blocks.
+    body = _valid_body(
+        messages=[
+            {"role": "user", "content": "ping"},
+            {"role": "assistant", "content": "pong"},
+            {"role": "tool", "content": "tool output"},
+            {"role": "user", "content": "and now?"},
+        ]
+    )
+    status, _, data = _post(server, body)
+    assert status in (200, 501)  # 501 only when the parity gate is not loaded
+    if status == 400:
+        assert _code(data) != "invalid_role"
 
 
 def test_bad_content_type_is_400(server):

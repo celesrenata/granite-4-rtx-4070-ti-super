@@ -1,4 +1,4 @@
-"""Minimal Granite chat-template renderer for ordinary system/user turns."""
+"""Minimal Granite chat-template renderer for system/user/assistant/tool turns."""
 from __future__ import annotations
 
 from typing import Any
