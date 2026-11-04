@@ -169,6 +169,15 @@ ssh root@10.1.1.12 "curl -s -X POST 127.0.0.1:2701/v1/chat/completions \
 ssh root@10.1.1.12 'cat /var/lib/granite4-rtx/parity_report.json'   # per-position detail
 ```
 
+Full live check (25 assertions: endpoints, answers, determinism, limits,
+validation, 8 concurrent requests; stdlib only):
+
+```sh
+scp scripts/service_smoke.py root@10.1.1.12:/tmp/
+ssh root@10.1.1.12 'nix shell nixpkgs#python3 -c python3 /tmp/service_smoke.py'
+# -> 25/25 passed
+```
+
 Request limits on the GPU path: `max_tokens` defaults to 1024 and is capped
 at `maxContext - prompt_tokens`; a prompt longer than the context is a 400
 `context_length_exceeded`. Generation stops at the checkpoint's
