@@ -77,14 +77,15 @@ def reference_tokens(ckpt: str, prompt: str, max_tokens: int,
     return out
 
 
-def engine_tokens(engine: str, ckpt: str, prompt_ids: list[int], max_tokens: int) -> list[int]:
+def engine_tokens(engine: str, ckpt: str, prompt_ids: list[int], max_tokens: int,
+                  gpu: bool = False) -> list[int]:
     """Run granite4-infer generate (greedy) and parse the produced tokens."""
     toks = ",".join(map(str, prompt_ids))
-    r = subprocess.run(
-        [engine, "generate", "--checkpoint", ckpt,
-         "--tokens", toks, "--max-tokens", str(max_tokens), "--seed", "0"],
-        capture_output=True, text=True,
-    )
+    cmd = [engine, "generate", "--checkpoint", ckpt,
+           "--tokens", toks, "--max-tokens", str(max_tokens), "--seed", "0"]
+    if gpu:
+        cmd += ["--gpu", "1"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"engine failed: {r.stderr[-500:]}")
     doc = json.loads(r.stdout)
@@ -117,6 +118,9 @@ def main() -> int:
     ap.add_argument("--cache-dir", default=".gt/parity_cache")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--gpu", action="store_true",
+                    help="gate the CUDA path (generate --gpu 1); the artifact then "
+                         "tells the server to serve with --gpu 1")
     ap.add_argument("--out", help="write the full comparison report to this path")
     ap.add_argument("--gate-out", default=".gt/parity_gate.json",
                     help="write the gate-status artifact (on PASS) to this path")
@@ -142,7 +146,7 @@ def main() -> int:
                        args.cache_dir).write_text(json.dumps(ref))
 
     mine = engine_tokens(args.engine, args.checkpoint, prompt_ids,
-                         args.max_tokens)
+                         args.max_tokens, gpu=args.gpu)
     rep = compare(mine, ref)
     rep["prompt"] = args.prompt
     rep["prompt_ids"] = prompt_ids
@@ -164,6 +168,7 @@ def main() -> int:
             "matched": rep["matched"],
             "rate": rep["rate"],
             "engine": str(Path(args.engine).resolve()),
+            "gpu": args.gpu,
             "utc": __import__("datetime").datetime.now(
                 __import__("datetime").timezone.utc).isoformat(),
         }

@@ -7,18 +7,24 @@ and this module is the ONLY thing that turns that artifact into a serving
 engine. A missing, failed, or stale gate artifact leaves the server in its
 Phase-0 state (501, inference unavailable) - no partial serving.
 
-Generation shells out to the `granite4-infer` binary named by the artifact
-(`granite4-infer generate --tokens ... --max-tokens ... --seed 0`, greedy)
-and decodes the produced ids with the checkpoint's byte-level BPE tokenizer.
-Generation is bounded: `--max-tokens` (caller-requested, capped by
-MAX_COMPLETION_TOKENS) plus one stop at the checkpoint's eos_token_id.
+Generation runs the `granite4-infer` binary named by the artifact and decodes
+the produced ids with the checkpoint's byte-level BPE tokenizer. When the gate
+validated the GPU path, one persistent `granite4-infer serve --gpu 1` process
+keeps the model resident and answers every request (no per-request load);
+otherwise each request shells out to `granite4-infer generate --tokens ...
+--max-tokens ... --seed 0` (greedy, host oracle). Generation is bounded:
+`--max-tokens` (caller-requested, capped by MAX_COMPLETION_TOKENS) plus one
+stop at the checkpoint's eos_token_id, which the engine also receives
+(`--eos`) so it stops computing there.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,8 +35,14 @@ from frontend import chat_template, tokenizer
 # modest lengths, and the host forward is O(context) per step.
 MAX_COMPLETION_TOKENS = 128
 
-# A per-request timeout generous for host-side greedy decode.
+# A per-request timeout generous for host-side greedy decode (the GPU path
+# finishes MAX_COMPLETION_TOKENS in a few seconds).
 _GENERATE_TIMEOUT_S = 600
+
+# The persistent GPU engine: positions per request, and how long its one-time
+# load (checkpoint pack + upload) may take.
+SERVE_MAX_CONTEXT = 8192
+_SERVE_STARTUP_TIMEOUT_S = 600
 
 
 class ServingError(Exception):
@@ -52,6 +64,84 @@ class ServingError(Exception):
         }
 
 
+class ServeProcess:
+    """One persistent `granite4-infer serve` engine.
+
+    Requests are serialized (the engine runs one at a time). The process is
+    started on first use; a timeout, a malformed reply, or a dead process
+    kills it, and the next request starts a fresh one.
+    """
+
+    def __init__(self, cmd: list[str], *, startup_timeout_s: float = _SERVE_STARTUP_TIMEOUT_S):
+        self._cmd = cmd
+        self._startup_timeout_s = startup_timeout_s
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen[str] | None = None
+        self._lines: queue.Queue[str | None] = queue.Queue()
+
+    def _start(self) -> None:
+        proc = subprocess.Popen(self._cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                text=True, bufsize=1)
+        lines: queue.Queue[str | None] = queue.Queue()
+
+        def _pump() -> None:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                lines.put(line)
+            lines.put(None)  # EOF: the engine exited
+
+        threading.Thread(target=_pump, daemon=True).start()
+        self._proc, self._lines = proc, lines
+        ready = self._read(self._startup_timeout_s)
+        if ready.get("ready") is not True:
+            self.close()
+            raise ServingError(500, "engine_failed", "engine did not report ready")
+
+    def _read(self, timeout_s: float) -> dict[str, Any]:
+        try:
+            line = self._lines.get(timeout=timeout_s)
+        except queue.Empty:
+            self.close()
+            raise ServingError(504, "generation_timeout",
+                               "engine did not finish within the deadline")
+        if line is None:
+            self.close()
+            raise ServingError(500, "engine_failed", "engine process exited")
+        try:
+            doc = json.loads(line)
+        except json.JSONDecodeError:
+            self.close()
+            raise ServingError(500, "engine_malformed", "engine emitted non-JSON output")
+        if not isinstance(doc, dict):
+            self.close()
+            raise ServingError(500, "engine_malformed", "engine emitted a non-object")
+        return doc
+
+    def request(self, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None:
+                self._start()
+            assert self._proc is not None and self._proc.stdin is not None
+            try:
+                self._proc.stdin.write(json.dumps(payload) + "\n")
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self.close()
+                raise ServingError(500, "engine_failed", "engine process exited")
+            return self._read(timeout_s)
+
+    def close(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 @dataclass
 class GateStatus:
     """A parsed, validated gate-status artifact."""
@@ -67,6 +157,7 @@ class GateStatus:
     rate: float
     utc: str
     raw: dict[str, Any]
+    gpu: bool = False  # the gate validated `generate --gpu 1`
 
     @classmethod
     def load(cls, path: str | Path) -> "GateStatus | None":
@@ -99,6 +190,7 @@ class GateStatus:
             rate=float(raw["rate"]),
             utc=str(raw["utc"]),
             raw=raw,
+            gpu=raw.get("gpu") is True,
         )
         # The binary must exist and be executable to serve with it.
         if not (Path(g.engine).is_file() and os.access(g.engine, os.X_OK)):
@@ -126,6 +218,9 @@ class EngineService:
         else:
             self._tok = tok
         self._eos = self._eos_id(gate.checkpoint) if eos_id is None else eos_id
+        self._serve = (ServeProcess([gate.engine, "serve", "--checkpoint", gate.checkpoint,
+                                     "--gpu", "1", "--max-context", str(SERVE_MAX_CONTEXT)])
+                       if gate.gpu else None)
 
     @classmethod
     def from_gate_path(cls, path: str | Path) -> "EngineService | None":
@@ -136,16 +231,19 @@ class EngineService:
 
     @staticmethod
     def _eos_id(checkpoint_dir: str) -> int | None:
+        """The checkpoint's integer eos_token_id (config.json), or None.
+
+        tokenizer_config.json only names the eos *token* (a string such as
+        "<|im_end|>"), which never equals a generated id; the id itself lives
+        in config.json."""
         try:
             cfg = json.loads(
-                (Path(checkpoint_dir) / "tokenizer_config.json").read_text(
-                    encoding="utf-8"))
+                (Path(checkpoint_dir) / "config.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            pass
-        else:
-            eos = cfg.get("eos_token")
-            if isinstance(eos, str):
-                return eos
+            return None
+        eos = cfg.get("eos_token_id")
+        if isinstance(eos, int) and not isinstance(eos, bool) and eos >= 0:
+            return eos
         return None
 
     def is_available(self) -> bool:
@@ -154,11 +252,23 @@ class EngineService:
     # -- generation ---------------------------------------------------------
 
     def _generate_ids(self, prompt_ids: list[int], max_tokens: int) -> list[int]:
+        if self._serve is not None:
+            payload: dict[str, Any] = {"tokens": prompt_ids, "max_tokens": max_tokens,
+                                       "seed": 0}
+            if self._eos is not None:
+                payload["eos"] = self._eos
+            doc = self._serve.request(payload, self.timeout_s)
+            if "error" in doc:
+                raise ServingError(500, "engine_failed",
+                                   "engine generation failed: " + str(doc["error"])[:200])
+            return self._parse_ids(doc)
         toks = ",".join(map(str, prompt_ids))
         cmd = [
             self.gate.engine, "generate", "--checkpoint", self.gate.checkpoint,
             "--tokens", toks, "--max-tokens", str(max_tokens), "--seed", "0",
         ]
+        if self._eos is not None:
+            cmd += ["--eos", str(self._eos)]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=self.timeout_s)
@@ -172,18 +282,28 @@ class EngineService:
             doc = json.loads(r.stdout)
         except json.JSONDecodeError:
             raise ServingError(500, "engine_malformed", "engine emitted non-JSON output")
+        if not isinstance(doc, dict):
+            raise ServingError(500, "engine_malformed", "engine emitted a non-object")
+        return self._parse_ids(doc)
+
+    def _parse_ids(self, doc: dict[str, Any]) -> list[int]:
         ids = doc.get("generated")
         if not isinstance(ids, list):
             raise ServingError(500, "engine_malformed",
                                "engine output missing 'generated' token list")
         out: list[int] = []
         for t in ids:
-            if not isinstance(t, int):
+            if not isinstance(t, int) or isinstance(t, bool):
                 raise ServingError(500, "engine_malformed", "engine emitted a non-int token")
             out.append(t)
             if self._eos is not None and t == self._eos:
                 break
         return out
+
+    def close(self) -> None:
+        """Stop the persistent engine, if one is running."""
+        if self._serve is not None:
+            self._serve.close()
 
     def chat_completions(self, body: dict[str, Any], request_id: str) -> dict[str, Any]:
         messages = body.get("messages")

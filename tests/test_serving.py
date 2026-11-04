@@ -17,6 +17,7 @@ They run hermetically: no real checkpoint, no GPU.
 from __future__ import annotations
 
 import json
+import sys
 import subprocess
 import threading
 from collections.abc import Generator
@@ -265,7 +266,7 @@ def test_eos_truncates_generation(monkeypatch, tmp_path):
     ckpt = tmp_path / "ckpt"
     ckpt.mkdir()
     (ckpt / "tokenizer_config.json").write_text(json.dumps(
-        {"eos_token": 2, "bos_token": 1, "pad_token": 2}))
+        {"eos_token": "<|im_end|>", "bos_token": "<|start|>"}))
     gate = engine_service.GateStatus(
         passed=True, checkpoint=str(ckpt), checkpoint_sha="x",
         engine=str(engine_bin), prompt="p", max_tokens=24, min_match=1.0,
@@ -288,6 +289,95 @@ def test_eos_truncates_generation(monkeypatch, tmp_path):
     assert captured["cmd"][1] == "generate"
     assert captured["cmd"][captured["cmd"].index("--tokens") + 1] == "1,3,4"
     assert captured["cmd"][captured["cmd"].index("--seed") + 1] == "0"
+    # The engine gets the stop token too, and no --gpu without a GPU gate.
+    assert captured["cmd"][captured["cmd"].index("--eos") + 1] == "2"
+    assert "--gpu" not in captured["cmd"]
+
+
+def test_eos_id_comes_from_config_json(tmp_path):
+    # tokenizer_config.json only names the eos token string; the integer id
+    # the generated ids are compared against is config.json's eos_token_id.
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "tokenizer_config.json").write_text(json.dumps({"eos_token": "<|im_end|>"}))
+    (ckpt / "config.json").write_text(json.dumps({"eos_token_id": 100257}))
+    assert engine_service.EngineService._eos_id(str(ckpt)) == 100257
+    (ckpt / "config.json").write_text(json.dumps({"eos_token_id": "x"}))
+    assert engine_service.EngineService._eos_id(str(ckpt)) is None
+    assert engine_service.EngineService._eos_id(str(tmp_path / "missing")) is None
+
+
+_FAKE_SERVE = """#!{python}
+import json, sys
+args = sys.argv[1:]
+assert args[0] == "serve" and args[args.index("--gpu") + 1] == "1", args
+with open({log!r}, "a") as f:
+    f.write("start\\n")
+print(json.dumps({{"ready": True, "max_context": 8192}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    if req["tokens"] == [666]:
+        sys.exit(3)  # simulate an engine crash
+    if req["tokens"] == [7]:
+        print(json.dumps({{"error": "prompt + max_tokens exceeds the context"}}), flush=True)
+        continue
+    ids = [t + 1 for t in req["tokens"]][: req["max_tokens"]] + [req.get("eos", 99), 42]
+    print(json.dumps({{"generated": ids}}), flush=True)
+"""
+
+
+def _gpu_engine(tmp_path, monkeypatch):
+    log = tmp_path / "starts.log"
+    engine_bin = tmp_path / "engine"
+    engine_bin.write_text(_FAKE_SERVE.format(python=sys.executable, log=str(log)))
+    engine_bin.chmod(0o755)
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    path = tmp_path / "gate.json"
+    path.write_text(json.dumps(_gate_dict(engine=str(engine_bin), checkpoint=str(ckpt),
+                                          gpu=True)))
+    gate = engine_service.GateStatus.load(path)
+    assert gate is not None and gate.gpu
+
+    def _no_run(*a, **kw):
+        raise AssertionError("a GPU gate must not spawn one engine per request")
+
+    monkeypatch.setattr(engine_service.subprocess, "run", _no_run)
+    return engine_service.EngineService(gate, tok=_FakeTokenizer(), eos_id=2), log
+
+
+def test_gpu_gate_uses_one_persistent_engine(monkeypatch, tmp_path):
+    eng, log = _gpu_engine(tmp_path, monkeypatch)
+    try:
+        assert eng._generate_ids([10, 20], 8) == [11, 21, 2]  # stops at eos 2
+        assert eng._generate_ids([5], 8) == [6, 2]
+        assert log.read_text().count("start") == 1  # loaded once, reused
+    finally:
+        eng.close()
+
+
+def test_gpu_engine_error_reply_is_500_and_engine_survives(monkeypatch, tmp_path):
+    eng, log = _gpu_engine(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(engine_service.ServingError) as e:
+            eng._generate_ids([7], 8)
+        assert e.value.status == 500 and "exceeds the context" in e.value.message
+        assert eng._generate_ids([4], 8) == [5, 2]
+        assert log.read_text().count("start") == 1
+    finally:
+        eng.close()
+
+
+def test_gpu_engine_crash_restarts(monkeypatch, tmp_path):
+    eng, log = _gpu_engine(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(engine_service.ServingError) as e:
+            eng._generate_ids([666], 8)
+        assert e.value.code == "engine_failed"
+        assert eng._generate_ids([4], 8) == [5, 2]  # a fresh engine serves
+        assert log.read_text().count("start") == 2
+    finally:
+        eng.close()
 
 
 def test_default_health_is_unavailable():
