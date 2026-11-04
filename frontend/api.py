@@ -10,12 +10,15 @@ Inference is gate-driven: the server loads a passing parity-gate artifact
 at startup and only then serves completions. Without it, the endpoints
 stay in the Phase-0 state.
 
-Endpoints:
+Endpoints (OpenAI-compatible; /v1 paths also work without the /v1
+prefix, so clients may set base_url to either host form):
     GET  /health                 -> {"status": "ok", "inference": "available|unavailable"}
     GET  /metrics                -> engine status (status code, device, message)
-    GET  /v1/models              -> model card, status "available" after a passing gate
+    GET  /v1/models, /models     -> model list, status "available" after a passing gate
+    GET  /v1/models/<id>         -> single model card (404 model_not_found on
+         /models/<id>             an unknown id)
     POST /v1/chat/completions    -> 400 on invalid request; 200 with a completion
-                                     when the gate has passed, else 501
+         /chat/completions         when the gate has passed, else 501
                                      (inference has not been enabled)
 
 The 501 body carries the same error shape OpenAI clients expect, so a
@@ -126,20 +129,28 @@ def metrics_payload() -> dict[str, Any]:
 # /v1/models
 # ---------------------------------------------------------------------------
 
-def models_payload() -> dict[str, Any]:
+def _model_card() -> dict[str, Any]:
     return {
-        "object": "list",
-        "data": [
-            {
-                "id": MODEL_ID,
-                "object": "model",
-                "created": 0,
-                "owned_by": "ibm",
-                "status": "available" if _SERVING_ENGINE is not None else "unavailable",
-                "architecture": architecture_dict(),
-            }
-        ],
+        "id": MODEL_ID,
+        "object": "model",
+        "created": 0,
+        "owned_by": "ibm",
+        "status": "available" if _SERVING_ENGINE is not None else "unavailable",
+        "architecture": architecture_dict(),
     }
+
+
+def models_payload() -> dict[str, Any]:
+    return {"object": "list", "data": [_model_card()]}
+
+
+def single_model_payload(model: str) -> dict[str, Any] | None:
+    """OpenAI's GET /v1/models/{model} shape, or None for an unknown id."""
+    if model != MODEL_ID:
+        return None
+    card = _model_card()
+    card.pop("architecture")  # OpenAI's retrieval response is the bare card
+    return card
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +249,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(200, health_payload())
         elif path == "/metrics":
             self._send_json(200, metrics_payload())
-        elif path == "/v1/models":
+        elif path in ("/v1/models", "/models"):
             self._send_json(200, models_payload())
+        elif path.startswith("/v1/models/") or path.startswith("/models/"):
+            model = path.split("/", 3)[-1]
+            card = single_model_payload(model)
+            if card is None:
+                self._send_json(404, ApiError(404, "model_not_found", f"model '{model}' does not exist").to_body())
+            else:
+                self._send_json(200, card)
         else:
             self._send_json(404, _not_found().to_body())
 
@@ -252,7 +270,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
-        if path != "/v1/chat/completions":
+        if path not in ("/v1/chat/completions", "/chat/completions"):
             self._send_json(404, _not_found().to_body())
             return
         length = self.headers.get("Content-Length")

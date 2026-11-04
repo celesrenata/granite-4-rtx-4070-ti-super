@@ -114,6 +114,41 @@ def test_models(server):
     assert model["architecture"]["num_layers"] == 40
 
 
+def test_models_alias_without_v1(server):
+    # base_url set to the bare host (OpenAI SDK convention) hits /models
+    status, _, data = _http(server, "GET", "/models")
+    assert status == 200
+    [model] = json.loads(data)["data"]
+    assert model["id"] == MODEL_ID
+
+
+def test_single_model_retrieval(server):
+    # OpenAI clients may fetch one model: GET /v1/models/{model}
+    status, _, data = _http(server, "GET", f"/v1/models/{MODEL_ID}")
+    assert status == 200
+    card = json.loads(data)
+    assert card["id"] == MODEL_ID
+    assert card["object"] == "model"
+
+    status, _, data = _http(server, "GET", f"/models/{MODEL_ID}")
+    assert status == 200
+    assert json.loads(data)["id"] == MODEL_ID
+
+
+def test_single_model_unknown_is_404(server):
+    status, _, data = _http(server, "GET", "/v1/models/gpt-4")
+    assert status == 404
+    assert json.loads(data)["error"]["code"] == "model_not_found"
+
+
+def test_chat_completions_alias_without_v1(server):
+    status, _, data = _http(
+        server, "POST", "/chat/completions",
+        json.dumps({"model": MODEL_ID, "messages": [{"role": "user", "content": "hi"}]}).encode(),
+    )
+    assert status in (200, 501)  # 501 while the parity gate is not set
+
+
 # ---------------------------------------------------------------------------
 # 404s
 # ---------------------------------------------------------------------------
