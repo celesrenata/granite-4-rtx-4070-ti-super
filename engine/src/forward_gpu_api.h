@@ -9,11 +9,10 @@
 // causal-prefix compact buffers, and the RoPE tables sized for max_positions
 // - so a generate loop pays for them once and then decodes in place.
 //
-// gpu_forward_range replays [0, end): prefill is a full replay; each decode
-// step is [0, end) again, and the KV cache regrows only the new positions.
-// Every position's attention is computed from scratch over its causal prefix
-// (gathered into a contiguous [Hk][kv_len][d] block, the layout the P2 gqa
-// kernels require), so re-running a prefix reproduces the same values.
+// gpu_forward runs only the positions past the KV watermark: a prompt is one
+// prefill call (tensor-core GEMMs for 5+ rows), a speculative verify is one
+// batched 2-4-row call, and gpu_decode_greedy chains single-position greedy
+// steps on the device (one CUDA graph launch per token, no host round trip).
 
 #ifndef GRANITE4_FORWARD_GPU_API_H
 #define GRANITE4_FORWARD_GPU_API_H
@@ -80,6 +79,35 @@ void gpu_ctx_reset(GpuCtx* ctx);
 // `error` (error may be nullptr; error_size is its capacity).
 int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
                       std::uint16_t* d_logits, char* error,
+                      std::size_t error_size);
+
+// Output plan for gpu_forward. Only rows t >= logits_from get the final norm
+// and lm_head (rows below it just fill the KV cache, e.g. a prompt prefill
+// that needs the last row only); row t is written to
+// d_logits + (t - logits_from) * vocab. With d_argmax, d_argmax[t -
+// logits_from] also receives each row's greedy token (first maximum, the
+// host sample_greedy_f32 rule). logits_from == end requests no logits.
+struct GpuForwardOut {
+  std::uint16_t* d_logits = nullptr;
+  int logits_from = 0;
+  std::int32_t* d_argmax = nullptr;
+};
+
+// gpu_forward_range with an explicit output plan (same watermark rules).
+int gpu_forward(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
+                const GpuForwardOut& out, char* error, std::size_t error_size);
+
+// Greedy decode chained on the device: `steps` single-position forwards
+// starting at p = gpu_ctx_written(ctx). Step i forwards position p + i (its
+// token d_tokens[p + i] must already be on the device; d_tokens[p] normally
+// comes from a prior gpu_forward d_argmax), writes the logits row into
+// d_logits_row ([vocab], overwritten each step) and its greedy token into
+// d_tokens[p + i + 1]. Nothing is synchronized or copied back: the caller
+// reads the generated ids from d_tokens afterwards. The step is captured
+// once into a CUDA graph (G4_GRAPH=0 disables) and replayed per token.
+// Requires p + steps < max_positions. Advances the watermark by `steps`.
+int gpu_decode_greedy(GpuCtx* ctx, std::int32_t* d_tokens, int steps,
+                      std::uint16_t* d_logits_row, char* error,
                       std::size_t error_size);
 
 // Run the attention portion of speculative verification for `rows` consecutive

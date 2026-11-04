@@ -1,4 +1,4 @@
-// Experimental fused-k verification GEMV for speculative decoding.
+// Fused-k verification GEMV for speculative decoding.
 //
 // A is [tokens,K], B is [rows,K] FP8 row-major, C is [tokens,rows]. One
 // block owns an output row and streams that row of B exactly once while
@@ -8,32 +8,21 @@
 // totals in warp order), so each token's output is bit-identical to the
 // single-token path and the greedy token gate stays exact.
 //
-// Deliberately standalone until the k-token forward/attention path is
-// complete.
+// Production: forward_range_batched_impl runs the lm_head through it.
 #include <cuda_runtime.h>
 #include <cstdint>
+
+#include "device_math.cuh"
 
 namespace {
 constexpr int kMaxVerifyTokens = 4;
 
-__device__ __forceinline__ float fp8_to_f32(std::uint8_t x) {
-  const std::uint32_t s = static_cast<std::uint32_t>(x & 0x80u) << 24;
-  const std::uint32_t y = x & 0x7fu;
-  const std::uint32_t e = y >> 3;
-  const std::uint32_t m = y & 7u;
-  std::uint32_t bits = ((120u + e) << 23) | (m << 20);
-  const std::uint32_t top = (m == 7u) ? 0u : (0x43800000u | (m << 20));
-  bits = (e == 15u) ? top : bits;
-  bits = (e == 0u) ? __float_as_uint(static_cast<float>(m) * 0.001953125f) : bits;
-  return ((e == 15u && m == 7u)) ? 0.0f : __uint_as_float(bits | s);
-}
-__device__ __forceinline__ float bf16_to_f32(std::uint16_t x) {
-  return __uint_as_float(static_cast<std::uint32_t>(x) << 16);
-}
-__device__ __forceinline__ std::uint16_t f32_to_bf16(float x) {
-  const std::uint32_t u = __float_as_uint(x);
-  return static_cast<std::uint16_t>((u + 0x7ffu + ((u >> 16) & 1u)) >> 16);
-}
+using granite4::dev::bf16_hi;
+using granite4::dev::bf16_lo;
+using granite4::dev::bf16_to_f32;
+using granite4::dev::f32_to_bf16;
+using granite4::dev::fp8_to_f32;
+using granite4::dev::fp8x4_to_f32;
 
 // Per-token dot products for one output row, from one weight stream.
 __global__ void verify_gemv_kernel(const std::uint16_t* __restrict__ a,
@@ -58,11 +47,8 @@ __global__ void verify_gemv_kernel(const std::uint16_t* __restrict__ a,
 #pragma unroll
       for (int q = 0; q < 4; ++q) {  // ws[q] = 4 fp8 elements
         const int e = 16 * g + 4 * q;
-        const std::uint32_t wq = ws[q];
-        const float b0 = fp8_to_f32(static_cast<std::uint8_t>(wq & 0xffu));
-        const float b1 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 8) & 0xffu));
-        const float b2 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 16) & 0xffu));
-        const float b3 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 24) & 0xffu));
+        float b0, b1, b2, b3;
+        fp8x4_to_f32(ws[q], b0, b1, b2, b3);
 #pragma unroll
         for (int token = 0; token < kMaxVerifyTokens; ++token) {
           if (token >= tokens) break;
@@ -70,11 +56,8 @@ __global__ void verify_gemv_kernel(const std::uint16_t* __restrict__ a,
               reinterpret_cast<const std::uint32_t*>(a + static_cast<std::size_t>(token) * k);
           const std::uint32_t y0 = a4[e / 2];      // elements e, e+1
           const std::uint32_t y1 = a4[e / 2 + 1];  // elements e+2, e+3
-          const float fa0 = bf16_to_f32(static_cast<std::uint16_t>(y0 & 0xffffu));
-          const float fa1 = bf16_to_f32(static_cast<std::uint16_t>((y0 >> 16) & 0xffffu));
-          const float fa2 = bf16_to_f32(static_cast<std::uint16_t>(y1 & 0xffffu));
-          const float fa3 = bf16_to_f32(static_cast<std::uint16_t>((y1 >> 16) & 0xffffu));
-          acc[token] += b0 * fa0 + b1 * fa1 + b2 * fa2 + b3 * fa3;
+          acc[token] += b0 * bf16_lo(y0) + b1 * bf16_hi(y0) + b2 * bf16_lo(y1) +
+                        b3 * bf16_hi(y1);
         }
       }
     }
@@ -111,7 +94,7 @@ __global__ void verify_gemv_kernel(const std::uint16_t* __restrict__ a,
 }
 }  // namespace
 
-// Experimental API. `tokens` must be in [1, 4]. Returns -1 for unsupported
+// `tokens` must be in [1, 4]. Returns -1 for unsupported
 // widths so callers cannot silently lose the one-weight-stream guarantee.
 extern "C" int granite4_verify_gemv(const std::uint16_t* d_a, const std::uint8_t* d_b,
                                      float scale, int tokens, int rows, int k,

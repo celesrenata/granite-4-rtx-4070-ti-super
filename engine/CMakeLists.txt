@@ -23,7 +23,11 @@ set(GRANITE_ENGINE_SOURCES
   src/speculative_verify.h
   src/speculative_verify.cc
   src/weights.h
-  src/weights.cc)
+  src/weights.cc
+  src/gpu_pack.h
+  src/gpu_pack.cc)
+
+find_package(Threads REQUIRED)
 
 if(GRANITE_ENABLE_CUDA)
   enable_language(CUDA)
@@ -32,14 +36,21 @@ if(GRANITE_ENABLE_CUDA)
   # Explicit arch: sm_89 only. No "native" / no auto-detect, so a build is
   # never silently retargeted at another GPU.
   set(CMAKE_CUDA_ARCHITECTURES 89)
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo --expt-relaxed-constexpr")
+  # Per-thread default stream: every <<<>>> launch and runtime call without an
+  # explicit stream goes to cudaStreamPerThread, which the decode path
+  # captures into a CUDA graph (gpu_decode_greedy). Host .cc files get the
+  # same semantics via CUDA_API_PER_THREAD_DEFAULT_STREAM below.
+  set(CMAKE_CUDA_FLAGS
+      "${CMAKE_CUDA_FLAGS} -lineinfo --expt-relaxed-constexpr --default-stream per-thread")
   find_package(CUDAToolkit REQUIRED)
   list(APPEND GRANITE_ENGINE_SOURCES src/kernels.cu src/kernels_phase2.cu
-       src/kernels_phase3.cu src/forward_gpu.cu src/verify_gemv.cu)
+       src/kernels_phase3.cu src/forward_gpu.cu src/verify_gemv.cu
+       src/prefill_gemm.cu src/attention_split.cu)
 endif()
 
 add_library(granite4 SHARED ${GRANITE_ENGINE_SOURCES})
 target_include_directories(granite4 PUBLIC src)
+target_link_libraries(granite4 PUBLIC Threads::Threads)
 
 # A static library of the same sources. The shared library is the primary
 # artifact (used by the C ABI and tests); the static one exists so the
@@ -47,6 +58,7 @@ target_include_directories(granite4 PUBLIC src)
 # point at a build tree that no longer exists after install.
 add_library(granite4_static STATIC ${GRANITE_ENGINE_SOURCES})
 target_include_directories(granite4_static PUBLIC src)
+target_link_libraries(granite4_static PUBLIC Threads::Threads)
 
 if(GRANITE_ENABLE_CUDA)
   target_link_libraries(granite4 PRIVATE CUDA::cudart)
@@ -56,6 +68,8 @@ if(GRANITE_ENABLE_CUDA)
   # files self-define it; .cc files get it here.
   target_compile_definitions(granite4 PRIVATE GRANITE_CUDA=1)
   target_compile_definitions(granite4_static PUBLIC GRANITE_CUDA=1)
+  target_compile_definitions(granite4 PUBLIC CUDA_API_PER_THREAD_DEFAULT_STREAM=1)
+  target_compile_definitions(granite4_static PUBLIC CUDA_API_PER_THREAD_DEFAULT_STREAM=1)
 endif()
 
 # Host-only tests: no CUDA required.
@@ -122,10 +136,10 @@ if(GRANITE_ENABLE_CUDA)
   # P4: GEMV micro-benchmark - achieved bandwidth of the decode GEMM at the
   # real model shapes, isolates the per-token weight-streaming cost.
   add_executable(granite4-gemv-bench src/gemv_bench.cu)
-  target_link_libraries(granite4-gemv-bench PRIVATE CUDA::cudart)
+  target_link_libraries(granite4-gemv-bench PRIVATE granite4_static CUDA::cudart)
 
-  # Experimental speculative-decoding verify path. Kept out of granite4 and
-  # production decode until its batched traffic wins on the target workload.
+  # Standalone build of the fused-k verify GEMV (also linked into granite4,
+  # where the batched verify forward uses it for the lm_head).
   add_executable(granite4-verify-gemv-test
                  src/verify_gemv.cu tests/test_verify_gemv.cu)
   target_link_libraries(granite4-verify-gemv-test PRIVATE CUDA::cudart)

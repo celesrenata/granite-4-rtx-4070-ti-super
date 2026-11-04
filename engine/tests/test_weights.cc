@@ -9,6 +9,7 @@
 #include "weights.h"
 
 #include "checkpoint.h"
+#include "gpu_pack.h"
 #include "json.h"
 #include "kernel_math.h"
 
@@ -98,6 +99,25 @@ struct T {
   std::vector<float> scale;  // FP8 export scales (unused by the BF16 test)
 };
 
+// The streaming checkpoint packer must reproduce the reference re-pack of the
+// loaded float weights byte for byte (blob and scales), at any thread count.
+static void expect_pack_parity(const std::string& dir, const ModelWeights& w,
+                               const char* what) {
+  GpuModel ref, fast;
+  std::string err;
+  expect(pack_gpu_model_from_weights(w, &ref, &err), "reference pack succeeds");
+  for (int threads : {1, 3}) {
+    expect(pack_gpu_model_from_checkpoint(dir, w.model, &fast, &err, threads),
+           "checkpoint pack succeeds");
+    const bool same = ref.bytes == fast.bytes &&
+                      std::memcmp(ref.weights.get(), fast.weights.get(), ref.bytes) == 0 &&
+                      ref.scales.size() == fast.scales.size() &&
+                      std::memcmp(ref.scales.data(), fast.scales.data(),
+                                  ref.scales.size() * sizeof(float)) == 0;
+    expect(same, what);
+  }
+}
+
 }  // namespace
 
 static void test_bf16_load() {
@@ -176,6 +196,7 @@ static void test_bf16_load() {
   const float lm_last = 0.05f + static_cast<float>(V * H - 1);
   expect(std::fabs(w.lm_head[V * H - 1] - bf16_to_f32_host(bf16bits(lm_last))) < 1e-6,
          "lm_head last element");
+  expect_pack_parity(dir, w, "bf16: checkpoint pack == reference pack");
   fs::remove_all(dir);
 }
 
@@ -279,6 +300,7 @@ static void test_fp8_load_per_tensor() {
         ref[i % kExactFp8.size()])
       ok = false;
   expect(ok, "fp8 per-tensor q_proj round-trips exactly");
+  expect_pack_parity(dir, w, "fp8 per-tensor: checkpoint pack == reference pack");
   fs::remove_all(dir);
 }
 
@@ -346,6 +368,7 @@ static void test_fp8_load_per_channel() {
       if (w.embed[(std::size_t)r * H + c] != want) ok = false;
     }
   expect(ok, "fp8 per-channel embed applies per-row scale");
+  expect_pack_parity(dir, w, "fp8 per-channel: checkpoint pack == reference pack");
   fs::remove_all(dir);
 }
 

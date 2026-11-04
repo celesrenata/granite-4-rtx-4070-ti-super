@@ -13,12 +13,15 @@
 //
 // Correctness-first tiling (one thread per output element); the
 // micro-benchmark pass (P2 exit criterion) lands in the next milestone.
+#include <algorithm>
+#include <algorithm>
 #include <cmath>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
 
 #define GRANITE_CUDA 1
+#include "device_math.cuh"
 #include "kernel_math.h"
 #include "model_config.h"
 
@@ -26,38 +29,12 @@ namespace granite4 {
 
 namespace {
 
-__device__ __forceinline__ std::uint16_t f32_to_bf16(float f) {
-  std::uint32_t u;
-  __builtin_memcpy(&u, &f, sizeof u);
-  u += 0x7fffu + ((u >> 16) & 1u);  // RNE
-  u >>= 16;
-  return static_cast<std::uint16_t>(u);
-}
-
-__device__ __forceinline__ float bf16_to_f32(std::uint16_t bits) {
-  const std::uint32_t u = static_cast<std::uint32_t>(bits) << 16;
-  float f;
-  __builtin_memcpy(&f, &u, sizeof f);
-  return f;
-}
-
-// Exact e4m3 decode, branchless (bit-identical to the arithmetic decode on
-// all 256 codepoints - matches checkpoint.cc fp8_e4m3_to_bf16, device-side).
-// See forward_gpu.cu for the bit-mapping comment.
-__device__ __forceinline__ float fp8_to_f32(std::uint8_t x) {
-  const std::uint32_t s = static_cast<std::uint32_t>(x & 0x80u) << 24;
-  const std::uint32_t y = x & 0x7Fu;
-  const std::uint32_t e = y >> 3;
-  const std::uint32_t m = y & 7u;
-  std::uint32_t bits = ((120u + e) << 23) | (m << 20);
-  const std::uint32_t top = (m == 7u) ? 0u : (0x43800000u | (m << 20));
-  bits = (e == 15u) ? top : bits;
-  bits = (e == 0u) ? __float_as_uint(static_cast<float>(m) * 0.001953125f)
-                   : bits;  // 0.001953125f = 2^-9
-  // sNaN (0x7f/0xff): the arithmetic decode returned +0.0 (sign discarded),
-  // so drop the sign here too to stay bit-identical.
-  return ((e == 15u && m == 7u)) ? 0.0f : __uint_as_float(bits | s);
-}
+using dev::bf16_hi;
+using dev::bf16_lo;
+using dev::bf16_to_f32;
+using dev::f32_to_bf16;
+using dev::fp8_to_f32;
+using dev::fp8x4_to_f32;
 
 }  // namespace
 
@@ -65,6 +42,11 @@ __device__ __forceinline__ float fp8_to_f32(std::uint8_t x) {
 // RMSNorm: one thread per element; the row reduction (mean of squares) is
 // re-read per thread (correct; the fast variant tiles over rows).
 // ---------------------------------------------------------------------------
+
+// Threads per RMSNorm block. G4 decode rows are 4096 wide: 1024 threads give
+// every thread 4 elements, so the strided load/normalize passes and the
+// per-thread double accumulation chain are 4x shorter than at 256.
+constexpr int kRmsNormThreads = 1024;
 
 __global__ void rmsnorm_kernel(const std::uint16_t* x, const std::uint16_t* w,
                                float eps, int rows, int cols,
@@ -80,30 +62,71 @@ __global__ void rmsnorm_kernel(const std::uint16_t* x, const std::uint16_t* w,
   const int nt = blockDim.x;
   const std::size_t base = static_cast<std::size_t>(row) * cols;
   const std::uint16_t* const xr = x + base;
-  // Each thread owns a strided slice; accumulate its sum-of-squares in
-  // double (matching the host oracle's double accumulation, so the reduced
-  // result rounds to the same bf16).
-  double ps = 0.0;
-  for (int c = t; c < cols; c += nt) {
-    const float v = bf16_to_f32(xr[c]);
-    ps += static_cast<double>(v) * v;
+  // Each thread owns a strided slice. The sum of squares is accumulated as an
+  // unevaluated float pair (hi + lo, Knuth TwoSum): ~48 significant bits, so
+  // like the host oracle's double sum it rounds to the same float mean square,
+  // at FP32 instead of the 1/64-rate FP64 throughput of consumer Ada. Each
+  // square of a bf16 value is exact in float. Rows of up to
+  // kRmsCache * blockDim elements (all of Granite's) keep the slice and its
+  // norm weights in registers, so the normalize pass re-reads nothing.
+  constexpr int kRmsCache = 8;
+  const bool cached = cols <= kRmsCache * nt;
+  float xv[kRmsCache], wv[kRmsCache];
+  float hi = 0.0f, lo = 0.0f;
+  auto add = [](float& h, float& l, float x) {
+    const float s = h + x;
+    const float bb = s - h;
+    l += (h - (s - bb)) + (x - bb);
+    h = s;
+  };
+  if (cached) {
+#pragma unroll
+    for (int j = 0; j < kRmsCache; ++j) {
+      const int c = t + j * nt;
+      xv[j] = c < cols ? bf16_to_f32(xr[c]) : 0.0f;
+      wv[j] = c < cols ? bf16_to_f32(w[c]) : 0.0f;
+    }
+#pragma unroll
+    for (int j = 0; j < kRmsCache; ++j) add(hi, lo, xv[j] * xv[j]);
+  } else {
+    for (int c = t; c < cols; c += nt) {
+      const float v = bf16_to_f32(xr[c]);
+      add(hi, lo, v * v);
+    }
   }
-  __shared__ double red[320];  // blockDim must be <= 320 (launcher).
-  // Deterministic warp-tree reduction: each warp keeps its lane-ordered
-  // partials, then lane 0 combines warp totals in warp order. This removes
-  // the 256-deep serial shared-memory loop from every decode RMSNorm.
-  for (int offset = 16; offset > 0; offset >>= 1)
-    ps += __shfl_down_sync(0xffffffffu, ps, offset);
-  if ((t & 31) == 0) red[t >> 5] = ps;
+  // Deterministic tree: lanes, then warps in warp order, merging pairs.
+  __shared__ float red_hi[32], red_lo[32];
+  __shared__ float total;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    const float oh = __shfl_down_sync(0xffffffffu, hi, offset);
+    const float ol = __shfl_down_sync(0xffffffffu, lo, offset);
+    lo += ol;
+    add(hi, lo, oh);
+  }
+  if ((t & 31) == 0) {
+    red_hi[t >> 5] = hi;
+    red_lo[t >> 5] = lo;
+  }
   __syncthreads();
   if (t == 0) {
-    double s = 0.0;
+    float h = 0.0f, l = 0.0f;
     const int warps = (nt + 31) >> 5;
-    for (int i = 0; i < warps; ++i) s += red[i];
-    red[0] = s;
+    for (int i = 0; i < warps; ++i) {
+      l += red_lo[i];
+      add(h, l, red_hi[i]);
+    }
+    total = static_cast<float>((static_cast<double>(h) + static_cast<double>(l)) / cols);
   }
   __syncthreads();
-  const float r = 1.0f / std::sqrt(static_cast<float>(red[0] / cols) + eps);
+  const float r = 1.0f / std::sqrt(total + eps);
+  if (cached) {
+#pragma unroll
+    for (int j = 0; j < kRmsCache; ++j) {
+      const int c = t + j * nt;
+      if (c < cols) out[base + c] = f32_to_bf16(xv[j] * r * wv[j]);
+    }
+    return;
+  }
   for (int c = t; c < cols; c += nt)
     out[base + c] = f32_to_bf16(bf16_to_f32(xr[c]) * r * bf16_to_f32(w[c]));
 }
@@ -233,18 +256,24 @@ __global__ void gqa_value_kernel(const std::uint16_t* p, const std::uint16_t* v,
 // memory; beyond the shared parallel-softmax limit the exact serial loop runs.
 // ---------------------------------------------------------------------------
 
-__global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
-                                 const std::uint16_t* v, float att_scale, int Hq,
-                                 int Hk, int d, int kv_len, int k_stride,
-                                 std::uint16_t* out) {
-  const int hq = blockIdx.x;
-  const int hkv = hq / (Hq / Hk);
+// One (query head, row) of fused GQA over the causal prefix [0, kv_len).
+// q_row is that row's [Hq][d] query; out_row its [Hq][d] output.
+//
+// The max is a block tree (max is exact in any order). The denominator is
+// the reference's ascending-order double sum, run by thread 0 with the
+// shared-memory loads batched ahead of the dependent adds; everything else
+// is parallel across the block.
+__device__ __forceinline__ void gqa_fused_row(const std::uint16_t* q_row,
+                                              const std::uint16_t* k,
+                                              const std::uint16_t* v, float att_scale,
+                                              int hq, int hkv, int d, int kv_len,
+                                              int k_stride, std::uint16_t* out_row) {
   const int t = threadIdx.x;
   const int nt = blockDim.x;  // blockDim.x == d
 
   extern __shared__ std::uint16_t smem[];
-  std::uint16_t* const sq = smem;              // [d]
-  std::uint16_t* const slog = smem + d;        // [kv_len] bf16 logits
+  std::uint16_t* const sq = smem;               // [d]
+  std::uint16_t* const slog = smem + d;         // [kv_len] bf16 logits
   std::uint16_t* const sp = smem + d + kv_len;  // [kv_len] bf16 probs
   const std::size_t base_elems =
       static_cast<std::size_t>(d) + 2u * static_cast<std::size_t>(kv_len);
@@ -252,39 +281,54 @@ __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
   double* const dexp = (kv_len <= granite4::kGqaSoftmaxParallelMax)
                            ? reinterpret_cast<double*>(smem + exp_off)
                            : nullptr;
+  __shared__ float wmax[32];
   __shared__ float smax;     // row max (Phase B)
   __shared__ double sdenom;  // softmax denominator (Phase B)
 
   // Preload the q head row once (identical values to re-reading global).
-  for (int i = t; i < d; i += nt) sq[i] = q[hq * d + i];
+  for (int i = t; i < d; i += nt) sq[i] = q_row[hq * d + i];
   __syncthreads();
 
-  // Phase A: bf16 logits[hq, kv] = att_scale * dot(q[hq], k[hkv, kv]).
+  // Phase A: bf16 logits[kv] = att_scale * dot(q, k[hkv, kv]), plus the
+  // per-thread running max of what this thread wrote.
+  float m = -std::numeric_limits<float>::infinity();
   for (int kv = t; kv < kv_len; kv += nt) {
     const int kbase = (hkv * k_stride + kv) * d;
     float acc = 0.0f;
     for (int i = 0; i < d; ++i)
       acc += bf16_to_f32(k[kbase + i]) * bf16_to_f32(sq[i]);
-    slog[kv] = f32_to_bf16(att_scale * acc);
+    const std::uint16_t lb = f32_to_bf16(att_scale * acc);
+    slog[kv] = lb;
+    m = fmaxf(m, bf16_to_f32(lb));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+  if ((t & 31) == 0) wmax[t >> 5] = m;
+  __syncthreads();
+  if (t == 0) {
+    float mm = wmax[0];
+    for (int w = 1; w < ((nt + 31) >> 5); ++w) mm = fmaxf(mm, wmax[w]);
+    smax = mm;
   }
   __syncthreads();
 
-  // Phase B: preserve the reference max and ordered double denominator.
-  // Only the expensive exp() calls are distributed across the block.
-  if (t == 0) {
-    float m = -std::numeric_limits<float>::infinity();
-    for (int i = 0; i < kv_len; ++i)
-      m = fmaxf(m, 1.0f * bf16_to_f32(slog[i]));
-    smax = m;
-  }
-  __syncthreads();
+  // Phase B: exp terms in parallel, ordered double denominator.
   if (dexp != nullptr) {
     for (int i = t; i < kv_len; i += nt)
       dexp[i] = std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[i]) - smax));
     __syncthreads();
     if (t == 0) {
       double sum = 0.0;
-      for (int i = 0; i < kv_len; ++i) sum += dexp[i];
+      int i = 0;
+      for (; i + 8 <= kv_len; i += 8) {
+        double e[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) e[j] = dexp[i + j];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sum += e[j];
+      }
+      for (; i < kv_len; ++i) sum += dexp[i];
       sdenom = sum;
     }
     __syncthreads();
@@ -301,12 +345,24 @@ __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
   }
   __syncthreads();
 
-  // Phase C: out[hq, i] = sum_kv p[hq, kv] * v[hkv, kv, i].
+  // Phase C: out[hq, i] = sum_kv p[kv] * v[hkv, kv, i] (ascending kv).
   const int i = t;
   float acc = 0.0f;
   for (int kv = 0; kv < kv_len; ++kv)
     acc += bf16_to_f32(sp[kv]) * bf16_to_f32(v[(hkv * k_stride + kv) * d + i]);
-  out[hq * d + i] = f32_to_bf16(acc);
+  out_row[hq * d + i] = f32_to_bf16(acc);
+}
+
+// Single row; d_pos (optional): when non-null the causal length is
+// *d_pos + 1, read on the device, so a captured decode graph replays at
+// every position.
+__global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
+                                 const std::uint16_t* v, float att_scale, int Hq,
+                                 int Hk, int d, int kv_len, int k_stride,
+                                 const int* d_pos, std::uint16_t* out) {
+  if (d_pos != nullptr) kv_len = *d_pos + 1;
+  const int hq = blockIdx.x;
+  gqa_fused_row(q, k, v, att_scale, hq, hq / (Hq / Hk), d, kv_len, k_stride, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +390,7 @@ __global__ void kv_append_batched_kernel(const std::uint16_t* src_k,
   cache_v[cache_row + static_cast<std::size_t>(pos) * d + i] = src_v[src_off];
 }
 
+// Row blockIdx.y attends to its causal prefix [0, base_kv + row + 1).
 __global__ void gqa_fused_batched_kernel(const std::uint16_t* q,
                                          const std::uint16_t* k,
                                          const std::uint16_t* v,
@@ -342,72 +399,9 @@ __global__ void gqa_fused_batched_kernel(const std::uint16_t* q,
                                          std::uint16_t* out) {
   const int hq = blockIdx.x;
   const int row = blockIdx.y;
-  const int hkv = hq / (Hq / Hk);
-  const int t = threadIdx.x;
-  const int nt = blockDim.x;  // blockDim.x == d
-  const int kv_len = base_kv + row + 1;  // causal prefix for this row
-
-  extern __shared__ std::uint16_t smem[];
-  std::uint16_t* const sq = smem;              // [d]
-  std::uint16_t* const slog = smem + d;        // [kv_len] bf16 logits
-  std::uint16_t* const sp = smem + d + kv_len;  // [kv_len] bf16 probs
-  const std::size_t base_elems =
-      static_cast<std::size_t>(d) + 2u * static_cast<std::size_t>(kv_len);
-  const std::size_t exp_off = (base_elems + 3u) & ~std::size_t(3);  // 8B align
-  double* const dexp = (kv_len <= granite4::kGqaSoftmaxParallelMax)
-                           ? reinterpret_cast<double*>(smem + exp_off)
-                           : nullptr;
-  __shared__ float smax;
-  __shared__ double sdenom;
-
-  const std::uint16_t* const q_row =
-      q + static_cast<std::size_t>(row) * Hq * d;
-  for (int i = t; i < d; i += nt) sq[i] = q_row[hq * d + i];
-  __syncthreads();
-
-  for (int kv = t; kv < kv_len; kv += nt) {
-    const int kbase = (hkv * k_stride + kv) * d;
-    float acc = 0.0f;
-    for (int i = 0; i < d; ++i)
-      acc += bf16_to_f32(k[kbase + i]) * bf16_to_f32(sq[i]);
-    slog[kv] = f32_to_bf16(att_scale * acc);
-  }
-  __syncthreads();
-
-  if (t == 0) {
-    float m = -std::numeric_limits<float>::infinity();
-    for (int i = 0; i < kv_len; ++i)
-      m = fmaxf(m, 1.0f * bf16_to_f32(slog[i]));
-    smax = m;
-  }
-  __syncthreads();
-  if (dexp != nullptr) {
-    for (int kv = t; kv < kv_len; kv += nt)
-      dexp[kv] = std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[kv]) - smax));
-    __syncthreads();
-    if (t == 0) {
-      double s = 0.0;
-      for (int kv = 0; kv < kv_len; ++kv) s += dexp[kv];
-      sdenom = s;
-    }
-    __syncthreads();
-    for (int kv = t; kv < kv_len; kv += nt)
-      sp[kv] = f32_to_bf16(static_cast<float>(dexp[kv] / sdenom));
-  } else if (t == 0) {
-    double s = 0.0;
-    for (int kv = 0; kv < kv_len; ++kv)
-      s += std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[kv]) - smax));
-    for (int kv = 0; kv < kv_len; ++kv)
-      sp[kv] = f32_to_bf16(static_cast<float>(
-          std::exp(static_cast<double>(1.0f * bf16_to_f32(slog[kv]) - smax)) / s));
-  }
-  __syncthreads();
-
-  const int i = t;
-  float acc = 0.0f;
-  for (int kv = 0; kv < kv_len; ++kv)
-    acc += bf16_to_f32(sp[kv]) * bf16_to_f32(v[(hkv * k_stride + kv) * d + i]);
-  out[static_cast<std::size_t>(row) * Hq * d + hq * d + i] = f32_to_bf16(acc);
+  const std::size_t off = static_cast<std::size_t>(row) * Hq * d;
+  gqa_fused_row(q + off, k, v, att_scale, hq, hq / (Hq / Hk), d, base_kv + row + 1,
+                k_stride, out + off);
 }
 
 // ---------------------------------------------------------------------------
@@ -432,22 +426,15 @@ __global__ void silu_gate_up_kernel(const std::uint8_t* Wg, const std::uint8_t* 
     const std::uint32_t* x4 = reinterpret_cast<const std::uint32_t*>(x);
     const int K4 = K >> 2;
     for (int k4 = t; k4 < K4; k4 += nt) {
-      const std::uint32_t bg = rg4[k4];
-      const std::uint32_t bu = ru4[k4];
       const std::uint32_t xa = x4[2 * k4];
       const std::uint32_t xb = x4[2 * k4 + 1];
-      const float x0 = bf16_to_f32(static_cast<std::uint16_t>(xa & 0xffffu));
-      const float x1 = bf16_to_f32(static_cast<std::uint16_t>((xa >> 16) & 0xffffu));
-      const float x2 = bf16_to_f32(static_cast<std::uint16_t>(xb & 0xffffu));
-      const float x3 = bf16_to_f32(static_cast<std::uint16_t>((xb >> 16) & 0xffffu));
-      g += fp8_to_f32(static_cast<std::uint8_t>(bg & 0xffu)) * x0 +
-           fp8_to_f32(static_cast<std::uint8_t>((bg >> 8) & 0xffu)) * x1 +
-           fp8_to_f32(static_cast<std::uint8_t>((bg >> 16) & 0xffu)) * x2 +
-           fp8_to_f32(static_cast<std::uint8_t>((bg >> 24) & 0xffu)) * x3;
-      u += fp8_to_f32(static_cast<std::uint8_t>(bu & 0xffu)) * x0 +
-           fp8_to_f32(static_cast<std::uint8_t>((bu >> 8) & 0xffu)) * x1 +
-           fp8_to_f32(static_cast<std::uint8_t>((bu >> 16) & 0xffu)) * x2 +
-           fp8_to_f32(static_cast<std::uint8_t>((bu >> 24) & 0xffu)) * x3;
+      const float x0 = bf16_lo(xa), x1 = bf16_hi(xa);
+      const float x2 = bf16_lo(xb), x3 = bf16_hi(xb);
+      float g0, g1, g2, g3, u0, u1, u2, u3;
+      fp8x4_to_f32(rg4[k4], g0, g1, g2, g3);
+      fp8x4_to_f32(ru4[k4], u0, u1, u2, u3);
+      g += g0 * x0 + g1 * x1 + g2 * x2 + g3 * x3;
+      u += u0 * x0 + u1 * x1 + u2 * x2 + u3 * x3;
     }
   } else {
     for (int i = t; i < K; i += nt) {
@@ -501,25 +488,19 @@ __global__ void silu_gate_up_batched_kernel(const std::uint8_t* Wg,
     const std::uint32_t* ru4 = reinterpret_cast<const std::uint32_t*>(ru);
     const int K4 = K >> 2;
     for (int k4 = t; k4 < K4; k4 += nt) {
-      const std::uint32_t bg = rg4[k4], bu = ru4[k4];
+      float g0, g1, g2, g3, u0, u1, u2, u3;
+      fp8x4_to_f32(rg4[k4], g0, g1, g2, g3);
+      fp8x4_to_f32(ru4[k4], u0, u1, u2, u3);
 #pragma unroll
       for (int row = 0; row < 4; ++row) {
         if (row >= rows) break;
         const std::uint32_t* x4 = reinterpret_cast<const std::uint32_t*>(
             x + static_cast<std::size_t>(row) * K);
         const std::uint32_t xa = x4[2 * k4], xb = x4[2 * k4 + 1];
-        const float x0 = bf16_to_f32(static_cast<std::uint16_t>(xa & 0xffffu));
-        const float x1 = bf16_to_f32(static_cast<std::uint16_t>(xa >> 16));
-        const float x2 = bf16_to_f32(static_cast<std::uint16_t>(xb & 0xffffu));
-        const float x3 = bf16_to_f32(static_cast<std::uint16_t>(xb >> 16));
-        g[row] += fp8_to_f32(static_cast<std::uint8_t>(bg & 0xffu)) * x0 +
-                  fp8_to_f32(static_cast<std::uint8_t>(bg >> 8)) * x1 +
-                  fp8_to_f32(static_cast<std::uint8_t>(bg >> 16)) * x2 +
-                  fp8_to_f32(static_cast<std::uint8_t>(bg >> 24)) * x3;
-        u[row] += fp8_to_f32(static_cast<std::uint8_t>(bu & 0xffu)) * x0 +
-                  fp8_to_f32(static_cast<std::uint8_t>(bu >> 8)) * x1 +
-                  fp8_to_f32(static_cast<std::uint8_t>(bu >> 16)) * x2 +
-                  fp8_to_f32(static_cast<std::uint8_t>(bu >> 24)) * x3;
+        const float x0 = bf16_lo(xa), x1 = bf16_hi(xa);
+        const float x2 = bf16_lo(xb), x3 = bf16_hi(xb);
+        g[row] += g0 * x0 + g1 * x1 + g2 * x2 + g3 * x3;
+        u[row] += u0 * x0 + u1 * x1 + u2 * x2 + u3 * x3;
       }
     }
   } else {
@@ -654,9 +635,6 @@ __global__ void fp8_decode_all_kernel(float* out) {
 
 }  // namespace granite4
 
-namespace granite4 {
-}
-
 // ---------------------------------------------------------------------------
 // Host launchers (C ABI surface for the P3 scheduler). 0 on success, -1 on
 // CUDA error (diagnostic on stderr).
@@ -673,6 +651,16 @@ namespace granite4 {
   } while (0)
 
 extern "C" {
+
+int granite4_kernel_gqa_fused_pos(const std::uint16_t* d_q, const std::uint16_t* d_k,
+                                  const std::uint16_t* d_v, float att_scale, int Hq,
+                                  int Hk, int d, int kv_len, int k_stride,
+                                  const int* d_pos, std::uint16_t* d_out);
+int granite4_kernel_gqa_fused_rows(const std::uint16_t* d_q,
+                                   const std::uint16_t* d_k,
+                                   const std::uint16_t* d_v, float att_scale,
+                                   int Hq, int Hk, int d, int base_kv, int rows,
+                                   int k_stride, std::uint16_t* d_out);
 
 int granite4_fp8_decode_all(float** d_out) {
   if (d_out == nullptr) return -1;
@@ -738,8 +726,8 @@ int granite4_kernel_rmsnorm(const std::uint16_t* d_x, const std::uint16_t* d_w,
       !std::isfinite(eps) || eps <= 0.0f || rows <= 0 || cols <= 0 ||
       static_cast<long long>(rows) * cols > INT_MAX)
     return -1;
-  // One block per row (block-per-row reduction; blockDim <= 320).
-  granite4::rmsnorm_kernel<<<rows, 256>>>(d_x, d_w, eps, rows, cols, d_out);
+  granite4::rmsnorm_kernel<<<rows, granite4::kRmsNormThreads>>>(d_x, d_w, eps, rows, cols,
+                                                                d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
@@ -754,7 +742,8 @@ int granite4_kernel_rmsnorm_batched(const std::uint16_t* d_x,
       !std::isfinite(eps) || eps <= 0.0f || rows <= 0 || rows > 4 || cols <= 0 ||
       static_cast<long long>(rows) * cols > INT_MAX)
     return -1;
-  granite4::rmsnorm_kernel<<<rows, 256>>>(d_x, d_w, eps, rows, cols, d_out);
+  granite4::rmsnorm_kernel<<<rows, granite4::kRmsNormThreads>>>(d_x, d_w, eps, rows, cols,
+                                                                d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
@@ -833,23 +822,75 @@ int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k
                               const std::uint16_t* d_v, float att_scale, int Hq,
                               int Hk, int d, int kv_len, int k_stride,
                               std::uint16_t* d_out) {
+  return granite4_kernel_gqa_fused_pos(d_q, d_k, d_v, att_scale, Hq, Hk, d, kv_len,
+                                       k_stride, nullptr, d_out);
+}
+
+std::size_t granite4_gqa_fused_smem_bytes(int d, int kv_len_max) {
+  if (d <= 0 || kv_len_max <= 0) return 0;
+  // [q row d][logits kv][probs kv] bf16, 8-byte aligned, then kv doubles for
+  // the parallel softmax. Rows shorter than kv_len_max place their double
+  // array earlier, and at most min(kv_len_max, parallel max) doubles are
+  // ever used, so this bounds every row of a batched launch.
+  const std::size_t base =
+      (static_cast<std::size_t>(d) + 2u * static_cast<std::size_t>(kv_len_max) + 3u) &
+      ~std::size_t(3);
+  const std::size_t exp_elems = static_cast<std::size_t>(
+      std::min(kv_len_max, granite4::kGqaSoftmaxParallelMax));
+  return base * sizeof(std::uint16_t) + exp_elems * sizeof(double);
+}
+
+int granite4_gqa_fused_smem_limit() {
+  static const int limit = [] {
+    int dev = 0, optin = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) !=
+            cudaSuccess) {
+      cudaGetLastError();
+      return 48 * 1024;
+    }
+    // Opt both fused kernels into the full per-block shared memory once; the
+    // dynamic budget is the opt-in total minus each kernel's static part.
+    int dyn = optin;
+    for (const void* fn : {reinterpret_cast<const void*>(granite4::gqa_fused_kernel),
+                           reinterpret_cast<const void*>(granite4::gqa_fused_batched_kernel)}) {
+      cudaFuncAttributes attr{};
+      if (cudaFuncGetAttributes(&attr, fn) != cudaSuccess) {
+        cudaGetLastError();
+        return 48 * 1024;
+      }
+      dyn = std::min(dyn, optin - static_cast<int>(attr.sharedSizeBytes));
+    }
+    for (const void* fn : {reinterpret_cast<const void*>(granite4::gqa_fused_kernel),
+                           reinterpret_cast<const void*>(granite4::gqa_fused_batched_kernel)}) {
+      if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn) !=
+          cudaSuccess) {
+        cudaGetLastError();
+        return 48 * 1024;
+      }
+    }
+    return dyn;
+  }();
+  return limit;
+}
+
+int granite4_kernel_gqa_fused_pos(const std::uint16_t* d_q, const std::uint16_t* d_k,
+                                  const std::uint16_t* d_v, float att_scale, int Hq,
+                                  int Hk, int d, int kv_len, int k_stride,
+                                  const int* d_pos, std::uint16_t* d_out) {
+  // With d_pos, kv_len is the upper bound the shared memory is sized for.
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_out == nullptr ||
       !std::isfinite(att_scale) || Hq <= 0 || Hk <= 0 || d <= 0 || kv_len <= 0 ||
       k_stride < kv_len || Hq < Hk || Hq % Hk != 0 ||
       d > granite4::kMaxHeadDim ||
       static_cast<long long>(Hq) * d > INT_MAX ||
       static_cast<long long>(Hk) * d > INT_MAX ||
-      static_cast<long long>(kv_len) + d > INT_MAX ||
-      static_cast<std::size_t>(kv_len) > granite4::kGqaSoftmaxParallelMaxSeqLen)
+      static_cast<long long>(kv_len) + d > INT_MAX)
     return -1;
-  const std::size_t base_elems = static_cast<std::size_t>(d) + 2u * kv_len;
-  const std::size_t exp_elems = (kv_len <= granite4::kGqaSoftmaxParallelMax) ? kv_len : 0u;
-  const std::size_t smem_bytes =
-      ((base_elems + exp_elems * (sizeof(double) / sizeof(std::uint16_t)) + 3u) & ~std::size_t(3)) *
-      sizeof(std::uint16_t);
-  if (smem_bytes > 48u * 1024u) return -1;
+  const std::size_t smem_bytes = granite4_gqa_fused_smem_bytes(d, kv_len);
+  if (smem_bytes > static_cast<std::size_t>(granite4_gqa_fused_smem_limit())) return -1;
   granite4::gqa_fused_kernel<<<Hq, d, smem_bytes>>>(d_q, d_k, d_v, att_scale, Hq, Hk,
-                                                     d, kv_len, k_stride, d_out);
+                                                     d, kv_len, k_stride, d_pos, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
@@ -879,27 +920,28 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
                                       int Hq, int Hk, int d, int base_kv,
                                       int rows, int k_stride,
                                       std::uint16_t* d_out) {
+  if (rows > 4) return -1;
+  return granite4_kernel_gqa_fused_rows(d_q, d_k, d_v, att_scale, Hq, Hk, d, base_kv,
+                                        rows, k_stride, d_out);
+}
+
+int granite4_kernel_gqa_fused_rows(const std::uint16_t* d_q,
+                                   const std::uint16_t* d_k,
+                                   const std::uint16_t* d_v, float att_scale,
+                                   int Hq, int Hk, int d, int base_kv, int rows,
+                                   int k_stride, std::uint16_t* d_out) {
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_out == nullptr ||
-      !std::isfinite(att_scale) || rows <= 0 || rows > 4 || Hq <= 0 || Hk <= 0 ||
+      !std::isfinite(att_scale) || rows <= 0 || rows > 65535 || Hq <= 0 || Hk <= 0 ||
       d <= 0 || base_kv < 0 || Hq < Hk || Hq % Hk != 0 ||
       d > granite4::kMaxHeadDim ||
       static_cast<long long>(Hq) * d > INT_MAX ||
       static_cast<long long>(Hk) * d > INT_MAX ||
-      base_kv > INT_MAX - rows || k_stride < base_kv + rows ||
-      static_cast<std::size_t>(base_kv + rows) >
-          granite4::kGqaSoftmaxParallelMaxSeqLen)
+      base_kv > INT_MAX - rows || k_stride < base_kv + rows)
     return -1;
   // Shared memory is sized for the longest row (base_kv + rows); each block
   // row uses only its own causal prefix within that allocation.
-  const int kv_len_max = base_kv + rows;
-  const std::size_t base_elems =
-      static_cast<std::size_t>(d) + 2u * static_cast<std::size_t>(kv_len_max);
-  const std::size_t exp_elems =
-      (kv_len_max <= granite4::kGqaSoftmaxParallelMax) ? kv_len_max : 0u;
-  const std::size_t smem_bytes =
-      ((base_elems + exp_elems * (sizeof(double) / sizeof(std::uint16_t)) + 3u) &
-       ~std::size_t(3)) *
-      sizeof(std::uint16_t);
+  const std::size_t smem_bytes = granite4_gqa_fused_smem_bytes(d, base_kv + rows);
+  if (smem_bytes > static_cast<std::size_t>(granite4_gqa_fused_smem_limit())) return -1;
   granite4::gqa_fused_batched_kernel<<<dim3(Hq, rows), d, smem_bytes>>>(
       d_q, d_k, d_v, att_scale, Hq, Hk, d, base_kv, rows, k_stride, d_out);
   G4_CUDA_CHECK(cudaGetLastError());

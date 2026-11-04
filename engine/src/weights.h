@@ -65,6 +65,11 @@ struct ModelWeights {
 bool load_weights(const std::string& dir, ModelWeights* out, std::string* error,
                   bool enforce_spec = true);
 
+// Read and strictly validate `dir`/config.json (step 1 of load_weights):
+// the spec check when `enforce_spec`, structural consistency otherwise.
+bool load_model_config(const std::string& dir, ModelConfig* out,
+                       std::string* error, bool enforce_spec = true);
+
 }  // namespace granite4
 
 #endif  // GRANITE4_WEIGHTS_H

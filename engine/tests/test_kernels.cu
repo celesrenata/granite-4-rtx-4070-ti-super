@@ -9,6 +9,7 @@
 // Also verifies the arch probe: the binary must have been compiled for
 // sm_89 and be running on it (the probe returns 1 only under __CUDA_ARCH__
 // == 890).
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -17,6 +18,7 @@
 #include <limits>
 #include <vector>
 
+#include "device_math.cuh"
 #include "kernel_math.h"
 #include "forward_gpu.h"    // GpuWeightsLayout, kGpuScalesPerLayer
 #include "forward_gpu_api.h" // public gpu_ctx_* / gpu_forward_range
@@ -128,6 +130,24 @@ extern "C" int granite4_kernel_gqa_fused_batched(
     float att_scale, int Hq, int Hk, int d, int base_kv, int rows, int k_stride,
     std::uint16_t* d_out);
 
+extern "C" int granite4_kernel_gqa_fused_rows(
+    const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
+    float att_scale, int Hq, int Hk, int d, int base_kv, int rows, int k_stride,
+    std::uint16_t* d_out);
+extern "C" int granite4_prefill_gemm_bf16(const std::uint16_t* d_a, const std::uint8_t* d_w,
+                                          float scale, int M, int N, int K,
+                                          std::uint16_t* d_c);
+namespace granite4 {
+std::size_t attn_split_scratch_bytes(int Hq, int rows, int stride);
+int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
+               const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
+               int kv_base, const int* d_pos, int rows, int stride, void* scratch,
+               std::uint16_t* out);
+int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
+                      const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
+                      int base_pos, int rows, int stride, std::uint16_t* out);
+}
+
 namespace {
 
 int g_failures = 0;
@@ -225,6 +245,36 @@ static void test_fp8_decode_all() {
     }
   }
   expect(bad == 0, "fp8_to_f32 branchless decode bit-exact on all 256 codepoints");
+}
+
+// The sm_89 hardware decode (fp8x4_to_f32) used by every decode GEMV must
+// agree bit-for-bit with the branchless reference on every finite code; only
+// the two NaN codes (never produced by the packer) may differ.
+__global__ void fp8_hw_vs_sw_kernel(int* bad) {
+  const std::uint32_t x = threadIdx.x;  // one code per thread
+  const std::uint32_t word = x | ((x ^ 0x5au) << 8) | ((x ^ 0xa5u) << 16) | ((x ^ 0xffu) << 24);
+  float h[4];
+  granite4::dev::fp8x4_to_f32(word, h[0], h[1], h[2], h[3]);
+  for (int j = 0; j < 4; ++j) {
+    const std::uint8_t code = static_cast<std::uint8_t>(word >> (8 * j));
+    if ((code & 0x7fu) == 0x7fu) continue;
+    if (__float_as_uint(h[j]) != __float_as_uint(granite4::dev::fp8_to_f32(code)))
+      atomicAdd(bad, 1);
+  }
+}
+
+static void test_fp8_hw_decode() {
+  int* d_bad = nullptr;
+  if (cudaMalloc(&d_bad, sizeof(int)) != cudaSuccess) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemset(d_bad, 0, sizeof(int)));
+  fp8_hw_vs_sw_kernel<<<1, 256>>>(d_bad);
+  int bad = -1;
+  CUDA_CHECK(cudaMemcpy(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaFree(d_bad));
+  expect(bad == 0, "fp8x4_to_f32 hardware decode bit-exact on all finite codes");
 }
 
 static void test_rmsnorm_device() {
@@ -431,8 +481,8 @@ static void test_verify_gemv_production_parity_device() {
   CUDA_CHECK(cudaMemcpy(r.data(), dr, r.size() * 2, cudaMemcpyDeviceToHost));
   int parity_bad = 0;
   for (std::size_t i = 0; i < v.size(); ++i)
-    if (!bf16_close(v[i], r[i], 2)) ++parity_bad;
-  expect(parity_bad == 0, "verify GEMV: within 2 ULP of production GEMV");
+    if (v[i] != r[i]) ++parity_bad;
+  expect(parity_bad == 0, "verify GEMV: bit-identical to production GEMV");
   cudaFree(da); cudaFree(db); cudaFree(dv); cudaFree(dr);
 }
 
@@ -797,6 +847,139 @@ static void test_gqa_fused_device() {
   cudaFree(dp);
   cudaFree(dout);
   cudaFree(dout2);
+}
+
+// Tensor-core prefill GEMM vs the exact host GEMM (f32 sum order differs:
+// within bf16 rounding). Shapes exercise partial M and N tiles.
+static void test_prefill_gemm_device() {
+  const int M = 70, N = 136, K = 256;
+  Xorshift64 rng(0x6e44);
+  std::vector<std::uint16_t> a(static_cast<std::size_t>(M) * K);
+  std::vector<std::uint8_t> w(static_cast<std::size_t>(N) * K);
+  for (auto& x : a) x = gen_bf16(rng);
+  for (auto& x : w) x = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  const float scale = 0.0123f;
+  std::uint16_t *da = nullptr, *dc = nullptr;
+  std::uint8_t* dw = nullptr;
+  if (cudaMalloc(&da, a.size() * 2) || cudaMalloc(&dw, w.size()) ||
+      cudaMalloc(&dc, static_cast<std::size_t>(M) * N * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(da, a.data(), a.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice));
+  expect(granite4_prefill_gemm_bf16(da, dw, scale, M, N, K, dc) == 0, "prefill gemm: launch");
+  std::vector<std::uint16_t> got(static_cast<std::size_t>(M) * N);
+  CUDA_CHECK(cudaMemcpy(got.data(), dc, got.size() * 2, cudaMemcpyDeviceToHost));
+  int bad = 0;
+  for (int m = 0; m < M; ++m)
+    for (int n = 0; n < N; ++n) {
+      double ref = 0.0;
+      for (int k = 0; k < K; ++k)
+        ref += static_cast<double>(bf16_to_f32_host(a[static_cast<std::size_t>(m) * K + k])) *
+               fp8_to_f32_host(w[static_cast<std::size_t>(n) * K + k]);
+      if (!bf16_close(got[static_cast<std::size_t>(m) * N + n],
+                      f32_to_bf16_host(static_cast<float>(scale * ref)), 2))
+        ++bad;
+    }
+  expect(bad == 0, "prefill gemm: within 2 ULP of the exact product");
+  cudaFree(da); cudaFree(dw); cudaFree(dc);
+}
+
+// Tensor-core causal prefill attention vs the fused GQA reference (bf16
+// logits, double softmax) on the same cache: per element within a small
+// absolute tolerance relative to the output scale.
+static void test_prefill_attention_device() {
+  const int Hq = 8, Hk = 2, d = 128, base = 37, rows = 75, stride = 128;
+  Xorshift64 rng(0xa77e);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  std::uint16_t *dq, *dk, *dv, *dref, *dgot;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dk, cn * 2) || cudaMalloc(&dv, cn * 2) ||
+      cudaMalloc(&dref, qn * 2) || cudaMalloc(&dgot, qn * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  const float scale = 0.0078125f * 8.0f;  // sharper than the model's, harder
+  expect(granite4_kernel_gqa_fused_rows(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride,
+                                        dref) == 0,
+         "prefill attention: reference launch");
+  expect(granite4::prefill_attention(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride,
+                                     dgot) == 0,
+         "prefill attention: launch");
+  std::vector<std::uint16_t> ref(qn), got(qn);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got.data(), dgot, qn * 2, cudaMemcpyDeviceToHost));
+  double max_err = 0.0;
+  for (std::size_t i = 0; i < qn; ++i)
+    max_err = std::max(max_err, static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) -
+                                                              bf16_to_f32_host(ref[i]))));
+  std::printf("  prefill attention: max |delta| = %.5f\n", max_err);
+  expect(max_err < 0.03, "prefill attention: matches fused GQA within bf16 tolerance");
+  cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dref); cudaFree(dgot);
+}
+
+// Split-KV attention vs fused GQA on long prefixes (several splits), both
+// with a host kv_base and with the position read from device memory; the
+// device-position single row must equal the corresponding batched row
+// bit for bit (decode and verify share one layout).
+static void test_attn_split_device() {
+  const int Hq = 8, Hk = 2, d = 128, stride = 1500, base = 1203, rows = 4;
+  Xorshift64 rng(0x5917);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  const float scale = 0.0078125f * 8.0f;
+  std::uint16_t *dq, *dk, *dv, *dref, *dgot, *done;
+  int* dpos;
+  void* scratch;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dk, cn * 2) || cudaMalloc(&dv, cn * 2) ||
+      cudaMalloc(&dref, qn * 2) || cudaMalloc(&dgot, qn * 2) || cudaMalloc(&done, qn * 2) ||
+      cudaMalloc(&dpos, sizeof(int)) ||
+      cudaMalloc(&scratch, granite4::attn_split_scratch_bytes(Hq, rows, stride))) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  expect(granite4_kernel_gqa_fused_rows(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride,
+                                        dref) == 0,
+         "split attention: reference launch");
+  expect(granite4::attn_split(dq, dk, dv, scale, Hq, Hk, d, base, nullptr, rows, stride,
+                              scratch, dgot) == 0,
+         "split attention: batched launch");
+  const int pos = base + 2;  // row 2 as a device-position decode row
+  CUDA_CHECK(cudaMemcpy(dpos, &pos, sizeof(int), cudaMemcpyHostToDevice));
+  const std::size_t r2 = static_cast<std::size_t>(2) * Hq * d;
+  expect(granite4::attn_split(dq + r2, dk, dv, scale, Hq, Hk, d, 0, dpos, 1, stride, scratch,
+                              done) == 0,
+         "split attention: device-position launch");
+  std::vector<std::uint16_t> ref(qn), got(qn), one(static_cast<std::size_t>(Hq) * d);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got.data(), dgot, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(one.data(), done, one.size() * 2, cudaMemcpyDeviceToHost));
+  double max_err = 0.0;
+  for (std::size_t i = 0; i < qn; ++i)
+    max_err = std::max(max_err, static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) -
+                                                              bf16_to_f32_host(ref[i]))));
+  std::printf("  split attention: max |delta| = %.5f\n", max_err);
+  expect(max_err < 0.03, "split attention: matches fused GQA within bf16 tolerance");
+  bool same = true;
+  for (std::size_t i = 0; i < one.size(); ++i) same = same && one[i] == got[r2 + i];
+  expect(same, "split attention: decode row bit-identical to the batched row");
+  cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dref); cudaFree(dgot); cudaFree(done);
+  cudaFree(dpos); cudaFree(scratch);
 }
 
 static void test_batched_verify_attention_device() {
@@ -1204,7 +1387,8 @@ static void test_batched_forward_range_parity_device() {
   const int max_pos = 32;
   const int seq_len = 13;
 
-  const GpuWeightsLayout lay{H, I, V, L, Hq, Hk, d};
+  const auto z = [](int v) { return static_cast<std::size_t>(v); };
+  const GpuWeightsLayout lay{z(H), z(I), z(V), z(L), z(Hq), z(Hk), z(d)};
   Xorshift64 rng(0xF0F0);
   auto gen_bf16v = [&]() { return gen_bf16(rng); };
   auto gen_fp8 = [&]() { return fp8_e4m3_encode(rng.next_float_range(2.0), nullptr); };
@@ -1420,6 +1604,7 @@ int main() {
   }
   test_arch_probe();
   test_fp8_decode_all();
+  test_fp8_hw_decode();
   test_rmsnorm_device();
   test_rope_device();
   test_softmax_device();
@@ -1435,6 +1620,9 @@ int main() {
   test_attention_device();
   test_gqa_fused_device();
   test_batched_verify_attention_device();
+  test_prefill_gemm_device();
+  test_prefill_attention_device();
+  test_attn_split_device();
   test_batched_silu_gate_up_device();
   test_batched_rmsnorm_device();
   test_batched_rope_device();

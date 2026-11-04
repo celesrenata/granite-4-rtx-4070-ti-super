@@ -1,4 +1,4 @@
-// Correctness test for the contained experimental batched verify GEMV API.
+// Correctness test for the fused-k verify GEMV against a host fmaf reference.
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdint>
@@ -23,7 +23,12 @@ int main() {
   std::vector<std::uint16_t> a(T*K), out(T*R), got(T*R);
   std::vector<std::uint8_t> b(R*K);
   for (int i = 0; i < T*K; ++i) a[i] = bf16(std::sin(i * .071f) * .5f);
-  for (int i = 0; i < R*K; ++i) b[i] = static_cast<std::uint8_t>((i * 37 + 11) & 0x7f);
+  // Finite codes only: 0x7f / 0xff are the e4m3 NaN, which the packer never
+  // emits (fp8_e4m3_encode clips finite input to +-448).
+  for (int i = 0; i < R*K; ++i) {
+    const std::uint8_t code = static_cast<std::uint8_t>((i * 37 + 11) & 0x7f);
+    b[i] = code == 0x7f ? 0x7e : code;
+  }
   std::vector<std::uint16_t> ref(T*R);
   for (int t = 0; t < T; ++t) for (int r = 0; r < R; ++r) {
     float sum = 0;

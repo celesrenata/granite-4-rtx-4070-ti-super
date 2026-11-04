@@ -18,30 +18,46 @@
 //     Greedy (seed=0) or seeded top-p generation, emitting the produced
 //     token ids as JSON. (Tokenization/detokenization is done by the caller -
 //     the Python harness - so this path is token-level, not text-level.)
-//     With `--gpu 1` the per-step forward runs on the device.
+//     With `--gpu 1` the forward runs on the device: one prefill call for the
+//     prompt, then greedy decode chained on the device (gpu_decode_greedy:
+//     one graph launch per token, ids read back once at the end).
 //     `--draft-lookup K` (greedy only) proposes up to K repeated spans from
 //     the token history, verifies each proposal against the target's greedy
-//     argmax one position at a time, and commits the accepted prefix. It
+//     argmax in one batched forward, and commits the accepted prefix. It
 //     reports `G4_DRAFT steps=... proposed=... accepted=...` to stderr, and
 //     echoes the same counters in the stdout JSON as
 //     `{"generated":[...],"draft":{"steps":S,"proposed":P,"accepted":A,
 //     "accept_rate":R}}` so a benchmark harness can parse one document.
+//     `--eos ID` stops generation after the first ID (emitted, then nothing
+//     more); without it exactly --max-tokens tokens are produced.
 //     Works on the CUDA path (draft-verify against the device logits) and on
-//     the host oracle path (draft-verify against the f32 host logits); each
-//     step replays the full accepted prefix because the host oracle has no
-//     incremental KV watermark.
+//     the host oracle path (draft-verify against the f32 host logits); the
+//     host path replays the full accepted prefix each step because the host
+//     oracle has no incremental KV watermark.
+//
+//   serve --checkpoint DIR --gpu 1 [--max-context N]
+//     Persistent engine: loads the model once (default 8192 positions per
+//     request), prints {"ready":true,"max_context":N}, then answers one JSON
+//     request per stdin line - {"tokens":[...],"max_tokens":N,"seed":S,
+//     "draft_lookup":K,"eos":ID} (all but tokens/max_tokens optional) - with
+//     one generate document per stdout line, or {"error":"..."}. Requests
+//     run one at a time; EOF on stdin exits.
 //
 // Tokenization is intentionally NOT done here: the checkpoint ships an HF
 // `tokenizer.json` that the Python harness loads with the `tokenizers`
 // library, keeping token-for-token parity on one side.
+//
+// G4_LOAD_TIMING=1 prints the load / pack / upload wall times to stderr.
 
 #include "checkpoint.h"
 #include "draft_lookup.h"
+#include "json.h"
 #include "kernel_math.h"
 #include "speculative_verify.h"
 #include "weights.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -51,8 +67,9 @@
 #include <vector>
 
 #if defined(GRANITE_CUDA) && GRANITE_CUDA == 1
-#include "forward_gpu_api.h"
 #include "forward_gpu.h"
+#include "forward_gpu_api.h"
+#include "gpu_pack.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -60,14 +77,100 @@ using namespace granite4;
 
 namespace {
 
+struct Args {
+  std::string sub, dir;
+  std::vector<std::int32_t> tokens;
+  int max_tokens = 0, last = 0, gpu = 0, draft_k = 0;
+  long seed = 0;
+  long eos = -1;  // stop token (-1: none)
+  int max_context = 8192;  // serve: positions per request
+
+  bool is_eos(std::int32_t tok) const { return eos >= 0 && tok == eos; }
+};
+
+bool parse_args(int argc, char** argv, Args* a) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string s = argv[i];
+    if (s == "forward" || s == "generate" || s == "serve") {
+      a->sub = s;
+    } else if (s == "--checkpoint" && i + 1 < argc) {
+      a->dir = argv[++i];
+    } else if (s == "--tokens" && i + 1 < argc) {
+      std::stringstream ss(argv[++i]);
+      std::string tok;
+      while (std::getline(ss, tok, ','))
+        if (!tok.empty()) a->tokens.push_back(std::stoi(tok));
+    } else if (s == "--max-tokens" && i + 1 < argc) {
+      a->max_tokens = std::atoi(argv[++i]);
+    } else if (s == "--seed" && i + 1 < argc) {
+      a->seed = std::atol(argv[++i]);
+    } else if (s == "--last" && i + 1 < argc) {
+      a->last = std::atoi(argv[++i]);
+    } else if (s == "--gpu" && i + 1 < argc) {
+      a->gpu = std::atoi(argv[++i]);
+    } else if (s == "--draft-lookup" && i + 1 < argc) {
+      a->draft_k = std::atoi(argv[++i]);
+    } else if (s == "--eos" && i + 1 < argc) {
+      a->eos = std::atol(argv[++i]);
+    } else if (s == "--max-context" && i + 1 < argc) {
+      a->max_context = std::atoi(argv[++i]);
+    } else {
+      return false;
+    }
+  }
+  if (a->sub == "serve") return !a->dir.empty() && a->max_context > 0;
+  return !a->sub.empty() && !a->dir.empty() && !a->tokens.empty();
+}
+
+// Emit rows [from, n) of a [n][vocab] logits table as JSON.
+template <typename Get>
+void print_logits(int from, int n, std::size_t vocab, const Get& get) {
+  std::string out = "{\"logits\":[";
+  char buf[32];
+  for (int t = from; t < n; ++t) {
+    if (t > from) out += ',';
+    out += "{\"position\":" + std::to_string(t) + ",\"values\":[";
+    for (std::size_t v = 0; v < vocab; ++v) {
+      if (v) out += ',';
+      const int len = std::snprintf(buf, sizeof buf, "%.9g", get(t, v));
+      out.append(buf, static_cast<std::size_t>(len));
+    }
+    out += "]}";
+  }
+  out += "]}\n";
+  std::fwrite(out.data(), 1, out.size(), stdout);
+}
+
+int argmax_f32(const float* p, int n) {
+  int best = 0;
+  for (int c = 1; c < n; ++c)
+    if (p[c] > p[best]) best = c;
+  return best;
+}
+
+void report_draft(const DraftReport& report) {
+  std::fprintf(stderr, "G4_DRAFT steps=%ld proposed=%ld accepted=%ld rate=%.3f\n",
+               report.steps, report.proposed, report.accepted, draft_accept_rate(report));
+}
+
+class LoadTimer {
+ public:
+  LoadTimer() : on_(std::getenv("G4_LOAD_TIMING") != nullptr) {}
+  void lap(const char* what) {
+    const auto now = std::chrono::steady_clock::now();
+    if (on_)
+      std::fprintf(stderr, "G4_LOAD %s=%.2fs\n", what,
+                   std::chrono::duration<double>(now - last_).count());
+    last_ = now;
+  }
+
+ private:
+  bool on_;
+  std::chrono::steady_clock::time_point last_ = std::chrono::steady_clock::now();
+};
+
 // ---------------------------------------------------------------------------
-// GPU forward support (compiled only when GRANITE_CUDA).
-//
-// The host loads dequantized float weights (ModelWeights, weights.h). To
-// feed the device pass we re-pack them into the GpuWeightsLayout
-// (forward_gpu.h): the GEMM weight tensors are quantized to FP8 e4m3 with a
-// per-tensor scale (max_abs/448 - the P1 storage decision), while the
-// embeddings and norm weights stay BF16 (the original checkpoint dtype).
+// GPU paths (compiled only when GRANITE_CUDA).
 // ---------------------------------------------------------------------------
 #if defined(GRANITE_CUDA) && GRANITE_CUDA == 1
 
@@ -75,633 +178,581 @@ namespace {
   do {                                                                        \
     cudaError_t e_ = (expr);                                                  \
     if (e_ != cudaSuccess) {                                                  \
-      std::fprintf(stderr, "granite4: host CUDA error at %s:%d: %s\n",        \
-                   __FILE__, __LINE__, cudaGetErrorString(e_));               \
+      *error = std::string("cuda: ") + cudaGetErrorString(e_) + " at " +      \
+               std::to_string(__LINE__);                                      \
       return false;                                                           \
     }                                                                         \
   } while (0)
 
-struct GpuModel {
-  GpuWeightsLayout lay;
-  std::vector<std::uint8_t> weights;  // packed (GpuWeightsLayout)
-  std::vector<float> scales;          // [lay.num_scales()]
-};
-
-// Convert a dequantized float row-major matrix to BF16 (2 bytes/element).
-// Float values here are exact BF16-decoded originals, so the conversion is
-// lossless.
-void push_bf16(std::vector<std::uint8_t>* buf, const float* src,
-                std::size_t n) {
-  buf->resize(buf->size() + 2 * n);
-  std::uint8_t* p = buf->data() + buf->size() - 2 * n;
-  for (std::size_t i = 0; i < n; ++i) {
-    const std::uint16_t b = f32_to_bf16_host(src[i]);
-    p[2 * i] = static_cast<std::uint8_t>(b & 0xFF);
-    p[2 * i + 1] = static_cast<std::uint8_t>(b >> 8);
-  }
-}
-
-// Quantize a float row-major matrix [rows][cols] to FP8 e4m3 with a
-// per-tensor scale (max_abs/448). Returns the scale (0 if the tensor is all
-// zero).
-float push_fp8_pt(std::vector<std::uint8_t>* buf, const float* src,
-                  std::size_t rows, std::size_t cols) {
-  double mx = 0.0;
-  for (std::size_t i = 0; i < rows * cols; ++i) {
-    const double a = std::abs(static_cast<double>(src[i]));
-    if (a > mx) mx = a;
-  }
-  const float scale = static_cast<float>(mx / kFp8E4M3MaxF);
-  buf->resize(buf->size() + rows * cols);
-  std::uint8_t* p = buf->data() + buf->size() - rows * cols;
-  if (scale <= 0.0f) {
-    std::memset(p, 0, rows * cols);
-    return 0.0f;
-  }
-  for (std::size_t i = 0; i < rows * cols; ++i) {
-    bool sat = false;
-    p[i] = fp8_e4m3_encode(static_cast<double>(src[i]) /
-                               static_cast<double>(scale),
-                           &sat);
-  }
-  return scale;
-}
-
-bool pack_gpu_model(const ModelWeights& w, GpuModel* out, std::string* error) {
-  const GpuWeightsLayout lay{w.model.hidden_size, w.model.intermediate_size,
-                             w.model.vocab_size, w.model.num_layers,
-                             w.model.num_attention_heads,
-                             w.model.num_key_value_heads, w.model.head_dim};
-  out->lay = lay;
-  auto& buf = out->weights;
-  auto& scales = out->scales;
-  buf.clear();
-  scales.clear();
-  buf.reserve(lay.total_bytes());
-  scales.reserve(lay.num_scales());
-
-  // embed [vocab][hidden] BF16.
-  push_bf16(&buf, w.embed.data(), lay.vocab * lay.hidden);
-
-  // Per-layer float offsets (the oracle's safetensors order, kernel_math.h).
-  const std::size_t H = lay.hidden, I = lay.intermediate;
-  const std::size_t KV = lay.num_kv_heads * lay.head_dim;
-  const std::size_t off_post_ln = H;
-  const std::size_t off_q = 2 * H;
-  const std::size_t off_k = off_q + H * H;
-  const std::size_t off_v = off_k + KV * H;
-  const std::size_t off_o = off_v + KV * H;
-  const std::size_t off_gate = off_o + H * H;
-  const std::size_t off_up = off_gate + I * H;
-  const std::size_t off_down = off_up + I * H;
-  const std::size_t layer_f = off_down + H * I;
-
-  for (std::size_t layer = 0; layer < lay.num_layers; ++layer) {
-    const float* const lb =
-        w.layers.data() + layer * (w.layer_bytes > 0 ? w.layer_bytes : layer_f);
-    // Norm weights stay BF16.
-    push_bf16(&buf, lb, H);
-    push_bf16(&buf, lb + off_post_ln, H);
-    // GEMM weights: FP8 per-tensor (order: q, k, v, o, gate, up, down).
-    scales.push_back(push_fp8_pt(&buf, lb + off_q, H, H));
-    scales.push_back(push_fp8_pt(&buf, lb + off_k, KV, H));
-    scales.push_back(push_fp8_pt(&buf, lb + off_v, KV, H));
-    scales.push_back(push_fp8_pt(&buf, lb + off_o, H, H));
-    scales.push_back(push_fp8_pt(&buf, lb + off_gate, I, H));
-    scales.push_back(push_fp8_pt(&buf, lb + off_up, I, H));
-    scales.push_back(push_fp8_pt(&buf, lb + off_down, H, I));
+// One sequence on the device. The packed weights (streamed straight from the
+// checkpoint, gpu_pack.h) are uploaded once; the KV history persists in the
+// ctx, so every call forwards only the positions past the watermark. The
+// host keeps the token sequence; only new tokens go up, and only argmax ids
+// (or the one logits row a sampler needs) come back.
+class GpuSession {
+ public:
+  ~GpuSession() {
+    cudaFree(d_tokens_);
+    cudaFree(d_logits_);
+    cudaFree(d_argmax_);
+    if (ctx_ != nullptr) gpu_ctx_free(ctx_);
   }
 
-  // final_norm BF16, lm_head FP8.
-  push_bf16(&buf, w.final_norm.data(), lay.hidden);
-  scales.push_back(
-      push_fp8_pt(&buf, w.lm_head.data(), lay.vocab, lay.hidden));
-
-  if (buf.size() != lay.total_bytes()) {
-    *error = "gpu pack: buffer size mismatch";
-    return false;
-  }
-  if (scales.size() != lay.num_scales()) {
-    *error = "gpu pack: scale count mismatch";
-    return false;
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// GPU inference session (P2: persistent weights + incremental decode).
-//
-// The ~9.5 GB packed weights are uploaded ONCE (gpu_weights_load) and every
-// step runs incrementally on the device: gpu_forward_range processes only
-// positions [written, end) because the KV history persists in the ctx
-// caches. Token/logits buffers are preallocated for max_pos positions; per
-// step only the newly computed logits rows are copied back.
-// ---------------------------------------------------------------------------
-struct GpuSession {
-  GpuCtx* ctx = nullptr;
-  std::int32_t* d_tokens = nullptr;   // [max_pos]
-  std::uint16_t* d_logits = nullptr;  // [max_pos * vocab]
-  int max_pos = 0;
-  std::int32_t vocab = 0;
-
-  ~GpuSession() { close(); }
-
-  // Open the session: create the ctx and upload the packed weights. `gm`
-  // (and `w.model`) must outlive the session.
-  bool open(const GpuModel& gm, const ModelConfig& cfg, int max_pos,
-            std::string* error) {
-    this->max_pos = max_pos;
-    this->vocab = static_cast<std::int32_t>(cfg.vocab_size);
-    char err[256] = "";
-    ctx = gpu_ctx_create(cfg, kForwardSpec, max_pos);
-    if (ctx == nullptr) {
+  // logit_rows: capacity of the logits buffer in rows.
+  bool open(const std::string& dir, int max_pos, int logit_rows, std::string* error) {
+    LoadTimer timer;
+    ModelConfig cfg;
+    if (!load_model_config(dir, &cfg, error, /*enforce_spec=*/true)) return false;
+    GpuModel gm;
+    if (!pack_gpu_model_from_checkpoint(dir, cfg, &gm, error)) return false;
+    timer.lap("pack");
+    max_pos_ = max_pos;
+    vocab_ = static_cast<int>(cfg.vocab_size);
+    logit_rows_ = logit_rows;
+    ctx_ = gpu_ctx_create(cfg, kForwardSpec, max_pos);
+    if (ctx_ == nullptr) {
       *error = "gpu_ctx_create failed";
       return false;
     }
-    if (gpu_weights_load(ctx, gm.weights.data(), gm.weights.size(),
-                         gm.scales.data(), gm.scales.size(), err, sizeof err) != 0) {
+    char err[256] = "";
+    if (gpu_weights_load(ctx_, gm.weights.get(), gm.bytes, gm.scales.data(),
+                         gm.scales.size(), err, sizeof err) != 0) {
       *error = std::string("gpu_weights_load: ") + err;
-      gpu_ctx_free(ctx);
-      ctx = nullptr;
       return false;
     }
-    G4_HOST_CUDA_CHECK(
-        cudaMalloc(&d_tokens, sizeof(std::int32_t) * static_cast<std::size_t>(max_pos)));
-    G4_HOST_CUDA_CHECK(cudaMalloc(
-        &d_logits, sizeof(std::uint16_t) *
-                       static_cast<std::size_t>(max_pos) *
-                       static_cast<std::size_t>(vocab)));
+    timer.lap("upload");
+    G4_HOST_CUDA_CHECK(cudaMalloc(&d_tokens_, sizeof(std::int32_t) * max_pos));
+    G4_HOST_CUDA_CHECK(cudaMalloc(&d_argmax_, sizeof(std::int32_t) * logit_rows));
+    G4_HOST_CUDA_CHECK(cudaMalloc(&d_logits_, sizeof(std::uint16_t) *
+                                                  static_cast<std::size_t>(logit_rows) *
+                                                  vocab_));
     return true;
   }
 
-  void close() {
-    if (d_tokens != nullptr) cudaFree(d_tokens);
-    d_tokens = nullptr;
-    if (d_logits != nullptr) cudaFree(d_logits);
-    d_logits = nullptr;
-    if (ctx != nullptr) gpu_ctx_free(ctx);
-    ctx = nullptr;
+  int vocab() const { return vocab_; }
+  int max_pos() const { return max_pos_; }
+  int logit_rows() const { return logit_rows_; }
+  int written() const { return gpu_ctx_written(ctx_); }
+  bool truncate(int written) { return gpu_ctx_truncate(ctx_, written) == 0; }
+
+
+  bool upload(const std::vector<std::int32_t>& seq, int from, int to, std::string* error) {
+    if (to <= from) return true;
+    G4_HOST_CUDA_CHECK(cudaMemcpy(d_tokens_ + from, seq.data() + from,
+                                  sizeof(std::int32_t) * (to - from),
+                                  cudaMemcpyHostToDevice));
+    return true;
   }
 
-  // Forward for tokens[0, end): incremental (positions below the KV
-  // watermark are skipped). Reads the computed rows back into `logits`
-  // ([end * vocab] BF16, resized).
-  bool step(const std::int32_t* tokens, int end,
-            std::vector<std::uint16_t>* logits, std::string* error) {
-    const int start = gpu_ctx_written(ctx);
-    G4_HOST_CUDA_CHECK(cudaMemcpy(d_tokens, tokens,
-                                  sizeof(std::int32_t) * static_cast<std::size_t>(end),
-                                  cudaMemcpyHostToDevice));
-    char err[256] = "";
-    if (gpu_forward_range(ctx, d_tokens, end, d_logits, err, sizeof err) != 0) {
-      *error = std::string("gpu_forward_range: ") + err;
+  // Forward [written, end); logits (and greedy ids) for rows >= logits_from.
+  bool forward(int end, int logits_from, std::string* error) {
+    if (end - logits_from > logit_rows_) {
+      *error = "logits buffer too small";
       return false;
     }
-    const int row_from = (end > start) ? start : 0;
-    logits->resize(static_cast<std::size_t>(end) * static_cast<std::size_t>(vocab));
-    G4_HOST_CUDA_CHECK(cudaMemcpy(logits->data() +
-                                      static_cast<std::size_t>(row_from) *
-                                          static_cast<std::size_t>(vocab),
-                                  d_logits +
-                                      static_cast<std::size_t>(row_from) *
-                                          static_cast<std::size_t>(vocab),
-                                  sizeof(std::uint16_t) *
-                                      static_cast<std::size_t>(end - row_from) *
-                                      static_cast<std::size_t>(vocab),
+    GpuForwardOut out;
+    out.d_logits = d_logits_;
+    out.logits_from = logits_from;
+    out.d_argmax = d_argmax_;
+    char err[256] = "";
+    if (gpu_forward(ctx_, d_tokens_, end, out, err, sizeof err) != 0) {
+      *error = std::string("gpu_forward: ") + err;
+      return false;
+    }
+    return true;
+  }
+
+  bool argmax(int rows, std::vector<std::int32_t>* ids, std::string* error) {
+    ids->resize(static_cast<std::size_t>(rows));
+    G4_HOST_CUDA_CHECK(cudaMemcpy(ids->data(), d_argmax_, sizeof(std::int32_t) * rows,
                                   cudaMemcpyDeviceToHost));
     return true;
   }
 
-  // Discard every cached position: the next step replays from position 0.
-  // Used to drop KV rows written for rejected speculative drafts.
-  void reset() { gpu_ctx_reset(ctx); }
+  bool logits(int rows, std::vector<std::uint16_t>* out, std::string* error) {
+    out->resize(static_cast<std::size_t>(rows) * vocab_);
+    G4_HOST_CUDA_CHECK(cudaMemcpy(out->data(), d_logits_, sizeof(std::uint16_t) * out->size(),
+                                  cudaMemcpyDeviceToHost));
+    return true;
+  }
 
-  // Keep the accepted prefix and discard only speculative rows.
-  bool truncate(int written) { return gpu_ctx_truncate(ctx, written) == 0; }
+  // Greedy chain of `steps` positions from the watermark (see
+  // gpu_decode_greedy); the ids land in d_tokens[written + 1 ...].
+  bool decode_greedy(int steps, std::string* error) {
+    char err[256] = "";
+    if (gpu_decode_greedy(ctx_, d_tokens_, steps, d_logits_, err, sizeof err) != 0) {
+      *error = std::string("gpu_decode_greedy: ") + err;
+      return false;
+    }
+    return true;
+  }
+
+  // Device token ids [from, to) back to the host.
+  bool tokens(int from, int to, std::vector<std::int32_t>* out, std::string* error) {
+    out->resize(static_cast<std::size_t>(to - from));
+    G4_HOST_CUDA_CHECK(cudaMemcpy(out->data(), d_tokens_ + from,
+                                  sizeof(std::int32_t) * (to - from),
+                                  cudaMemcpyDeviceToHost));
+    return true;
+  }
+
+  // Enqueue a device -> host copy of ids [from, to) into `host` (pinned) and
+  // record `done` after it; nothing waits.
+  bool tokens_async(int from, int to, std::int32_t* host, cudaEvent_t done,
+                    std::string* error) {
+    G4_HOST_CUDA_CHECK(cudaMemcpyAsync(host, d_tokens_ + from,
+                                       sizeof(std::int32_t) * (to - from),
+                                       cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    G4_HOST_CUDA_CHECK(cudaEventRecord(done, cudaStreamPerThread));
+    return true;
+  }
+
+  // Copy the first argmax id to d_tokens[at] on the device.
+  bool argmax_to_token(int at, std::string* error) {
+    G4_HOST_CUDA_CHECK(cudaMemcpy(d_tokens_ + at, d_argmax_, sizeof(std::int32_t),
+                                  cudaMemcpyDeviceToDevice));
+    return true;
+  }
+
+ private:
+  GpuCtx* ctx_ = nullptr;
+  std::int32_t* d_tokens_ = nullptr;   // [max_pos]
+  std::uint16_t* d_logits_ = nullptr;  // [logit_rows][vocab]
+  std::int32_t* d_argmax_ = nullptr;   // [logit_rows]
+  int max_pos_ = 0, vocab_ = 0, logit_rows_ = 0;
 };
+
+int fail(const std::string& err) {
+  std::fprintf(stderr, "%s\n", err.c_str());
+  return 1;
+}
+
+int gpu_forward_cmd(const Args& a) {
+  std::string err;
+  const int n = static_cast<int>(a.tokens.size());
+  GpuSession s;
+  std::vector<std::uint16_t> logits;
+  if (!s.open(a.dir, n, n, &err) || !s.upload(a.tokens, 0, n, &err) ||
+      !s.forward(n, 0, &err) || !s.logits(n, &logits, &err))
+    return fail(err);
+  const std::size_t V = static_cast<std::size_t>(s.vocab());
+  print_logits(a.last > 0 ? std::max(0, n - a.last) : 0, n, V, [&](int t, std::size_t v) {
+    return bf16_to_f32_host(logits[static_cast<std::size_t>(t) * V + v]);
+  });
+  return 0;
+}
+
+// Pinned host ids plus one event per decode chunk (EOS polling).
+class TokenStream {
+ public:
+  ~TokenStream() {
+    for (auto& e : events_) cudaEventDestroy(e);
+    cudaFreeHost(host_);
+  }
+  bool init(int n, int chunks, std::string* error) {
+    G4_HOST_CUDA_CHECK(cudaHostAlloc(&host_, sizeof(std::int32_t) * n, cudaHostAllocDefault));
+    events_.resize(static_cast<std::size_t>(chunks), nullptr);
+    for (auto& e : events_)
+      G4_HOST_CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+    return true;
+  }
+  std::int32_t* host() { return host_; }
+  cudaEvent_t event(int i) { return events_[static_cast<std::size_t>(i)]; }
+
+ private:
+  std::int32_t* host_ = nullptr;
+  std::vector<cudaEvent_t> events_;
+};
+
+// The generate modes run on an already open session (one-shot CLI or the
+// persistent `serve` loop) and start from an empty KV cache. Preconditions
+// (checked by check_request): prompt + max_tokens (+ draft_k) fits the
+// session's positions and draft_k + 1 fits its logits rows.
+struct Generation {
+  std::vector<std::int32_t> ids;
+  DraftReport report;
+  bool drafted = false;
+};
+
+bool check_request(const GpuSession& s, const Args& a, std::string* error) {
+  const long need = static_cast<long>(a.tokens.size()) + a.max_tokens + a.draft_k;
+  if (a.tokens.empty() || a.max_tokens <= 0) {
+    *error = "empty prompt or max_tokens <= 0";
+    return false;
+  }
+  if (need > s.max_pos()) {
+    *error = "prompt + max_tokens exceeds the context (" + std::to_string(s.max_pos()) + ")";
+    return false;
+  }
+  if (a.draft_k < 0 || a.draft_k + 1 > s.logit_rows()) {
+    *error = "draft_lookup out of range";
+    return false;
+  }
+  if (a.draft_k > 0 && a.seed != 0) {
+    *error = "draft-lookup: greedy only (omit --seed)";
+    return false;
+  }
+  for (std::int32_t t : a.tokens)
+    if (t < 0 || t >= s.vocab()) {
+      *error = "token id out of range";
+      return false;
+    }
+  return true;
+}
+
+bool generate_greedy(GpuSession& s, const Args& a, Generation* out, std::string* error) {
+  const int plen = static_cast<int>(a.tokens.size());
+  // Prefill: the prompt's KV plus the last row's greedy token, written on the
+  // device straight into d_tokens[plen]; the decode chain continues from it.
+  if (!s.truncate(0) || !s.upload(a.tokens, 0, plen, error) ||
+      !s.forward(plen, plen - 1, error) || !s.argmax_to_token(plen, error))
+    return false;
+  if (a.eos < 0) {
+    // No stop token: the whole chain is enqueued at once and read back once.
+    return (a.max_tokens == 1 || s.decode_greedy(a.max_tokens - 1, error)) &&
+           s.tokens(plen, plen + a.max_tokens, &out->ids, error);
+  }
+  // Chunks of kChunk tokens, each followed by an async readback; chunk c + 1
+  // is enqueued before chunk c is inspected, so the GPU never waits on the
+  // EOS check. At most one chunk past the stop is computed and discarded.
+  constexpr int kChunk = 8;
+  const int n = a.max_tokens;
+  const int chunks = (n + kChunk - 1) / kChunk;
+  TokenStream ts;
+  if (!ts.init(n, chunks, error)) return false;
+  // Chunk c covers ids [c * kChunk, min(n, (c + 1) * kChunk)); id 0 exists
+  // after the prefill, id i > 0 after decode step i - 1.
+  auto enqueue = [&](int c) {
+    const int lo = c * kChunk, hi = std::min(n, lo + kChunk);
+    const int steps = hi - std::max(lo, 1);
+    if (steps > 0 && !s.decode_greedy(steps, error)) return false;
+    return s.tokens_async(plen + lo, plen + hi, ts.host() + lo, ts.event(c), error);
+  };
+  bool ok = enqueue(0);
+  bool stopped = false;
+  for (int c = 0; ok && c < chunks && !stopped; ++c) {
+    if (c + 1 < chunks) ok = enqueue(c + 1);
+    if (cudaEventSynchronize(ts.event(c)) != cudaSuccess) {
+      *error = "event sync failed";
+      ok = false;
+    }
+    for (int i = c * kChunk; ok && i < std::min(n, (c + 1) * kChunk); ++i) {
+      out->ids.push_back(ts.host()[i]);
+      if (a.is_eos(ts.host()[i])) {
+        stopped = true;
+        break;
+      }
+    }
+  }
+  cudaStreamSynchronize(cudaStreamPerThread);
+  return ok;
+}
+
+bool generate_sampled(GpuSession& s, const Args& a, Generation* out, std::string* error) {
+  std::vector<std::int32_t> seq = a.tokens;
+  const int plen = static_cast<int>(seq.size());
+  if (!s.truncate(0) || !s.upload(seq, 0, plen, error)) return false;
+  const int V = s.vocab();
+  std::vector<std::uint16_t> row;
+  std::vector<float> p(static_cast<std::size_t>(V));
+  for (int step = 0; step < a.max_tokens; ++step) {
+    const int len = static_cast<int>(seq.size());
+    if (!s.forward(len, len - 1, error) || !s.logits(1, &row, error)) return false;
+    for (int i = 0; i < V; ++i) p[i] = bf16_to_f32_host(row[i]);
+    Xorshift64 rng(static_cast<std::uint64_t>(a.seed) + static_cast<std::uint64_t>(step));
+    const int next = sample_top_p_f32(p.data(), /*nucleus=*/0.9f, rng.next_float(), V);
+    seq.push_back(next);
+    out->ids.push_back(next);
+    if (a.is_eos(next)) break;
+    if (!s.upload(seq, len, len + 1, error)) return false;
+  }
+  return true;
+}
+
+bool generate_draft(GpuSession& s, const Args& a, Generation* out, std::string* error) {
+  std::vector<std::int32_t> seq = a.tokens;
+  const int plen = static_cast<int>(seq.size());
+  const int max_pos = plen + a.max_tokens + a.draft_k;
+  std::vector<std::int32_t>& generated = out->ids;
+  DraftReport& report = out->report;
+  out->drafted = true;
+  std::vector<std::int32_t> ids;
+  // Prefill once: the KV watermark then advances by only the committed
+  // tokens, so a step costs O(draft_k) instead of replaying the prefix.
+  // `anchor` is the target's greedy token after the last committed position.
+  if (!s.truncate(0) || !s.upload(seq, 0, plen, error) ||
+      !s.forward(plen, plen - 1, error) || !s.argmax(1, &ids, error))
+    return false;
+  std::int32_t anchor = ids[0];
+
+  std::vector<std::int32_t> target_arg;
+  while (static_cast<int>(generated.size()) < a.max_tokens) {
+    const int len = static_cast<int>(seq.size());  // == KV watermark
+    // Never propose past the output budget or the request's position bound;
+    // reserve one slot for the committed tail token so its KV always fits.
+    const int room = std::min(a.draft_k, a.max_tokens - static_cast<int>(generated.size()));
+    const int k = std::min(room, max_pos - len - 1);
+    const std::vector<std::int32_t> proposal =
+        (k > 0) ? draft_lookup(seq, k) : std::vector<std::int32_t>();
+    const int nprop = static_cast<int>(proposal.size());
+    report.proposed += nprop;
+
+    // target_arg[0] = anchor (row len-1); target_arg[i] = greedy token of
+    // row len-1+i, from one batched forward over the draft rows only.
+    target_arg.assign(1, anchor);
+    if (nprop > 0) {
+      std::vector<std::int32_t> cand(seq);
+      cand.insert(cand.end(), proposal.begin(), proposal.end());
+      if (!s.upload(cand, len, len + nprop, error) || !s.forward(len + nprop, len, error) ||
+          !s.argmax(nprop, &ids, error))
+        return false;
+      target_arg.insert(target_arg.end(), ids.begin(), ids.end());
+    }
+    // The unit-tested gate: the longest agreeing prefix plus one correction
+    // (or bonus) token, clamped to the output budget and the position bound.
+    const VerifyResult v = verify_greedy(target_arg.data(), proposal.data(), nprop);
+    const int budget =
+        std::min(a.max_tokens - static_cast<int>(generated.size()), max_pos - len);
+    const CommitPlan plan =
+        commit_speculative(v, proposal.data(), nprop, target_arg[nprop], budget);
+    bool stop = false;
+    for (std::int32_t tok : plan.tokens) {
+      seq.push_back(tok);
+      generated.push_back(tok);
+      if (a.is_eos(tok)) {
+        stop = true;
+        break;
+      }
+    }
+    report.accepted += v.accepted;
+    ++report.steps;
+    if (stop || static_cast<int>(generated.size()) >= a.max_tokens) break;
+
+    // The accepted prefix has valid KV; the tail token (correction or bonus)
+    // does not, so truncate to the valid rows and forward the tail (one row:
+    // a chained greedy step whose id lands in d_tokens[newlen]).
+    const int valid_kv = len + v.accepted;
+    const int newlen = static_cast<int>(seq.size());
+    if (newlen > valid_kv) {
+      if (!s.truncate(valid_kv) || !s.upload(seq, valid_kv, newlen, error)) return false;
+      if (newlen - valid_kv == 1 && valid_kv > 0) {
+        if (!s.decode_greedy(1, error) || !s.tokens(newlen, newlen + 1, &ids, error))
+          return false;
+      } else if (!s.forward(newlen, newlen - 1, error) || !s.argmax(1, &ids, error)) {
+        return false;
+      }
+      anchor = ids[0];
+    } else {
+      if (!s.truncate(newlen)) {
+        *error = "kv truncate failed";
+        return false;
+      }
+      anchor = target_arg[static_cast<std::size_t>(newlen - len)];
+    }
+  }
+  return true;
+}
+
+bool gpu_generate(GpuSession& s, const Args& a, Generation* out, std::string* error) {
+  if (!check_request(s, a, error)) return false;
+  if (a.draft_k > 0) return generate_draft(s, a, out, error);
+  return a.seed == 0 ? generate_greedy(s, a, out, error) : generate_sampled(s, a, out, error);
+}
+
+int gpu_generate_cmd(const Args& a) {
+  std::string err;
+  GpuSession s;
+  Generation g;
+  const int max_pos = static_cast<int>(a.tokens.size()) + a.max_tokens + a.draft_k;
+  if (!s.open(a.dir, max_pos, a.draft_k + 1, &err) || !gpu_generate(s, a, &g, &err))
+    return fail(err);
+  if (g.drafted) report_draft(g.report);
+  std::printf("%s", generate_document(g.ids, g.drafted ? &g.report : nullptr).c_str());
+  return 0;
+}
+
+// `serve`: load once, then answer one JSON request per stdin line with one
+// JSON line on stdout (see the file header). Errors are reported per request
+// ({"error": "..."}) and do not end the loop; EOF on stdin does.
+int gpu_serve_cmd(const Args& cli) {
+  std::string err;
+  GpuSession s;
+  constexpr int kServeLogitRows = 16;  // draft_lookup <= 15
+  if (!s.open(cli.dir, cli.max_context, kServeLogitRows, &err)) return fail(err);
+  std::printf("{\"ready\":true,\"max_context\":%d}\n", cli.max_context);
+  std::fflush(stdout);
+  std::string line;
+  for (int c; (c = std::getchar()) != EOF;) {
+    if (c != '\n') {
+      line.push_back(static_cast<char>(c));
+      continue;
+    }
+    json::Value req;
+    std::string perr;
+    Args a;
+    Generation g;
+    std::string reply;
+    if (!json::parse(line.data(), line.size(), &req, &perr) ||
+        req.kind != json::Value::Kind::Object) {
+      err = "bad request: " + perr;
+    } else {
+      const json::Value* toks = req.find("tokens");
+      if (toks != nullptr && toks->kind == json::Value::Kind::Array)
+        for (const auto& t : toks->arr)
+          a.tokens.push_back(t.kind == json::Value::Kind::Int
+                                 ? static_cast<std::int32_t>(t.int_value)
+                                 : -1);
+      a.max_tokens = static_cast<int>(req.get_int("max_tokens", 0));
+      a.seed = static_cast<long>(req.get_int("seed", 0));
+      a.draft_k = static_cast<int>(req.get_int("draft_lookup", 0));
+      a.eos = static_cast<long>(req.get_int("eos", -1));
+      err.clear();
+      if (gpu_generate(s, a, &g, &err)) reply = generate_document(g.ids, g.drafted ? &g.report : nullptr);
+    }
+    if (reply.empty()) {
+      std::string esc;
+      for (char ch : err) {
+        if (ch == '"' || ch == '\\') esc.push_back('\\');
+        if (static_cast<unsigned char>(ch) >= 0x20) esc.push_back(ch);
+      }
+      reply = "{\"error\":\"" + esc + "\"}\n";
+    }
+    std::fwrite(reply.data(), 1, reply.size(), stdout);
+    std::fflush(stdout);
+    line.clear();
+  }
+  return 0;
+}
 
 #endif  // GRANITE_CUDA
 
 // ---------------------------------------------------------------------------
+// Host oracle paths.
+// ---------------------------------------------------------------------------
 
-bool parse_args(int argc, char** argv, std::string* sub, std::string* dir,
-                std::vector<std::int32_t>* tokens, int* max_tokens, long* seed,
-                int* last, int* gpu, int* draft_k) {
-  *sub = "";
-  *dir = "";
-  *max_tokens = 0;
-  *seed = 0;
-  *last = 0;
-  *gpu = 0;
-  *draft_k = 0;
-  for (int i = 1; i < argc; ++i) {
-    const std::string a = argv[i];
-    if (a == "forward" || a == "generate") {
-      *sub = a;
-    } else if (a == "--checkpoint" && i + 1 < argc) {
-      *dir = argv[++i];
-    } else if (a == "--tokens" && i + 1 < argc) {
-      const std::string t = argv[++i];
-      std::stringstream ss(t);
-      std::string tok;
-      while (std::getline(ss, tok, ',')) {
-        if (!tok.empty()) tokens->push_back(std::stoi(tok));
+int host_forward_cmd(const Args& a, const ModelWeights& w) {
+  std::vector<float> logits;
+  forward_logits_f32(a.tokens, w.embed, w.layers, w.final_norm.data(), w.lm_head.data(),
+                     w.model, kForwardSpec, &logits);
+  const int n = static_cast<int>(a.tokens.size());
+  const std::size_t V = w.model.vocab_size;
+  print_logits(a.last > 0 ? std::max(0, n - a.last) : 0, n, V,
+               [&](int t, std::size_t v) { return logits[static_cast<std::size_t>(t) * V + v]; });
+  return 0;
+}
+
+int host_generate(const Args& a, const ModelWeights& w) {
+  std::vector<std::int32_t> seq = a.tokens;
+  std::vector<std::int32_t> generated;
+  std::vector<float> logits;
+  const int V = static_cast<int>(w.model.vocab_size);
+  auto forward = [&](const std::vector<std::int32_t>& toks) {
+    forward_logits_f32(toks, w.embed, w.layers, w.final_norm.data(), w.lm_head.data(),
+                       w.model, kForwardSpec, &logits);
+  };
+  if (a.draft_k > 0) {
+    // Host mirror of the CUDA draft-verify-commit loop. forward_logits_f32
+    // returns f32 logits for every position and has no KV watermark, so
+    // each step replays the whole accepted prefix from position 0.
+    DraftReport report;
+    while (static_cast<int>(generated.size()) < a.max_tokens) {
+      const int len = static_cast<int>(seq.size());
+      const int room = std::min(a.draft_k, a.max_tokens - static_cast<int>(generated.size()));
+      const std::vector<std::int32_t> proposal =
+          (room > 0) ? draft_lookup(seq, room) : std::vector<std::int32_t>();
+      const int nprop = static_cast<int>(proposal.size());
+      report.proposed += nprop;
+      std::vector<std::int32_t> cand(seq);
+      cand.insert(cand.end(), proposal.begin(), proposal.end());
+      forward(cand);
+      std::vector<std::int32_t> target_arg(nprop + 1, 0);
+      for (int i = 0; i <= nprop; ++i)
+        target_arg[i] = argmax_f32(logits.data() + static_cast<std::size_t>(len - 1 + i) * V, V);
+      const VerifyResult v = verify_greedy(target_arg.data(), proposal.data(), nprop);
+      const int budget = a.max_tokens - static_cast<int>(generated.size());
+      const CommitPlan plan =
+          commit_speculative(v, proposal.data(), nprop, target_arg[nprop], budget);
+      bool stop = false;
+      if (plan.commit > 0) {
+        for (std::int32_t tok : plan.tokens) {
+          seq.push_back(tok);
+          generated.push_back(tok);
+          if (a.is_eos(tok)) {
+            stop = true;
+            break;
+          }
+        }
+        report.accepted += v.accepted;
       }
-    } else if (a == "--max-tokens" && i + 1 < argc) {
-      *max_tokens = std::atoi(argv[++i]);
-    } else if (a == "--seed" && i + 1 < argc) {
-      *seed = std::atol(argv[++i]);
-    } else if (a == "--last" && i + 1 < argc) {
-      *last = std::atoi(argv[++i]);
-    } else if (a == "--gpu" && i + 1 < argc) {
-      *gpu = std::atoi(argv[++i]);
-    } else if (a == "--draft-lookup" && i + 1 < argc) {
-      *draft_k = std::atoi(argv[++i]);
-    } else {
-      return false;
+      ++report.steps;
+      if (stop) break;
     }
+    report_draft(report);
+    std::printf("%s", generate_document(generated, &report).c_str());
+    return 0;
   }
-  return !sub->empty() && !dir->empty() && !tokens->empty();
+  for (int step = 0; step < a.max_tokens; ++step) {
+    forward(seq);
+    const float* row =
+        logits.data() + static_cast<std::size_t>(seq.size() - 1) * w.model.vocab_size;
+    int next;
+    if (a.seed == 0) {
+      next = sample_greedy_f32(row, V);
+    } else {
+      Xorshift64 rng(static_cast<std::uint64_t>(a.seed) + static_cast<std::uint64_t>(step));
+      next = sample_top_p_f32(row, /*nucleus=*/0.9f, rng.next_float(), V);
+    }
+    seq.push_back(next);
+    generated.push_back(next);
+    if (a.is_eos(next)) break;
+  }
+  std::printf("%s", generate_document(generated, nullptr).c_str());
+  return 0;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string sub, dir, err;
-  std::vector<std::int32_t> tokens;
-  int max_tokens = 0, last = 0, gpu = 0, draft_k = 0;
-  long seed = 0;
-  if (!parse_args(argc, argv, &sub, &dir, &tokens, &max_tokens, &seed, &last,
-                  &gpu, &draft_k)) {
+  Args a;
+  if (!parse_args(argc, argv, &a)) {
     std::fprintf(
         stderr,
         "usage: granite4-infer forward --checkpoint DIR --tokens id,id,... "
         "[--last N] [--gpu 0|1]\n"
         "       granite4-infer generate --checkpoint DIR --tokens id,id,... "
-        "--max-tokens N [--seed S] [--gpu 0|1] [--draft-lookup K]\n");
+        "--max-tokens N [--seed S] [--gpu 0|1] [--draft-lookup K] [--eos ID]\n"
+        "       granite4-infer serve --checkpoint DIR --gpu 1 [--max-context N]\n");
+    return 2;
+  }
+  if (a.sub == "generate" && a.max_tokens <= 0) {
+    std::fprintf(stderr, "generate: --max-tokens required\n");
+    return 2;
+  }
+  if (a.sub == "generate" && a.draft_k > 0 && a.seed != 0) {
+    std::fprintf(stderr, "draft-lookup: greedy only (omit --seed)\n");
     return 2;
   }
 
+  if (a.sub == "serve" && a.gpu == 0) {
+    std::fprintf(stderr, "serve: requires --gpu 1\n");
+    return 2;
+  }
+  if (a.gpu != 0) {
+#if defined(GRANITE_CUDA) && GRANITE_CUDA == 1
+    if (a.sub == "forward") return gpu_forward_cmd(a);
+    if (a.sub == "serve") return gpu_serve_cmd(a);
+    return gpu_generate_cmd(a);
+#else
+    std::fprintf(stderr, "granite4-infer was built without CUDA support\n");
+    return 1;
+#endif
+  }
+
   ModelWeights w;
-  if (!load_weights(dir, &w, &err, /*enforce_spec=*/true)) {
+  std::string err;
+  if (!load_weights(a.dir, &w, &err, /*enforce_spec=*/true)) {
     std::fprintf(stderr, "load_weights: %s\n", err.c_str());
     return 1;
   }
-
-  if (sub == "forward") {
-#if defined(GRANITE_CUDA) && GRANITE_CUDA == 1
-    if (gpu != 0) {
-      GpuModel gm;
-      if (!pack_gpu_model(w, &gm, &err)) {
-        std::fprintf(stderr, "%s\n", err.c_str());
-        return 1;
-      }
-      const int max_pos = static_cast<int>(tokens.size());
-      GpuSession session;
-      std::vector<std::uint16_t> logits;
-      if (!session.open(gm, w.model, max_pos, &err) ||
-          !session.step(tokens.data(), max_pos, &logits, &err)) {
-        std::fprintf(stderr, "%s\n", err.c_str());
-        return 1;
-      }
-
-      // Emit the final N positions (default: all) as JSON.
-      const int n = static_cast<int>(tokens.size());
-      const int from = last > 0 ? std::max(0, n - last) : 0;
-      std::printf("{\"logits\":[");
-      for (int t = from; t < n; ++t) {
-        if (t > from) std::printf(",");
-        std::printf("{\"position\":%d,\"values\":[", t);
-        for (std::size_t v = 0; v < gm.lay.vocab; ++v) {
-          if (v) std::printf(",");
-          std::printf("%.9g",
-                      bf16_to_f32_host(
-                          logits[static_cast<std::size_t>(t) * gm.lay.vocab +
-                                 v]));
-        }
-        std::printf("]}");
-      }
-      std::printf("]}\n");
-      return 0;
-    }
-#endif  // GRANITE_CUDA
-    if (gpu != 0) {
-      std::fprintf(stderr, "granite4-infer was built without CUDA support\n");
-      return 1;
-    }
-    // Host oracle path.
-    std::vector<float> logits;
-    forward_logits_f32(tokens, w.embed, w.layers, w.final_norm.data(),
-                       w.lm_head.data(), w.model, kForwardSpec, &logits);
-    const int n = static_cast<int>(tokens.size());
-    const int from = last > 0 ? std::max(0, n - last) : 0;
-    std::printf("{\"logits\":[");
-    for (int t = from; t < n; ++t) {
-      if (t > from) std::printf(",");
-      std::printf("{\"position\":%d,\"values\":[", t);
-      for (std::size_t v = 0; v < w.model.vocab_size; ++v) {
-        if (v) std::printf(",");
-        std::printf("%.9g",
-                    logits[static_cast<std::size_t>(t) * w.model.vocab_size +
-                           v]);
-      }
-      std::printf("]}");
-    }
-    std::printf("]}\n");
-    return 0;
-  }
-
-  if (sub == "generate") {
-    if (max_tokens <= 0) {
-      std::fprintf(stderr, "generate: --max-tokens required\n");
-      return 2;
-    }
-#if defined(GRANITE_CUDA) && GRANITE_CUDA == 1
-    if (gpu != 0) {
-      GpuModel gm;
-      if (!pack_gpu_model(w, &gm, &err)) {
-        std::fprintf(stderr, "%s\n", err.c_str());
-        return 1;
-      }
-      const int max_pos =
-          static_cast<int>(tokens.size()) + max_tokens +
-          (draft_k > 0 ? draft_k : 0);
-      GpuSession session;
-      std::vector<std::uint16_t> logits;
-      if (!session.open(gm, w.model, max_pos, &err)) {
-        std::fprintf(stderr, "%s\n", err.c_str());
-        return 1;
-      }
-      const int V = static_cast<int>(gm.lay.vocab);
-
-      std::vector<std::int32_t> seq = tokens;
-      std::vector<std::int32_t> generated;
-      // Sample one token from a logits row: greedy for seed=0, seeded top-p
-      // otherwise (the draft path requires greedy so verification is exact).
-      auto sample_row = [&](const std::uint16_t* row, int step_index) -> int {
-        std::vector<float> p(V);
-        for (int i = 0; i < V; ++i) p[i] = bf16_to_f32_host(row[i]);
-        if (seed == 0) return sample_greedy_f32(p.data(), V);
-        Xorshift64 rng(static_cast<std::uint64_t>(seed) +
-                       static_cast<std::uint64_t>(step_index));
-        return sample_top_p_f32(p.data(), /*nucleus=*/0.9f, rng.next_float(), V);
-      };
-
-      if (draft_k > 0) {
-        if (seed != 0) {
-          std::fprintf(stderr, "draft-lookup: greedy only (omit --seed)\n");
-          return 2;
-        }
-        // Prefill the prompt once: compute the KV cache and the anchor row
-        // (the last prompt position's row, which predicts the first generated
-        // token). The draft-verify loop below then keeps this watermark and
-        // advances it by only the committed tokens each step, so a step costs
-        // O(draft_k) instead of re-replaying the whole accepted prefix.
-        {
-          const int plen = static_cast<int>(seq.size());
-          if (!session.step(seq.data(), plen, &logits, &err)) {
-            std::fprintf(stderr, "%s\n", err.c_str());
-            return 1;
-          }
-        }
-        DraftReport report;
-        std::vector<float> row_f(V);
-        std::vector<std::int32_t> target_arg;
-        auto argmax_f32 = [](const float* p, int n) {
-          int best = 0;
-          for (int c = 1; c < n; ++c)
-            if (p[c] > p[best]) best = c;
-          return best;
-        };
-        while (static_cast<int>(generated.size()) < max_tokens) {
-          const int len = static_cast<int>(seq.size());  // == KV watermark
-
-          // Never propose past the output budget or the ctx's position limit.
-          // Reserve one ctx slot for the committed tail token (correction /
-          // bonus), so its KV always fits.
-          const int room =
-              std::min(draft_k, max_tokens - static_cast<int>(generated.size()));
-          const int pos_room = max_pos - len - 1;
-          const int k = std::min(room, pos_room);
-          const std::vector<std::int32_t> proposal =
-              (k > 0) ? draft_lookup(seq, k) : std::vector<std::int32_t>();
-          const int nprop = static_cast<int>(proposal.size());
-          report.proposed += nprop;
-
-          // One incremental target forward over the new draft rows only. With
-          // `nprop > 0` the KV watermark is at `len`, so positions [0, len) are
-          // reused and only rows [len, len+nprop) are computed; the anchor row
-          // (len-1) stays in `logits`. Row len-1+i is the target's greedy
-          // argmax for the (i+1)-th proposal; row len+nprop-1 is the target's
-          // own next token (the correction on rejection, the bonus on full
-          // acceptance). With `nprop == 0` there is nothing to forward - the
-          // anchor row is already valid from the previous step - so the forward
-          // is skipped entirely rather than replaying the prefix.
-          if (nprop > 0) {
-            std::vector<std::int32_t> cand(seq);
-            cand.insert(cand.end(), proposal.begin(), proposal.end());
-            if (!session.step(cand.data(), len + nprop, &logits, &err)) {
-              std::fprintf(stderr, "%s\n", err.c_str());
-              return 1;
-            }
-          }
-          target_arg.assign(nprop + 1, 0);
-          for (int i = 0; i <= nprop; ++i) {
-            const std::uint16_t* row =
-                logits.data() + static_cast<std::size_t>(len - 1 + i) * V;
-            for (int c = 0; c < V; ++c) row_f[c] = bf16_to_f32_host(row[c]);
-            target_arg[i] = argmax_f32(row_f.data(), V);
-          }
-          // The unit-tested gate: accept the longest prefix where the target
-          // agrees with the draft, plus one correction (or bonus) token.
-          const VerifyResult v =
-              verify_greedy(target_arg.data(), proposal.data(), nprop);
-          // Commit the accepted prefix, then the gate's tail token, clamped
-          // to the output budget (unit-tested in commit_speculative) and to the
-          // ctx's remaining capacity so the tail KV always fits.
-          const int budget =
-              std::min(max_tokens - static_cast<int>(generated.size()),
-                       max_pos - len);
-          const CommitPlan plan =
-              commit_speculative(v, proposal.data(), nprop,
-                                 target_arg[nprop], budget);
-          for (std::int32_t tok : plan.tokens) {
-            seq.push_back(tok);
-            generated.push_back(tok);
-          }
-          report.accepted += v.accepted;
-
-          // The accepted draft prefix has valid KV (the forward wrote those
-          // positions with the committed draft tokens). The tail token (the
-          // correction on rejection, the bonus on full acceptance) does not: its
-          // KV was written with the draft token, or is absent for the bonus.
-          // Recompute the tail (0 or 1 position) with the committed tokens, then
-          // leave the watermark at the committed length for the next step.
-          const int valid_kv = len + v.accepted;
-          const int newlen = static_cast<int>(seq.size());
-          if (newlen > valid_kv) {
-            if (!session.truncate(valid_kv)) {
-              std::fprintf(stderr, "kv truncate failed\n");
-              return 1;
-            }
-            if (!session.step(seq.data(), newlen, &logits, &err)) {
-              std::fprintf(stderr, "%s\n", err.c_str());
-              return 1;
-            }
-          } else if (!session.truncate(newlen)) {
-            std::fprintf(stderr, "kv truncate failed\n");
-            return 1;
-          }
-          ++report.steps;
-        }
-        const double accept_rate = draft_accept_rate(report);
-        // The stderr line stays for human/G4_-prefixed grepping; the same
-        // counters ride along in the stdout JSON so a benchmark harness can
-        // parse one document.
-        std::fprintf(stderr, "G4_DRAFT steps=%ld proposed=%ld accepted=%ld "
-                             "rate=%.3f\n",
-                     report.steps, report.proposed, report.accepted,
-                     accept_rate);
-        std::printf("%s", generate_document(generated, &report).c_str());
-        return 0;
-      }
-
-      // Prefill: forward the whole prompt once (populates the KV caches and
-      // leaves the prompt's final-position row ready to sample from).
-      {
-        const int len = static_cast<int>(seq.size());
-        if (!session.step(seq.data(), len, &logits, &err)) {
-          std::fprintf(stderr, "%s\n", err.c_str());
-          return 1;
-        }
-      }
-      for (int step = 0; step < max_tokens; ++step) {
-        // Sample from the final position's row (computed by the prefill or
-        // the previous step's forward).
-        const int len = static_cast<int>(seq.size());
-        const std::uint16_t* row =
-            logits.data() +
-            static_cast<std::size_t>(len - 1) * static_cast<std::size_t>(V);
-        const int next = sample_row(row, step);
-        seq.push_back(next);
-        generated.push_back(next);
-        // Compute the new position's row (skipped on the last step - it is
-        // never sampled).
-        if (step + 1 < max_tokens) {
-          const int len2 = static_cast<int>(seq.size());
-          if (!session.step(seq.data(), len2, &logits, &err)) {
-            std::fprintf(stderr, "%s\n", err.c_str());
-            return 1;
-          }
-        }
-      }
-      // No draft path: emit the token ids only (no draft counters).
-      std::printf("%s", generate_document(generated, nullptr).c_str());
-      return 0;
-    }
-#endif  // GRANITE_CUDA
-    if (gpu != 0) {
-      std::fprintf(stderr, "granite4-infer was built without CUDA support\n");
-      return 1;
-    }
-
-    // Host oracle path.
-    std::vector<std::int32_t> seq = tokens;
-    std::vector<std::int32_t> generated;
-    std::vector<float> logits;
-    if (draft_k > 0) {
-      if (seed != 0) {
-        std::fprintf(stderr, "draft-lookup: greedy only (omit --seed)\n");
-        return 2;
-      }
-      // Host mirror of the CUDA draft-verify-commit loop. forward_logits_f32
-      // returns f32 logits for every position, so verification is the same
-      // argmax rows; there is no KV watermark, so each step replays the whole
-      // accepted prefix from position 0.
-      DraftReport report;
-      const int V = static_cast<int>(w.model.vocab_size);
-      auto argmax_f32 = [](const float* p, int n) {
-        int best = 0;
-        for (int c = 1; c < n; ++c)
-          if (p[c] > p[best]) best = c;
-        return best;
-      };
-      while (static_cast<int>(generated.size()) < max_tokens) {
-        const int len = static_cast<int>(seq.size());
-
-        // Never propose past the output budget (no ctx watermark on the host
-        // path, so the position cap is the output budget alone).
-        const int room =
-            std::min(draft_k, max_tokens - static_cast<int>(generated.size()));
-        const std::vector<std::int32_t> proposal =
-            (room > 0) ? draft_lookup(seq, room) : std::vector<std::int32_t>();
-        const int nprop = static_cast<int>(proposal.size());
-        report.proposed += nprop;
-
-        // One target forward over accepted prefix + draft proposals. The
-        // rows at positions [len, len+nprop) verify each proposal; row
-        // len+nprop is the target's own next token (correction when the
-        // draft is rejected, bonus when it is fully accepted).
-        std::vector<std::int32_t> cand(seq);
-        cand.insert(cand.end(), proposal.begin(), proposal.end());
-        forward_logits_f32(cand, w.embed, w.layers, w.final_norm.data(),
-                           w.lm_head.data(), w.model, kForwardSpec, &logits);
-        std::vector<std::int32_t> target_arg(nprop + 1, 0);
-        for (int i = 0; i <= nprop; ++i) {
-          const float* row =
-              logits.data() + static_cast<std::size_t>(len - 1 + i) * V;
-          target_arg[i] = argmax_f32(row, V);
-        }
-        // The unit-tested gate: accept the longest prefix where the target
-        // agrees with the draft, plus one correction (or bonus) token.
-        const VerifyResult v =
-            verify_greedy(target_arg.data(), proposal.data(), nprop);
-        // Commit the accepted prefix, then the gate's tail token, clamped
-        // to the output budget (unit-tested in commit_speculative).
-        const int budget = max_tokens - static_cast<int>(generated.size());
-        const CommitPlan plan =
-            commit_speculative(v, proposal.data(), nprop,
-                               target_arg[nprop], budget);
-        if (plan.commit > 0) {
-          for (std::int32_t tok : plan.tokens) {
-            seq.push_back(tok);
-            generated.push_back(tok);
-          }
-          report.accepted += v.accepted;
-        }
-        ++report.steps;
-      }
-      const double accept_rate = draft_accept_rate(report);
-      std::fprintf(stderr, "G4_DRAFT steps=%ld proposed=%ld accepted=%ld "
-                           "rate=%.3f\n",
-                   report.steps, report.proposed, report.accepted,
-                   accept_rate);
-      std::printf("%s", generate_document(generated, &report).c_str());
-      return 0;
-    }
-    for (int step = 0; step < max_tokens; ++step) {
-      forward_logits_f32(seq, w.embed, w.layers, w.final_norm.data(),
-                         w.lm_head.data(), w.model, kForwardSpec, &logits);
-      const int len = static_cast<int>(seq.size());
-      const float* row =
-          logits.data() + static_cast<std::size_t>(len - 1) * w.model.vocab_size;
-      const int n = static_cast<int>(w.model.vocab_size);
-      int next;
-      if (seed == 0) {
-        next = sample_greedy_f32(row, n);
-      } else {
-        Xorshift64 rng(static_cast<std::uint64_t>(seed) +
-                       static_cast<std::uint64_t>(step));
-        const float u = rng.next_float();
-        next = sample_top_p_f32(row, /*nucleus=*/0.9f, u, n);
-      }
-      seq.push_back(next);
-      generated.push_back(next);
-    }
-    // No draft path: emit the token ids only (no draft counters).
-    std::printf("%s", generate_document(generated, nullptr).c_str());
-    return 0;
-  }
-
-  return 2;
+  return a.sub == "forward" ? host_forward_cmd(a, w) : host_generate(a, w);
 }

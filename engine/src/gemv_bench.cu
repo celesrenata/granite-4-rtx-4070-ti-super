@@ -16,115 +16,14 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "kernel_math.h"  // (host-only helpers; device twins below)
+#include <cuda_runtime.h>
 
-namespace granite4 {
-namespace {
-
-// Exact e4m3 decode, branchless - same bit-for-bit values as the forward
-// kernel's fp8_to_f32 (kept in sync by hand; both are trivial).
-__device__ __forceinline__ float fp8_to_f32(std::uint8_t x) {
-  const std::uint32_t s = static_cast<std::uint32_t>(x & 0x80u) << 24;
-  const std::uint32_t y = x & 0x7Fu;
-  const std::uint32_t e = y >> 3;
-  const std::uint32_t m = y & 7u;
-  std::uint32_t bits = ((120u + e) << 23) | (m << 20);
-  const std::uint32_t top = (m == 7u) ? 0u : (0x43800000u | (m << 20));
-  bits = (e == 15u) ? top : bits;
-  bits = (e == 0u) ? __float_as_uint(static_cast<float>(m) * 0.001953125f)
-                   : bits;  // 0.001953125f = 2^-9
-  // sNaN (0x7f/0xff): the arithmetic decode returned +0.0 (sign discarded),
-  // so drop the sign here too to stay bit-identical.
-  return ((e == 15u && m == 7u)) ? 0.0f : __uint_as_float(bits | s);
-}
-
-__device__ __forceinline__ float bf16_to_f32(std::uint16_t bits) {
-  const std::uint32_t u = static_cast<std::uint32_t>(bits) << 16;
-  float f;
-  __builtin_memcpy(&f, &u, sizeof f);
-  return f;
-}
-
-__device__ __forceinline__ std::uint16_t f32_to_bf16(float f) {
-  std::uint32_t u;
-  __builtin_memcpy(&u, &f, sizeof u);
-  u += 0x7fffu + ((u >> 16) & 1u);
-  u >>= 16;
-  return static_cast<std::uint16_t>(u);
-}
-
-// The exact decode GEMV the forward uses (forward_gpu.cu
-// row_gemm_dequant_kernel): coalesced block-per-row with a 16-byte (uint4)
-// vector path, falling back to a 4-element uint32 path then scalar.
-__global__ void row_gemm_dequant_kernel(const std::uint16_t* a, const std::uint8_t* B,
-                                        float scale, int N, int K, std::uint16_t* out) {
-  const int i = blockIdx.x;
-  if (i >= N) return;
-  const int t = threadIdx.x, nt = blockDim.x;
-  const std::uint8_t* row = B + static_cast<std::size_t>(i) * K;
-  const std::uint32_t* a4 = reinterpret_cast<const std::uint32_t*>(a);
-  float acc = 0.0f;
-  if ((K & 15) == 0 && (reinterpret_cast<std::uintptr_t>(row) & 15u) == 0 &&
-      (reinterpret_cast<std::uintptr_t>(a) & 3u) == 0) {
-    const int K16 = K >> 4;
-    const uint4* row16 = reinterpret_cast<const uint4*>(row);
-    for (int g = t; g < K16; g += nt) {
-      const uint4 w = row16[g];
-      const std::uint32_t ws[4] = {w.x, w.y, w.z, w.w};
-#pragma unroll
-      for (int q = 0; q < 4; ++q) {
-        const int e = 16 * g + 4 * q;
-        const std::uint32_t wq = ws[q];
-        const std::uint32_t y0 = a4[e / 2];
-        const std::uint32_t y1 = a4[e / 2 + 1];
-        const float b0 = fp8_to_f32(static_cast<std::uint8_t>(wq & 0xffu));
-        const float b1 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 8) & 0xffu));
-        const float b2 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 16) & 0xffu));
-        const float b3 = fp8_to_f32(static_cast<std::uint8_t>((wq >> 24) & 0xffu));
-        const float fa0 = bf16_to_f32(static_cast<std::uint16_t>(y0 & 0xffffu));
-        const float fa1 = bf16_to_f32(static_cast<std::uint16_t>((y0 >> 16) & 0xffffu));
-        const float fa2 = bf16_to_f32(static_cast<std::uint16_t>(y1 & 0xffffu));
-        const float fa3 = bf16_to_f32(static_cast<std::uint16_t>((y1 >> 16) & 0xffffu));
-        acc += b0 * fa0 + b1 * fa1 + b2 * fa2 + b3 * fa3;
-      }
-    }
-  } else if ((K & 3) == 0) {
-    const std::uint32_t* row4 = reinterpret_cast<const std::uint32_t*>(row);
-    const int K4 = K >> 2;
-    for (int k4 = t; k4 < K4; k4 += nt) {
-      const std::uint32_t b = row4[k4];
-      const std::uint32_t x0 = a4[2 * k4];
-      const std::uint32_t x1 = a4[2 * k4 + 1];
-      const float b0 = fp8_to_f32(static_cast<std::uint8_t>(b & 0xffu));
-      const float b1 = fp8_to_f32(static_cast<std::uint8_t>((b >> 8) & 0xffu));
-      const float b2 = fp8_to_f32(static_cast<std::uint8_t>((b >> 16) & 0xffu));
-      const float b3 = fp8_to_f32(static_cast<std::uint8_t>((b >> 24) & 0xffu));
-      const std::uint16_t a0 = static_cast<std::uint16_t>(x0 & 0xffffu);
-      const std::uint16_t a1 = static_cast<std::uint16_t>((x0 >> 16) & 0xffffu);
-      const std::uint16_t a2 = static_cast<std::uint16_t>(x1 & 0xffffu);
-      const std::uint16_t a3 = static_cast<std::uint16_t>((x1 >> 16) & 0xffffu);
-      acc += b0 * bf16_to_f32(a0) + b1 * bf16_to_f32(a1) +
-             b2 * bf16_to_f32(a2) + b3 * bf16_to_f32(a3);
-    }
-  } else {
-    for (int k = t; k < K; k += nt)
-      acc += fp8_to_f32(row[k]) * bf16_to_f32(a[k]);
-  }
-  #pragma unroll
-  for (int off = 16; off > 0; off >>= 1)
-    acc += __shfl_down_sync(0xffffffffu, acc, off);
-  __shared__ float red[32];
-  if ((t & 31) == 0) red[t >> 5] = acc;
-  __syncthreads();
-  if (t == 0) {
-    float s = red[0];
-    for (int j = 1; j < (nt >> 5); ++j) s += red[j];
-    out[i] = f32_to_bf16(scale * s);
-  }
-}
-
-}  // namespace
-}  // namespace granite4
+// The production decode GEMV launcher (forward_gpu.cu): the bench measures
+// exactly the kernel and launch width the forward uses.
+extern "C" int granite4_kernel_row_gemm_dequant(const std::uint16_t* d_a,
+                                                const std::uint8_t* d_B,
+                                                float scale, int N, int K,
+                                                std::uint16_t* d_out);
 
 // L2 flusher: evicts the ~128 MB L2 (RTX 4070 Ti Super) by streaming a
 // 512 MB buffer, so each timed GEMV call reads its weights from HBM - the
@@ -186,8 +85,7 @@ int main(int argc, char** argv) {
     cudaMemset(dFlush, 0, flush_elems * sizeof(float));
     cudaDeviceSynchronize();
     // Warmup.
-    granite4::row_gemm_dequant_kernel<<<s.N, 128>>>(dA, dB, 1e-3f, s.N, s.K,
-                                                    dOut);
+    granite4_kernel_row_gemm_dequant(dA, dB, 1e-3f, s.N, s.K, dOut);
     cudaDeviceSynchronize();
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
@@ -197,8 +95,7 @@ int main(int argc, char** argv) {
       l2_flush<<<flush_elems / 256, 256>>>(dFlush, flush_elems);
       cudaDeviceSynchronize();
       cudaEventRecord(e0);
-      granite4::row_gemm_dequant_kernel<<<s.N, 128>>>(dA, dB, 1e-3f, s.N, s.K,
-                                                       dOut);
+      granite4_kernel_row_gemm_dequant(dA, dB, 1e-3f, s.N, s.K, dOut);
       cudaEventRecord(e1);
       cudaEventSynchronize(e1);
       float one = 0.0f;

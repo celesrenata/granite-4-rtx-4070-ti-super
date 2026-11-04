@@ -65,9 +65,8 @@ float bf16_bytes_to_float(const char* b) {
 
 }  // namespace
 
-bool load_weights(const std::string& dir, ModelWeights* out, std::string* error,
-                  bool enforce_spec) {
-  // 1. Parse + strictly validate config.json (reject before reading weights).
+bool load_model_config(const std::string& dir, ModelConfig* out,
+                       std::string* error, bool enforce_spec) {
   std::string cfg_bytes;
   {
     std::ifstream f((dir + "/config.json").c_str(), std::ios::binary);
@@ -101,7 +100,15 @@ bool load_weights(const std::string& dir, ModelWeights* out, std::string* error,
     *error = "config is not structurally consistent";
     return false;
   }
-  const ModelConfig cfg = pcfg.model;
+  *out = pcfg.model;
+  return true;
+}
+
+bool load_weights(const std::string& dir, ModelWeights* out, std::string* error,
+                  bool enforce_spec) {
+  // 1. Parse + strictly validate config.json (reject before reading weights).
+  ModelConfig cfg;
+  if (!load_model_config(dir, &cfg, error, enforce_spec)) return false;
 
   // 2. Per-layer block layout (shared with forward_logits_f32).
   const int64_t H = cfg.hidden_size, I = cfg.intermediate_size,

@@ -47,11 +47,14 @@ inline constexpr int kCudaArchMajor = 8;   // compute capability 8.9
 inline constexpr int kCudaArchMinor = 9;  // RTX 4070 Ti Super (Ada)
 inline constexpr char kGpuTarget[] = "sm_89";
 
-// Upper bound accepted by the fixed-width CUDA attention launchers.
 // CUDA attention launch limits. These are intentionally model-independent
 // safety ceilings, not Granite's runtime dimensions.
 inline constexpr int kMaxHeadDim = 256;
-inline constexpr int kGqaSoftmaxParallelMax = 512;
+// Fused GQA keeps the exp() terms of rows up to this length in shared memory
+// (8 bytes per position) so they are computed in parallel; longer rows run
+// the exact serial loop. 3584 keeps the whole fused block (q row, bf16
+// logits and probs, doubles) under the 48 KiB default at that length.
+inline constexpr int kGqaSoftmaxParallelMax = 3584;
 inline constexpr int kGqaSoftmaxParallelMaxSeqLen = kGqaSoftmaxParallelMax * 1024;
 
 }  // namespace granite4
