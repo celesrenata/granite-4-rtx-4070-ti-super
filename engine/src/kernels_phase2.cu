@@ -739,7 +739,7 @@ int granite4_kernel_rmsnorm_batched(const std::uint16_t* d_x,
   // just pins the verify-path bounds. Reusing it keeps a single
   // implementation, so a batched call cannot drift from the decode path.
   if (d_x == nullptr || d_w == nullptr || d_out == nullptr ||
-      !std::isfinite(eps) || eps <= 0.0f || rows <= 0 || rows > 4 || cols <= 0 ||
+      !std::isfinite(eps) || eps <= 0.0f || rows <= 0 || rows > granite4::kMaxVerifyRows || cols <= 0 ||
       static_cast<long long>(rows) * cols > INT_MAX)
     return -1;
   granite4::rmsnorm_kernel<<<rows, granite4::kRmsNormThreads>>>(d_x, d_w, eps, rows, cols,
@@ -901,7 +901,7 @@ int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
                                       std::uint16_t* d_cache_v, int base_pos,
                                       int rows, int stride, int Hk, int d) {
   if (d_src_k == nullptr || d_src_v == nullptr || d_cache_k == nullptr ||
-      d_cache_v == nullptr || base_pos < 0 || rows <= 0 || rows > 4 ||
+      d_cache_v == nullptr || base_pos < 0 || rows <= 0 || rows > granite4::kMaxVerifyRows ||
       Hk <= 0 || d <= 0 || base_pos > INT_MAX - rows ||
       stride < base_pos + rows || static_cast<long long>(Hk) * d > INT_MAX ||
       stride > INT_MAX / std::max(Hk, 1))
@@ -920,7 +920,7 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
                                       int Hq, int Hk, int d, int base_kv,
                                       int rows, int k_stride,
                                       std::uint16_t* d_out) {
-  if (rows > 4) return -1;
+  if (rows > granite4::kMaxVerifyRows) return -1;
   return granite4_kernel_gqa_fused_rows(d_q, d_k, d_v, att_scale, Hq, Hk, d, base_kv,
                                         rows, k_stride, d_out);
 }

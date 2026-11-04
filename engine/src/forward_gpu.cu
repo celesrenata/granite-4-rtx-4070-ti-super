@@ -535,21 +535,12 @@ int granite4_kernel_verify_qkv_stage(
     const float* d_cos, const float* d_sin, int base_pos, int rows, int Hq, int Hk,
     int d, int cache_stride, std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v);
-int granite4_kernel_silu_gate_up_batched(
-    const std::uint8_t* d_wg, const std::uint8_t* d_wu,
-    const std::uint16_t* d_x, float scale_g, float scale_u, int N, int K,
-    int rows, std::uint16_t* d_out);
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out);
 int granite4_kernel_rmsnorm_batched(const std::uint16_t* d_x,
                                     const std::uint16_t* d_w, float eps, int rows,
                                     int cols, std::uint16_t* d_out);
-int granite4_kernel_row_gemm_resid_dequant(const std::uint16_t* d_a,
-                                           const std::uint8_t* d_B, float scale,
-                                           const std::uint16_t* d_residual,
-                                           float residual_scale, int tokens, int N, int K,
-                                           std::uint16_t* d_out);
 }  // extern "C"
 
 #define G4_CUDA_CHECK(expr)                                                   \
@@ -580,7 +571,7 @@ struct GpuCtx {
   std::uint16_t* logits_scratch = nullptr;  // [Hq][max_pos] (fallback path)
   std::uint16_t* probs_scratch = nullptr;   // [Hq][max_pos] (fallback path)
   std::uint16_t* scratch = nullptr;
-  std::uint16_t* scratch_batched = nullptr;  // token-major [4 rows][...], batched verify forward
+  std::uint16_t* scratch_batched = nullptr;  // token-major [kMaxVerifyRows][...], batched verify forward
   int* d_pos = nullptr;     // device position of the single-position step
   bool gqa_fusable = true;  // fused GQA fits the per-block shared memory at max_pos
   bool direct_kv = false;   // A/B: attention indexes the persistent cache
@@ -687,7 +678,6 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
   // Per row: hidden(H) + normed(H) + normed2(H) + qf(Hq*d) + k_new(Hk*d)
   //          + v_new(Hk*d) + qf_rot(Hq*d) + k_new_rot(Hk*d) + attn_out(Hq*d)
   //          + gate_out(I) = 3*H + 3*(Hq*d) + 3*(Hk*d) + I.
-  constexpr int kMaxVerifyRows = 4;
   std::size_t scratch_batched_elems = 0;
   if (!checked_mul(static_cast<std::size_t>(g->H), 3, &term) ||
       !checked_add(term, static_cast<std::size_t>(g->I), &term) ||
@@ -734,7 +724,7 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
     if (sa != nullptr && sa[0] == '0') g->split_attn = false;
   }
   if (e == cudaSuccess && g->split_attn)
-    e = cudaMalloc(&g->attn_scratch, attn_split_scratch_bytes(g->Hq, 4, max_positions));
+    e = cudaMalloc(&g->attn_scratch, attn_split_scratch_bytes(g->Hq, kMaxVerifyRows, max_positions));
   // Fused GQA keeps [q row + logits + probs (+ exp terms)] in shared memory;
   // past the per-block opt-in limit the 3-kernel scratch path runs.
   g->gqa_fusable = granite4_gqa_fused_smem_bytes(g->d, max_positions) <=
@@ -787,14 +777,26 @@ void gpu_ctx_free(GpuCtx* ctx) {
 
 namespace {
 
-// Fused-K lm_head GEMV (verify_gemv.cu): streams each FP8 weight row once
-// while accumulating up to 4 activation rows; each row is bit-identical to
-// the single-token row_gemm_dequant. Declared here because it is a
-// standalone TU linked into the same library (no shared header).
+// Multi-token verify GEMVs (verify_gemv.cu): stream each FP8 weight row once
+// while accumulating up to kMaxVerifyRows activation rows; each row is
+// bit-identical to its single-token decode twin. Declared here because it is
+// a standalone TU linked into the same library (no shared header).
 extern "C" int granite4_verify_gemv(const std::uint16_t* d_a,
                                     const std::uint8_t* d_b, float scale,
                                     int tokens, int rows, int k,
                                     std::uint16_t* d_c);
+extern "C" int granite4_verify_gemv_resid(const std::uint16_t* d_a, const std::uint8_t* d_b,
+                                          float scale, const std::uint16_t* d_residual,
+                                          float residual_scale, int tokens, int rows, int k,
+                                          std::uint16_t* d_out);
+extern "C" int granite4_verify_qkv(const std::uint16_t* d_a, const std::uint8_t* d_wq,
+                                   const std::uint8_t* d_wk, const std::uint8_t* d_wv,
+                                   float sq, float sk, float sv, int tokens, int nq, int nk,
+                                   int nv, int k, std::uint16_t* d_q, std::uint16_t* d_k,
+                                   std::uint16_t* d_v);
+extern "C" int granite4_verify_silu(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
+                                    const std::uint16_t* d_x, float sg, float su, int n,
+                                    int k, int tokens, std::uint16_t* d_out);
 
 bool env_enabled(const char* name) {
   const char* v = std::getenv(name);
@@ -1140,14 +1142,13 @@ int forward_positions(GpuCtx* g, const std::int32_t* d_tokens, int start, int en
 }
 
 // ---------------------------------------------------------------------------
-// Batched suffix forward, rows = end - start in [2, 4] (speculative verify):
-// one token-major batch through the batched GEMV primitives, each weight row
-// streamed once for all rows. It reads/writes the same persistent KV rows as
-// the direct per-position path; the batched GQA stage and the fused-K lm_head
-// are bit-identical to their single-token twins, the batched QKV dequant,
-// O/down residual GEMV and SiLU within a few ULP (test_kernels.cu). Greedy
-// argmax is stable across the two paths in practice, which is what the
-// draft-verify loop relies on.
+// Batched suffix forward, rows = end - start in [2, kMaxVerifyRows]
+// (speculative verify): one token-major batch through the verify GEMVs, each
+// weight row streamed once for all rows. It reads/writes the same persistent
+// KV rows as the direct per-position path, and every stage (RMSNorm, the
+// verify GEMVs, RoPE, split-KV attention, lm_head) is bit-identical per row
+// to the decode step at that position (test_kernels.cu), so the greedy
+// verify gate accepts exactly the tokens plain greedy decoding emits.
 // ---------------------------------------------------------------------------
 int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int end,
                          const GpuForwardOut& out) {
@@ -1178,9 +1179,8 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
     const LayerView lw = layer_view(g, layer);
     if (granite4_kernel_rmsnorm_batched(d_hidden, lw.attn_norm, rms_eps, rows, H,
                                         d_normed) != 0 ||
-        granite4_kernel_qkv_dequant_batched(d_normed, lw.wq, lw.wk, lw.wv, lw.sc[0],
-                                            lw.sc[1], lw.sc[2], rows, Hq * d, Hk * d,
-                                            Hk * d, H, d_qf, d_k_new, d_v_new) != 0 ||
+        granite4_verify_qkv(d_normed, lw.wq, lw.wk, lw.wv, lw.sc[0], lw.sc[1], lw.sc[2],
+                            rows, Hq * d, Hk * d, Hk * d, H, d_qf, d_k_new, d_v_new) != 0 ||
         granite4_kernel_verify_qkv_stage(
             d_qf, d_k_new, d_v_new, g->cos_tbl + static_cast<std::size_t>(start) * half,
             g->sin_tbl + static_cast<std::size_t>(start) * half, start, rows, Hq, Hk, d,
@@ -1191,14 +1191,14 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
              : granite4_kernel_gqa_fused_batched(d_qf_rot, lw.kv_k, lw.kv_v,
                                                  g->spec.attention_multiplier, Hq, Hk, d,
                                                  start, rows, g->max_pos, d_attn_out)) != 0 ||
-        granite4_kernel_row_gemm_resid_dequant(d_attn_out, lw.wo, lw.sc[3], d_hidden,
-                                               resid_scale, rows, H, H, d_hidden) != 0 ||
+        granite4_verify_gemv_resid(d_attn_out, lw.wo, lw.sc[3], d_hidden, resid_scale, rows,
+                                   H, H, d_hidden) != 0 ||
         granite4_kernel_rmsnorm_batched(d_hidden, lw.ffn_norm, rms_eps, rows, H,
                                         d_normed2) != 0 ||
-        granite4_kernel_silu_gate_up_batched(lw.wg, lw.wu, d_normed2, lw.sc[4], lw.sc[5],
-                                             I, H, rows, d_gate_out) != 0 ||
-        granite4_kernel_row_gemm_resid_dequant(d_gate_out, lw.wd, lw.sc[6], d_hidden,
-                                               resid_scale, rows, H, I, d_hidden) != 0)
+        granite4_verify_silu(lw.wg, lw.wu, d_normed2, lw.sc[4], lw.sc[5], I, H, rows,
+                             d_gate_out) != 0 ||
+        granite4_verify_gemv_resid(d_gate_out, lw.wd, lw.sc[6], d_hidden, resid_scale, rows,
+                                   H, I, d_hidden) != 0)
       return -1;
   }
 
@@ -1386,8 +1386,8 @@ int forward_prefill(GpuCtx* g, const std::int32_t* d_tokens, int start, int end,
 //
 // Path selection (all read and write the same persistent KV rows):
 //   1 row            per-position decode step
-//   2..4 rows        batched GEMV suffix (speculative verify)
-//   5+ rows          tensor-core prefill
+//   2..16 rows       batched GEMV suffix (speculative verify)
+//   17+ rows         tensor-core prefill
 // The batched paths need the direct fused-attention branch; any failure
 // falls back to the per-position loop, which recomputes from the embedding
 // and re-appends the same KV rows idempotently.
@@ -1421,10 +1421,11 @@ int forward_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
 
   int rc = -1;
   const char* path = "";
-  if (!bucketed && direct && rows >= 2 && rows <= 4 && env_enabled("G4_BATCH_VERIFY")) {
+  if (!bucketed && direct && rows >= 2 && rows <= kMaxVerifyRows &&
+      env_enabled("G4_BATCH_VERIFY")) {
     rc = forward_rows_batched(g, d_tokens, start, end, out);
     path = " (batched)";
-  } else if (!bucketed && direct && rows > 4 && env_enabled("G4_PREFILL_GEMM") &&
+  } else if (!bucketed && direct && rows > kMaxVerifyRows && env_enabled("G4_PREFILL_GEMM") &&
              ensure_prefill_scratch(g)) {
     rc = forward_prefill(g, d_tokens, start, end, out);
     path = " (prefill)";
@@ -1538,7 +1539,7 @@ int gpu_verify_attention_stage(
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_cos == nullptr ||
       d_sin == nullptr || d_q_rot == nullptr || d_k_rot == nullptr ||
       d_cache_k == nullptr || d_cache_v == nullptr || d_out == nullptr ||
-      !std::isfinite(attention_scale) || rows < 1 || rows > 4 ||
+      !std::isfinite(attention_scale) || rows < 1 || rows > granite4::kMaxVerifyRows ||
       base_pos < 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
       head_dim > granite4::kMaxHeadDim || q_heads < kv_heads || q_heads % kv_heads != 0 ||
       static_cast<long long>(q_heads) * head_dim > INT_MAX ||
@@ -1568,7 +1569,7 @@ int gpu_verify_attention_layer_batched(
       !std::isfinite(q_scale) || !std::isfinite(k_scale) ||
       !std::isfinite(v_scale) || !std::isfinite(attention_scale) ||
       hidden_size <= 0 || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
-      rows < 1 || rows > 4 || base_pos < 0 ||
+      rows < 1 || rows > granite4::kMaxVerifyRows || base_pos < 0 ||
       head_dim > granite4::kMaxHeadDim ||
       static_cast<long long>(rows) * hidden_size > INT_MAX ||
       static_cast<long long>(rows) * hidden_size * static_cast<long long>(sizeof(std::uint16_t)) > INT_MAX ||
@@ -1794,7 +1795,7 @@ extern "C" int granite4_kernel_rope_at_pos_batched(
     const std::uint16_t* d_x, const float* d_cos, const float* d_sin, int rows,
     int heads, int d, std::uint16_t* d_out) {
   if (d_x == nullptr || d_cos == nullptr || d_sin == nullptr || d_out == nullptr ||
-      rows <= 0 || rows > 4 || heads <= 0 || d <= 0 || (d & 1) != 0 ||
+      rows <= 0 || rows > granite4::kMaxVerifyRows || heads <= 0 || d <= 0 || (d & 1) != 0 ||
       d > granite4::kMaxHeadDim ||
       static_cast<long long>(rows) * heads * d > INT_MAX)
     return -1;
@@ -1817,7 +1818,7 @@ extern "C" int granite4_kernel_verify_qkv_stage(
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_cos == nullptr ||
       d_sin == nullptr || d_q_rot == nullptr || d_k_rot == nullptr ||
       d_cache_k == nullptr || d_cache_v == nullptr || base_pos < 0 ||
-      rows <= 0 || rows > 4 || Hq <= 0 || Hk <= 0 || Hq < Hk ||
+      rows <= 0 || rows > granite4::kMaxVerifyRows || Hq <= 0 || Hk <= 0 || Hq < Hk ||
       Hq % Hk != 0 || d <= 0 || (d & 1) != 0 ||
       d > granite4::kMaxHeadDim ||
       static_cast<long long>(rows) * Hq * d > INT_MAX ||

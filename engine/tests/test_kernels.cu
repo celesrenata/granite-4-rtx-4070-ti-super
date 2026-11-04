@@ -61,6 +61,18 @@ extern "C" int granite4_verify_gemv(const std::uint16_t* d_a,
                                      const std::uint8_t* d_b, float scale,
                                      int tokens, int rows, int k,
                                      std::uint16_t* d_c);
+extern "C" int granite4_verify_gemv_resid(const std::uint16_t* d_a, const std::uint8_t* d_b,
+                                          float scale, const std::uint16_t* d_residual,
+                                          float residual_scale, int tokens, int rows, int k,
+                                          std::uint16_t* d_out);
+extern "C" int granite4_verify_qkv(const std::uint16_t* d_a, const std::uint8_t* d_wq,
+                                   const std::uint8_t* d_wk, const std::uint8_t* d_wv,
+                                   float sq, float sk, float sv, int tokens, int nq, int nk,
+                                   int nv, int k, std::uint16_t* d_q, std::uint16_t* d_k,
+                                   std::uint16_t* d_v);
+extern "C" int granite4_verify_silu(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
+                                    const std::uint16_t* d_x, float sg, float su, int n,
+                                    int k, int tokens, std::uint16_t* d_out);
 extern "C" int granite4_kernel_qkv_dequant(
     const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
     const std::uint8_t* d_wv, float sq, float sk, float sv, int nq, int nk, int k,
@@ -486,6 +498,89 @@ static void test_verify_gemv_production_parity_device() {
   cudaFree(da); cudaFree(db); cudaFree(dv); cudaFree(dr);
 }
 
+// The multi-token verify GEMVs against their single-token decode kernels at
+// every width 1..16, on decode-like K (4096: two 16-element chunks per lane;
+// 12800: an uneven 6.25 per lane), bit for bit.
+static void test_verify_kernels_bit_identical_device() {
+  constexpr int kMaxT = 16;
+  Xorshift64 rng(0x7e57);
+  for (const int K : {4096, 12800}) {
+    const int N = 72, nq = 48, nk = 12;  // nq + 2 nk == N rows of dw
+    const std::size_t outn = static_cast<std::size_t>(kMaxT) * N;
+    std::vector<std::uint16_t> a(static_cast<std::size_t>(kMaxT) * K), res(outn);
+    std::vector<std::uint8_t> w(static_cast<std::size_t>(N) * K), w2(w.size());
+    for (auto& v : a) v = gen_bf16(rng);
+    for (auto& v : res) v = gen_bf16(rng);
+    for (auto& v : w) v = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+    for (auto& v : w2) v = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+    std::uint16_t *da, *dres, *dgot, *dref, *dq, *dk, *dv, *rq, *rk, *rv;
+    std::uint8_t *dw, *dw2;
+    if (cudaMalloc(&da, a.size() * 2) || cudaMalloc(&dres, res.size() * 2) ||
+        cudaMalloc(&dw, w.size()) || cudaMalloc(&dw2, w2.size()) ||
+        cudaMalloc(&dgot, outn * 2) || cudaMalloc(&dref, outn * 2) ||
+        cudaMalloc(&dq, outn * 2) || cudaMalloc(&dk, outn * 2) || cudaMalloc(&dv, outn * 2) ||
+        cudaMalloc(&rq, outn * 2) || cudaMalloc(&rk, outn * 2) || cudaMalloc(&rv, outn * 2)) {
+      ++g_failures;
+      return;
+    }
+    CUDA_CHECK(cudaMemcpy(da, a.data(), a.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dres, res.data(), res.size() * 2, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dw2, w2.data(), w2.size(), cudaMemcpyHostToDevice));
+    auto same = [](const std::uint16_t* x, const std::uint16_t* y, std::size_t n) {
+      std::vector<std::uint16_t> hx(n), hy(n);
+      CUDA_CHECK(cudaMemcpy(hx.data(), x, n * 2, cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(hy.data(), y, n * 2, cudaMemcpyDeviceToHost));
+      return hx == hy;
+    };
+    auto at = [](auto* base, int t, int pitch) { return base + static_cast<std::size_t>(t) * pitch; };
+    const std::uint8_t* const wk = dw + static_cast<std::size_t>(nq) * K;
+    const std::uint8_t* const wv = wk + static_cast<std::size_t>(nk) * K;
+    bool launch_ok = true, gemv_ok = true, resid_ok = true, qkv_ok = true, silu_ok = true;
+    for (int T = 1; T <= kMaxT; ++T) {
+      const std::size_t n = static_cast<std::size_t>(T) * N;
+      launch_ok &= granite4_verify_gemv(da, dw, 0.0007f, T, N, K, dgot) == 0;
+      for (int t = 0; t < T; ++t)
+        launch_ok &= granite4_kernel_row_gemm_dequant(at(da, t, K), dw, 0.0007f, N, K,
+                                                      at(dref, t, N)) == 0;
+      gemv_ok &= same(dgot, dref, n);
+
+      launch_ok &= granite4_verify_gemv_resid(da, dw, 0.0006f, dres, 0.75f, T, N, K, dgot) == 0;
+      for (int t = 0; t < T; ++t)
+        launch_ok &= granite4_kernel_row_gemm_resid_dequant(at(da, t, K), dw, 0.0006f,
+                                                            at(dres, t, N), 0.75f, 1, N, K,
+                                                            at(dref, t, N)) == 0;
+      resid_ok &= same(dgot, dref, n);
+
+      launch_ok &= granite4_verify_qkv(da, dw, wk, wv, .0007f, .0008f, .0009f, T, nq, nk, nk,
+                                       K, dq, dk, dv) == 0;
+      for (int t = 0; t < T; ++t)
+        launch_ok &= granite4_kernel_qkv_dequant(at(da, t, K), dw, wk, wv, .0007f, .0008f,
+                                                 .0009f, nq, nk, K, at(rq, t, nq),
+                                                 at(rk, t, nk), at(rv, t, nk)) == 0;
+      qkv_ok &= same(dq, rq, static_cast<std::size_t>(T) * nq) &&
+                same(dk, rk, static_cast<std::size_t>(T) * nk) &&
+                same(dv, rv, static_cast<std::size_t>(T) * nk);
+
+      launch_ok &= granite4_verify_silu(dw, dw2, da, 0.03125f, 0.02734375f, N, K, T, dgot) == 0;
+      for (int t = 0; t < T; ++t)
+        launch_ok &= granite4_kernel_silu_gate_up(dw, dw2, at(da, t, K), 0.03125f, 0.02734375f,
+                                                  N, K, at(dref, t, N)) == 0;
+      silu_ok &= same(dgot, dref, n);
+    }
+    expect(launch_ok, "verify kernels: launches");
+    expect(gemv_ok, "verify kernels: GEMV bit-identical to decode (1..16 tokens)");
+    expect(resid_ok, "verify kernels: residual GEMV bit-identical to decode (1..16 tokens)");
+    expect(qkv_ok, "verify kernels: QKV bit-identical to decode (1..16 tokens)");
+    expect(silu_ok, "verify kernels: SwiGLU bit-identical to decode (1..16 tokens)");
+    expect(granite4_verify_gemv(da, dw, 1.0f, 17, N, K, dgot) == -1 &&
+               granite4_verify_gemv(da, dw, 1.0f, 0, N, K, dgot) == -1,
+           "verify kernels: reject widths outside 1..16");
+    cudaFree(da); cudaFree(dres); cudaFree(dw); cudaFree(dw2); cudaFree(dgot); cudaFree(dref);
+    cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(rq); cudaFree(rk); cudaFree(rv);
+  }
+}
+
 static void test_batched_qkv_parity_device() {
   const int tokens = 4, nq = 32, nk = 8, k = 256;
   Xorshift64 rng(0xa5a5);
@@ -604,7 +699,7 @@ static void test_verify_attention_validation_device() {
               32, 32, nullptr, nullptr, nullptr, nullptr, nullptr) == -1,
          "verify attention: rejects non-finite scale");
   expect(granite4_kernel_verify_attention_stage(
-              nullptr, nullptr, nullptr, nullptr, nullptr, 1.0f, 0, 5, 2, 1,
+              nullptr, nullptr, nullptr, nullptr, nullptr, 1.0f, 0, 17, 2, 1,
               32, 32, nullptr, nullptr, nullptr, nullptr, nullptr) == -1,
          "verify attention: rejects oversized batch");
 }
@@ -1034,9 +1129,9 @@ static void test_batched_verify_attention_device() {
   expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, rows,
                                            stride, Hk, d) == 0,
          "batched kv append: launch");
-  expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, 5, stride,
+  expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, 17, stride + 64,
                                            Hk, d) == -1,
-         "batched kv append: rejects rows > 4");
+         "batched kv append: rejects rows > 16");
   expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, rows,
                                            base + rows - 1, Hk, d) == -1,
          "batched kv append: rejects stride < base+rows");
@@ -1137,8 +1232,8 @@ static void test_batched_rmsnorm_device() {
   const float eps = 1e-5f;
   expect(granite4_kernel_rmsnorm_batched(dx, dw, eps, rows, cols, db) == 0,
          "batched rmsnorm: launch");
-  expect(granite4_kernel_rmsnorm_batched(dx, dw, eps, 5, cols, db) == -1,
-         "batched rmsnorm: rejects rows > 4");
+  expect(granite4_kernel_rmsnorm_batched(dx, dw, eps, 17, cols, db) == -1,
+         "batched rmsnorm: rejects rows > 16");
   for (int r = 0; r < rows; ++r)
     expect(granite4_kernel_rmsnorm(dx + static_cast<std::size_t>(r) * cols, dw,
                                    eps, 1, cols,
@@ -1181,9 +1276,9 @@ static void test_batched_rope_device() {
   expect(granite4_kernel_rope_at_pos_batched(dx, dc, dsin, rows, heads, d,
                                              db) == 0,
          "batched rope: launch");
-  expect(granite4_kernel_rope_at_pos_batched(dx, dc, dsin, 5, heads, d,
+  expect(granite4_kernel_rope_at_pos_batched(dx, dc, dsin, 17, heads, d,
                                              db) == -1,
-         "batched rope: rejects rows > 4");
+         "batched rope: rejects rows > 16");
   for (int r = 0; r < rows; ++r)
     expect(granite4_kernel_rope_at_pos(
                dx + static_cast<std::size_t>(r) * heads * d,
@@ -1385,7 +1480,7 @@ static void test_batched_forward_range_parity_device() {
   const int d = static_cast<int>(model.head_dim);
   const int V = static_cast<int>(model.vocab_size);
   const int max_pos = 32;
-  const int seq_len = 13;
+  const int seq_len = 30;
 
   const auto z = [](int v) { return static_cast<std::size_t>(v); };
   const GpuWeightsLayout lay{z(H), z(I), z(V), z(L), z(Hq), z(Hk), z(d)};
@@ -1469,16 +1564,17 @@ static void test_batched_forward_range_parity_device() {
     return;
   }
 
-  // Step plan mirroring the draft loop: a long single-token prefill (end 3,
-  // the watermark the verify loop starts from), then incremental suffix
-  // forwards of widths 4, 3, 2 (end 7, 10, 12) - the batched widths - with a
-  // final rows==1 decode (end 13) that stays on the per-position path in both
-  // ctxs. Both ctxs share one d_logits buffer, so capture each step's fresh
-  // rows immediately after the forward that wrote them (before the other ctx
-  // overwrites them).
-  const int ends[5] = {3, 7, 10, 12, 13};
+  // Step plan mirroring the draft loop: a short prefill (end 3, the
+  // watermark the verify loop starts from), then incremental suffix forwards
+  // of widths 4, 3, 2 (end 7, 10, 12), a rows==1 decode (end 13) that stays
+  // on the per-position path in both ctxs, the widest batched suffix (16
+  // rows, end 29) and one more decode. Both ctxs share one d_logits buffer,
+  // so capture each step's fresh rows immediately after the forward that
+  // wrote them (before the other ctx overwrites them).
+  const int ends[] = {3, 7, 10, 12, 13, 29, 30};
+  constexpr int kSteps = static_cast<int>(sizeof(ends) / sizeof(ends[0]));
   std::vector<std::uint16_t> ref_rows, batch_rows;  // accumulated logit rows
-  for (int e = 0; e < 5; ++e) {
+  for (int e = 0; e < kSteps; ++e) {
     const int end = ends[e];
     const int prev = e > 0 ? ends[e - 1] : 0;
     const std::size_t rows = static_cast<std::size_t>(end - prev) * V;
@@ -1506,18 +1602,12 @@ static void test_batched_forward_range_parity_device() {
     }
   }
 
-  // The batched suffix forwards (widths 4, 3, 2) must reproduce the
-  // per-position loop's logits. Most primitives are bit-identical (same
-  // embed / rmsnorm kernel, same RoPE formula, same row_gemm_resid kernel,
-  // bit-identical fused GQA), but the batched QKV-dequant and fused-K
-  // verify_gemv are each 2-ULP-tolerant vs their single-token counterparts
-  // (see test_batched_qkv_parity_device,
-  // test_verify_gemv_production_parity_device), and that tolerance
-  // compounds across layers. A *structural* defect (wrong position, KV row,
-  // or scale) shows up as thousands of ULP, so a generous band still catches
-  // it. The invariant the draft-verify loop actually relies on - a stable
-  // greedy argmax - is asserted separately and is the decisive check.
-  constexpr int kUlpTol = 32;
+  // The batched suffix forwards (widths 2..16) must reproduce the
+  // per-position loop's logits bit for bit: every stage of the verify
+  // forward shares its decode twin's per-row arithmetic (verify_gemv.cu,
+  // same RMSNorm / RoPE / attention kernels), which is what makes the greedy
+  // verify gate exact.
+  constexpr int kUlpTol = 0;
   expect(ref_rows.size() == batch_rows.size(), "parity: row counts match");
   if (ref_rows.size() == batch_rows.size()) {
     std::size_t bad = 0, bad_argmax = 0;
@@ -1537,7 +1627,7 @@ static void test_batched_forward_range_parity_device() {
         if (!bf16_close(a[i], b[i], ulp)) ++bad;
       if (argmax(a, V) != argmax(b, V)) ++bad_argmax;
     }
-    expect(bad == 0, "parity: batched suffix forward within ULP of per-position");
+    expect(bad == 0, "parity: batched suffix forward bit-identical to per-position");
     expect(bad_argmax == 0,
            "parity: greedy argmax stable (batched vs per-position)");
   }
@@ -1565,7 +1655,7 @@ static void test_batched_forward_range_parity_device() {
     for (int i = 0; i < 2 * V; ++i)
       if (!bf16_close(ref_redo[i], batch_redo[i], kUlpTol)) ++bad;
     expect(bad == 0,
-           "parity: truncate + batched recompute (width 2) within ULP");
+           "parity: truncate + batched recompute (width 2) bit-identical");
   }
   expect(gpu_ctx_truncate(ref_ctx, 9) == 0, "parity: ref truncate to 9");
   expect(gpu_ctx_truncate(batch_ctx, 9) == 0, "parity: batch truncate to 9");
@@ -1584,7 +1674,7 @@ static void test_batched_forward_range_parity_device() {
     for (int i = 0; i < 2 * V; ++i)
       if (!bf16_close(ref_redo[i], batch_redo[i], kUlpTol)) ++bad;
     expect(bad == 0,
-           "parity: truncate + batched recompute (width 3) within ULP");
+           "parity: truncate + batched recompute (width 3) bit-identical");
   }
 
   expect(gpu_ctx_written(ref_ctx) == 12, "parity: ref watermark");
@@ -1611,6 +1701,7 @@ int main() {
   test_gemm_device();
   test_row_gemm_device();
   test_verify_gemv_production_parity_device();
+  test_verify_kernels_bit_identical_device();
   test_batched_qkv_parity_device();
   test_batched_residual_projection_parity_device();
   test_verify_attention_validation_device();

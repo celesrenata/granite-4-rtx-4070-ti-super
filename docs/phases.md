@@ -588,6 +588,53 @@ per token (lower-precision weights, a quality decision) or more accepted
 tokens per weight pass (drafting). Long prefill is MMA bound at ~76% of the
 BF16 peak; FP8 activations would double the MMA rate at a numerics cost.
 
+### P4 round 3 — exact wide verify (2026-11-03, gremlin-1)
+
+The speculative verify forward (`forward_rows_batched`) now takes 2–16 rows
+(`kMaxVerifyRows`, was 4) through four multi-token GEMVs in `verify_gemv.cu`
+(Q|K|V, O/down with the residual add, SwiGLU gate/up, lm_head). Each streams
+a weight row once for all rows and reproduces its decode twin's per-token
+arithmetic (lane chunking at 128 threads, warp tree, warp totals in order),
+so every verify row is bit-identical to the decode step at that position:
+`test_verify_kernels_bit_identical_device` checks all four at widths 1–16
+against the decode kernels, and `test_batched_forward_range_parity_device`
+now requires the batched forward (widths 2, 3, 4, 16, plus truncate and
+recompute) to match the per-position forward bit for bit (it allowed 32 ULP
+before). The old batched Q/K/V and O/down kernels launched one block per
+(token, row) and re-read every weight row per token; that, not attention,
+was the ~3.5 ms per extra row. Suffixes of 17+ rows still run the
+tensor-core prefill.
+
+Device time of one verify forward (`G4_TIMESTEP=1`, `generate
+--draft-lookup K` on the summarize_quote prompt, medians):
+
+| rows | 1 (decode) | 2 | 3 | 4 | 6 | 7 | 8 | 12 | 15 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| before | 14.1 | 17.4 | 21.0 | 24.5 | — | 24.5 (prefill) | — | — | — |
+| now (ms) | 14.1 | 14.5 | 15.0 | 15.0 | 15.7 | — | 17.2 | 23.7 | 29.6 |
+
+Up to 8 rows an extra row costs ~0.4 ms. Past that the per-lane activation
+loads (two bytes of activation per weight byte per row, from L1/L2) start to
+dominate, so 9–16 rows cost ~1.5 ms each.
+
+Prompt-lookup drafting through the persistent engine (`serve`, chat-format
+prompts, up to 512 tokens, best of 2; outputs are token-identical to K=0 in
+every cell, which they were not at K ≥ 6 before):
+
+| prompt | K=0 | K=2 | K=4 | K=6 | K=8 | K=12 | K=15 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| essay | 71.2 | 67.8 | 67.7 | 67.5 | 67.0 | 65.4 | 63.9 |
+| qa | 69.8 | 68.1 | 67.9 | 67.6 | 67.0 | 64.4 | 62.3 |
+| code_edit | 54.7 | 66.8 | 68.7 | 70.6 | 72.0 | 67.0 | 63.0 |
+| json_extract | 58.6 | 63.9 | 76.3 | 75.3 | 73.6 | 67.3 | 62.5 |
+| summarize_quote | 67.3 | 81.4 | 97.9 | 107.1 | 111.3 | 106.6 | 100.8 |
+| list | 68.4 | 62.7 | 62.3 | 62.0 | 61.8 | 61.3 | 61.0 |
+
+(tokens/s). Copy-heavy replies gain up to 1.65×; novel text still loses a
+few percent, because lookup proposes rarely there and each miss costs a
+verify round. A model drafter (EAGLE-style head) is the next step; it can
+now verify chains of up to 8 tokens at ~0.4 ms per extra row.
+
 ## Rules across phases
 
 - No kernel or code is copied from `reference/qwen3-27b-5090/`; it is kept

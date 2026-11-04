@@ -34,6 +34,7 @@
 
 #include "attention_gpu.h"
 #include "device_math.cuh"
+#include "model_config.h"
 
 namespace granite4 {
 namespace {
@@ -189,7 +190,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                std::uint16_t* out) {
   if (q == nullptr || cache_k == nullptr || cache_v == nullptr || scratch == nullptr ||
       out == nullptr || !std::isfinite(scale) || d != kD || Hk <= 0 || Hq != kG * Hk ||
-      rows <= 0 || rows > 4 || stride <= 0 || (d_pos == nullptr && kv_base + rows > stride))
+      rows <= 0 || rows > kMaxVerifyRows || stride <= 0 || (d_pos == nullptr && kv_base + rows > stride))
     return -1;
   const int tps = tiles_per_split(stride);
   const int splits = ((stride + kTile - 1) / kTile + tps - 1) / tps;

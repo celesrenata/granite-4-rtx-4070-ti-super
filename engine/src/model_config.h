@@ -50,6 +50,10 @@ inline constexpr char kGpuTarget[] = "sm_89";
 // CUDA attention launch limits. These are intentionally model-independent
 // safety ceilings, not Granite's runtime dimensions.
 inline constexpr int kMaxHeadDim = 256;
+// Widest speculative verify forward (rows per batched suffix). Its GEMVs
+// stream each weight once for all rows and are bit-identical per row to the
+// decode step (verify_gemv.cu); wider suffixes run the tensor-core prefill.
+inline constexpr int kMaxVerifyRows = 16;
 // Fused GQA keeps the exp() terms of rows up to this length in shared memory
 // (8 bytes per position) so they are computed in parallel; longer rows run
 // the exact serial loop. 3584 keeps the whole fused block (q row, bf16
