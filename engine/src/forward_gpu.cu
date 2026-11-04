@@ -959,13 +959,43 @@ class CallTimer {
 struct RowOut {
   std::uint16_t* logits;
   std::int32_t* argmax;
+  std::uint16_t* hidden;  // final-normed hidden state (GpuForwardOut::d_hidden)
 };
 
-RowOut row_out(const GpuForwardOut& out, int t, int V) {
-  if (t < out.logits_from || out.d_logits == nullptr) return {nullptr, nullptr};
-  const std::size_t r = static_cast<std::size_t>(t - out.logits_from);
-  return {out.d_logits + r * V, out.d_argmax != nullptr ? out.d_argmax + r : nullptr};
+int hidden_from(const GpuForwardOut& out) {
+  return out.hidden_from >= 0 ? out.hidden_from : out.logits_from;
 }
+
+// First row that needs the final norm (end: none).
+int first_out_row(const GpuForwardOut& out, int end) {
+  int first = end;
+  if (out.d_logits != nullptr) first = std::min(first, out.logits_from);
+  if (out.d_hidden != nullptr) first = std::min(first, hidden_from(out));
+  return first;
+}
+
+bool wants_rows(const GpuForwardOut& out) {
+  return out.d_logits != nullptr || out.d_hidden != nullptr;
+}
+
+RowOut row_out(const GpuForwardOut& out, int t, int V, int H) {
+  RowOut ro{nullptr, nullptr, nullptr};
+  if (out.d_logits != nullptr && t >= out.logits_from) {
+    const std::size_t r = static_cast<std::size_t>(t - out.logits_from);
+    ro.logits = out.d_logits + r * V;
+    ro.argmax = out.d_argmax != nullptr ? out.d_argmax + r : nullptr;
+  }
+  if (out.d_hidden != nullptr && t >= hidden_from(out))
+    ro.hidden = out.d_hidden + static_cast<std::size_t>(t - hidden_from(out)) * H;
+  return ro;
+}
+
+// After the final norm of rows [first, end) into `normed` ([end - first][H]):
+// copy the requested hidden rows out, then the lm_head (+ argmax) over the
+// requested logits rows (verify GEMV up to kMaxVerifyRows rows, else the
+// tensor-core GEMM).
+int emit_rows(const GpuForwardOut& out, int first, int end, const std::uint16_t* normed,
+              int H, int V, const std::uint8_t* lm_head, float lm_scale);
 
 // ---------------------------------------------------------------------------
 // Single position *g->d_pos (= t_host). Every kernel of the direct-KV path
@@ -980,7 +1010,8 @@ RowOut row_out(const GpuForwardOut& out, int t, int V) {
 // ---------------------------------------------------------------------------
 int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
                      std::uint16_t* logits, std::int32_t* argmax,
-                     std::int32_t* chain_tokens, StepProbe* probe) {
+                     std::int32_t* chain_tokens, StepProbe* probe,
+                     std::uint16_t* hidden = nullptr) {
   const int L = g->L, H = g->H, I = g->I, Hq = g->Hq, Hk = g->Hk, d = g->d, V = g->V;
   const int max_pos = g->max_pos;
   const float rms_eps = g->spec.rms_norm_eps;
@@ -1103,9 +1134,16 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
   // ---------- final RMSNorm + lm_head (+ greedy pick) ----------
   bucket(StepProbe::kLm, 0, 0);
   gemv(StepProbe::kLmHead, 0, 0);
+  if (hidden != nullptr && logits == nullptr) {
+    if (granite4_kernel_rmsnorm(d_hidden, hv.final_norm, rms_eps, 1, H, hidden) != 0)
+      return -1;
+  }
   if (logits != nullptr) {
     if (granite4_kernel_rmsnorm(d_hidden, hv.final_norm, rms_eps, 1, H, d_normed) != 0)
       return -1;
+    if (hidden != nullptr)
+      G4_CUDA_CHECK(cudaMemcpyAsync(hidden, d_normed, sizeof(std::uint16_t) * H,
+                                    cudaMemcpyDeviceToDevice, cudaStreamPerThread));
     row_gemm_dequant_kernel<<<V, kRowGemvThreads>>>(d_normed, hv.lm_head, hv.lm_scale, V,
                                                     H, logits);
     G4_CUDA_CHECK(cudaGetLastError());
@@ -1132,9 +1170,9 @@ int forward_positions(GpuCtx* g, const std::int32_t* d_tokens, int start, int en
     CallTimer timer(bucketed);
     set_pos_kernel<<<1, 1>>>(g->d_pos, t);
     G4_CUDA_CHECK(cudaGetLastError());
-    const RowOut ro = row_out(out, t, g->V);
+    const RowOut ro = row_out(out, t, g->V, g->H);
     if (forward_position(g, d_tokens, t, ro.logits, ro.argmax, nullptr,
-                         bucketed ? &probe : nullptr) != 0)
+                         bucketed ? &probe : nullptr, ro.hidden) != 0)
       return -1;
     if (bucketed) probe.print(t + 1, t, timer.stop());
   }
@@ -1203,20 +1241,47 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
   }
 
   // Final norm + fused-K lm_head over the requested rows only.
-  const int first = std::max(start, out.d_logits != nullptr ? out.logits_from : end);
+  const int first = std::max(start, first_out_row(out, end));
   const int n = end - first;
   if (n > 0) {
-    const RowOut ro = row_out(out, first, V);
     std::uint16_t* const normed = d_normed + static_cast<std::size_t>(first - start) * H;
     if (granite4_kernel_rmsnorm_batched(
             d_hidden + static_cast<std::size_t>(first - start) * H, hv.final_norm,
             rms_eps, n, H, normed) != 0 ||
-        granite4_verify_gemv(normed, hv.lm_head, hv.lm_scale, n, V, H, ro.logits) != 0)
+        emit_rows(out, first, end, normed, H, V, hv.lm_head, hv.lm_scale) != 0)
       return -1;
-    if (ro.argmax != nullptr) {
-      argmax_rows_kernel<<<n, kArgmaxThreads>>>(ro.logits, V, ro.argmax, nullptr);
-      G4_CUDA_CHECK(cudaGetLastError());
-    }
+  }
+  return 0;
+}
+
+int emit_rows(const GpuForwardOut& out, int first, int end, const std::uint16_t* normed,
+              int H, int V, const std::uint8_t* lm_head, float lm_scale) {
+  const RowOut ro = row_out(out, std::max(first, hidden_from(out)), V, H);
+  if (ro.hidden != nullptr) {
+    const int h0 = std::max(first, hidden_from(out));
+    G4_CUDA_CHECK(cudaMemcpyAsync(ro.hidden, normed + static_cast<std::size_t>(h0 - first) * H,
+                                  sizeof(std::uint16_t) * (end - h0) * H,
+                                  cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+  }
+  if (out.d_logits == nullptr) return 0;
+  const int l0 = std::max(first, out.logits_from);
+  const int n = end - l0;
+  if (n <= 0) return 0;
+  const RowOut lo = row_out(out, l0, V, H);
+  const std::uint16_t* const a = normed + static_cast<std::size_t>(l0 - first) * H;
+  if (n <= kMaxVerifyRows) {
+    // Same weight stream and per-row arithmetic as the decode lm_head.
+    if (granite4_verify_gemv(a, lm_head, lm_scale, n, V, H, lo.logits) != 0) return -1;
+  } else {
+    GemmEpilogue lm;
+    lm.scale0 = lm.scale1 = lm.scale2 = lm_scale;
+    lm.out_bf16 = lo.logits;
+    lm.ldc = V;
+    if (prefill_gemm(GemmOut::kBf16, a, H, lm_head, n, V, H, lm) != 0) return -1;
+  }
+  if (lo.argmax != nullptr) {
+    argmax_rows_kernel<<<n, kArgmaxThreads>>>(lo.logits, V, lo.argmax, nullptr);
+    G4_CUDA_CHECK(cudaGetLastError());
   }
   return 0;
 }
@@ -1350,31 +1415,14 @@ int forward_prefill(GpuCtx* g, const std::int32_t* d_tokens, int start, int end,
     }
 
     // Logits for the requested rows of this chunk only.
-    const int first = std::max(c0, out.d_logits != nullptr ? out.logits_from : end);
+    const int first = std::max(c0, first_out_row(out, end));
     const int n = c0 + M - first;
     if (n <= 0) continue;
-    const RowOut ro = row_out(out, first, V);
     const std::size_t r0 = static_cast<std::size_t>(first - c0) * H;
     if (granite4_kernel_rmsnorm(s.hidden + r0, hv.final_norm, rms_eps, n, H,
-                                s.normed + r0) != 0)
+                                s.normed + r0) != 0 ||
+        emit_rows(out, first, c0 + M, s.normed + r0, H, V, hv.lm_head, hv.lm_scale) != 0)
       return -1;
-    if (n <= 4) {
-      // Same weight stream and arithmetic as the decode lm_head.
-      if (granite4_verify_gemv(s.normed + r0, hv.lm_head, hv.lm_scale, n, V, H,
-                               ro.logits) != 0)
-        return -1;
-    } else {
-      GemmEpilogue lm;
-      lm.scale0 = lm.scale1 = lm.scale2 = hv.lm_scale;
-      lm.out_bf16 = ro.logits;
-      lm.ldc = V;
-      if (prefill_gemm(GemmOut::kBf16, s.normed + r0, H, hv.lm_head, n, V, H, lm) != 0)
-        return -1;
-    }
-    if (ro.argmax != nullptr) {
-      argmax_rows_kernel<<<n, kArgmaxThreads>>>(ro.logits, V, ro.argmax, nullptr);
-      G4_CUDA_CHECK(cudaGetLastError());
-    }
   }
   return 0;
 }
@@ -1402,7 +1450,8 @@ int forward_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
   if (g == nullptr || d_tokens == nullptr) return seterr("invalid forward arguments");
   if (end <= 0 || end > g->max_pos) return seterr("invalid sequence length");
   if (out.logits_from < 0 || out.logits_from > end ||
-      (out.logits_from < end && out.d_logits == nullptr))
+      (out.logits_from < end && !wants_rows(out)) ||
+      (out.d_hidden != nullptr && (hidden_from(out) < 0 || hidden_from(out) > end)))
     return seterr("invalid logits range");
   const ForwardSpec& sp = g->spec;
   if (!std::isfinite(sp.rms_norm_eps) || sp.rms_norm_eps <= 0.0f ||
@@ -1691,6 +1740,16 @@ int gpu_decode_greedy(GpuCtx* ctx, std::int32_t* d_tokens, int steps,
 }
 
 int gpu_ctx_written(GpuCtx* ctx) { return ctx != nullptr ? ctx->written : -1; }
+
+int gpu_ctx_shared_weights(GpuCtx* ctx, const std::uint16_t** d_embed,
+                           const std::uint8_t** d_lm_head, float* lm_scale) {
+  if (ctx == nullptr || ctx->weights == nullptr || ctx->scales == nullptr) return -1;
+  const HeadView hv = head_view(ctx);
+  *d_embed = hv.embed;
+  *d_lm_head = hv.lm_head;
+  *lm_scale = hv.lm_scale;
+  return 0;
+}
 
 int gpu_ctx_truncate(GpuCtx* ctx, int written) {
   if (ctx == nullptr || written < 0 || written > ctx->written ||

@@ -1,0 +1,1602 @@
+[
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the sociology of open source"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why does salt melt ice on roads?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about gardening in cold climates"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about gardening in cold climates"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: our batch job runs 40 minutes slower on weekends. The hardware is unchanged. What would you check first and why?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a database query is 10x slower after a schema change that added an index. Explain how that could happen."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what is the difference between a monad and a functor?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a number divided by 7 gives a remainder of 3; divided by 5 it gives a remainder of 2. Find the smallest such number."
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, tidal energy"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the biology of sleep"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why is UTF-8 more common than UTF-16?"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Sensor reading: the air quality index is 42, temperature 21.3 C, humidity 58%, recorded at 08:00 on 2026-11-02 in Berlin.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about quantum error correction"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the product name, price in cents, and currency from: 'The Nova Desk Lamp, model ND-200, is listed at $49.99 USD in the spring catalog.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the history of the Roman Empire"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do vaccines train the immune system without causing disease?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do deep learning models need batch normalization?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the mathematics of voting systems"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The incident on 2026-11-01 started at 14:23 UTC, was caused by a bad deployment, and took 3 engineers and 47 minutes to resolve.'"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Recipe: pasta with tomato sauce needs 300 g pasta, 400 g tomatoes, 2 garlic cloves, 20 ml olive oil, salt, and 12 minutes of cooking.'"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The order #A7712 contains 2x USB-C hub at $18.50 each and 1x cable at $9.00, total $46.00, paid by card.'"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: our batch job runs 40 minutes slower on weekends. The hardware is unchanged. What would you check first and why?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. parse a CSV file with quoted fields, skip blank lines, and return rows as dictionaries."
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Recipe: pasta with tomato sauce needs 300 g pasta, 400 g tomatoes, 2 garlic cloves, 20 ml olive oil, salt, and 12 minutes of cooking.'"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The ticket was opened by j.smith, labeled bug and p2, assigned to the storage team, and closed after 3 days.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the mathematics of voting systems"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a simple expression evaluator supporting + - * / parentheses with proper precedence."
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, wildlife corridors"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how does RAID 5 differ from RAID 6?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how does a B-tree differ from a skip list?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that groups a list of events by day and sorts each group by time."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a ladder 5 m long leans against a wall with its base 1.4 m from the wall. How high up the wall does it reach?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the history of jazz"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: why can a system be individually rational for each node and collectively unstable? Give a network example."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what is the difference between a monad and a functor?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a rectangle's diagonal is 13 and its area is 30. What is its perimeter?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the history of paper money"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that flattens a nested list of arbitrary depth into a generator."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a company's per-unit cost rises as volume doubles. Identify the cost components that would explain this and how to verify each."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that streams a large JSON array object-by-object without loading it all."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a ladder 5 m long leans against a wall with its base 1.4 m from the wall. How high up the wall does it reach?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, protein folding"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why does salt melt ice on roads?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the history of the printing press"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about machine learning interpretability"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, protein folding"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: explain why a 99.9% uptime guarantee still allows about 52 minutes of downtime a year, and whether that number is right."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a database query is 10x slower after a schema change that added an index. Explain how that could happen."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about wildlife corridors"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement an exponential backoff scheduler with jitter and a max retry cap."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the sum of three consecutive multiples of 5 is 405. What are they?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: an A/B test shows a 12% lift with a p-value of 0.04 after a 1% sample. How would you interpret this?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a thread-safe LRU cache with a fixed capacity and O(1) get/put."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about protein folding"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that balances a binary search tree in order."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a number divided by 7 gives a remainder of 3; divided by 5 it gives a remainder of 2. Find the smallest such number."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the biology of sleep"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: if a is 30% more than b, by what percent is b less than a?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a recommendation system shows more clicks but less time spent. Reconcile the two signals."
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The order #A7712 contains 2x USB-C hub at $18.50 each and 1x cable at $9.00, total $46.00, paid by card.'"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a company's per-unit cost rises as volume doubles. Identify the cost components that would explain this and how to verify each."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the history of lighthouses"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the history of the Roman Empire"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what is the tradeoff between recall and precision?"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Recipe: pasta with tomato sauce needs 300 g pasta, 400 g tomatoes, 2 garlic cloves, 20 ml olive oil, salt, and 12 minutes of cooking.'"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a train leaves A at 9:00 at 60 km/h; another leaves B at 9:30 at 80 km/h toward A. The distance between A and B is 280 km. When do they meet and where?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do black holes have event horizons?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, ancient trade routes"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The order #A7712 contains 2x USB-C hub at $18.50 each and 1x cable at $9.00, total $46.00, paid by card.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about soil microbiome"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that computes the edit distance between two strings with the operation counts."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that topologically sorts a directed graph and reports cycles."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that topologically sorts a directed graph and reports cycles."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the ratio of boys to girls is 3:4 and there are 35 students. How many girls?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about machine learning interpretability"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do magnets attract?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: 15% of x plus 8 is equal to 27. Find x."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a factory's defect rate drops when a new machine is installed but only on one shift. Form the hypotheses and the test for each."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: why can a system be individually rational for each node and collectively unstable? Give a network example."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how does TCP avoid duplicate packets flooding a receiver?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: explain why a 99.9% uptime guarantee still allows about 52 minutes of downtime a year, and whether that number is right."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that groups a list of events by day and sorts each group by time."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a company's per-unit cost rises as volume doubles. Identify the cost components that would explain this and how to verify each."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that detects a race condition-free counter with a lock and benchmark it."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that topologically sorts a directed graph and reports cycles."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: how many ways can you choose 3 items from 10 without order mattering?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, gardening in cold climates"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Meeting notes: the decision was to postpone the launch by two weeks, owned by Priya, with a review on Friday.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, machine learning interpretability"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the philosophy of free will"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what is the purpose of a residual connection?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that normalizes a file path and rejects traversal attempts."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a company's per-unit cost rises as volume doubles. Identify the cost components that would explain this and how to verify each."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: our logs show p99 latency is 10x p50 but averages are stable. What does that distribution shape suggest and what are three common causes?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a circular track is 400 m. Two runners start together going opposite ways at 6 and 9 m/s. How often do they meet in one hour?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about soil microbiome"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that balances a binary search tree in order."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a rectangle's diagonal is 13 and its area is 30. What is its perimeter?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the ratio of boys to girls is 3:4 and there are 35 students. How many girls?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the sum of three consecutive multiples of 5 is 405. What are they?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the history of the printing press"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about ocean currents"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, wildfire smoke and air quality"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement an exponential backoff scheduler with jitter and a max retry cap."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that computes the edit distance between two strings with the operation counts."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a ladder 5 m long leans against a wall with its base 1.4 m from the wall. How high up the wall does it reach?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the average of five numbers is 40. If the largest is removed the average is 32. What was the largest?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that validates an IPv4 address including leading-zero rejection."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a recommendation system shows more clicks but less time spent. Reconcile the two signals."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do neural radiance fields represent 3D scenes?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about beekeeping"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the economics of public transit"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about ocean currents"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a number divided by 7 gives a remainder of 3; divided by 5 it gives a remainder of 2. Find the smallest such number."
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The order #A7712 contains 2x USB-C hub at $18.50 each and 1x cable at $9.00, total $46.00, paid by card.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, ocean currents"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that groups a list of events by day and sorts each group by time."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that merges two sorted linked lists in place and returns the head."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a rate limiter using a token bucket that supports multiple named clients."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: two pipes fill a tank in 4 and 6 hours; a drain empties it in 10 hours. With all three open, how long to fill the tank?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about supply chain resilience"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the history of the printing press"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: two identical models differ by 3 points in accuracy. Is the difference meaningful? Describe a procedure to decide."
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the product name, price in cents, and currency from: 'The Nova Desk Lamp, model ND-200, is listed at $49.99 USD in the spring catalog.'"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how does RAID 5 differ from RAID 6?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, tidal energy"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a clock's hour and minute hands are 120 degrees apart between 2 and 3 o'clock. What time is it?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that splits a sentence into words keeping punctuation attached to the preceding word."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what is the tradeoff between recall and precision?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that computes the longest common subsequence length with backtracking."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about wildfire smoke and air quality"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a factory's defect rate drops when a new machine is installed but only on one shift. Form the hypotheses and the test for each."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a recommendation system shows more clicks but less time spent. Reconcile the two signals."
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the ethics of synthetic data"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Patient record: 34-year-old, 72 kg, height 1.78 m, blood pressure 121/78, heart rate 61 bpm at rest.'"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Meeting notes: the decision was to postpone the launch by two weeks, owned by Priya, with a review on Friday.'"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how does RAID 5 differ from RAID 6?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a feature improved lab accuracy but decreased user retention. What does that imply and what should you do next?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do deep learning models need batch normalization?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the economics of public transit"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how does a B-tree differ from a skip list?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, climate adaptation in cities"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: 15% of x plus 8 is equal to 27. Find x."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: find the value of 2^10 - 10^2 divided by 4."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do crystals form specific shapes?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, soil microbiome"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the ethics of facial recognition"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that detects a race condition-free counter with a lock and benchmark it."
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, distributed systems"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a startup's churn doubled in two months while revenue stayed flat. List the likely causes in order of impact and the metric to check for each."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what causes auroras?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: our logs show p99 latency is 10x p50 but averages are stable. What does that distribution shape suggest and what are three common causes?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do rivers form meanders?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a startup's churn doubled in two months while revenue stayed flat. List the likely causes in order of impact and the metric to check for each."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a clock's hour and minute hands are 120 degrees apart between 2 and 3 o'clock. What time is it?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, wildfire smoke and air quality"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, urban agriculture"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a clock's hour and minute hands are 120 degrees apart between 2 and 3 o'clock. What time is it?"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the product name, price in cents, and currency from: 'The Nova Desk Lamp, model ND-200, is listed at $49.99 USD in the spring catalog.'"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do neural radiance fields represent 3D scenes?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the ratio of boys to girls is 3:4 and there are 35 students. How many girls?"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Patient record: 34-year-old, 72 kg, height 1.78 m, blood pressure 121/78, heart rate 61 bpm at rest.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the philosophy of free will"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do rivers form meanders?"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Meeting notes: the decision was to postpone the launch by two weeks, owned by Priya, with a review on Friday.'"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do crystals form specific shapes?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: find the value of 2^10 - 10^2 divided by 4."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: our logs show p99 latency is 10x p50 but averages are stable. What does that distribution shape suggest and what are three common causes?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what causes auroras?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: why does adding more data sometimes decrease a model's accuracy?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the history of the Roman Empire"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what is the difference between a monad and a functor?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that finds the longest palindromic substring using dynamic programming."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: why does adding more data sometimes decrease a model's accuracy?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: explain why a 99.9% uptime guarantee still allows about 52 minutes of downtime a year, and whether that number is right."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that validates an IPv4 address including leading-zero rejection."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a train leaves A at 9:00 at 60 km/h; another leaves B at 9:30 at 80 km/h toward A. The distance between A and B is 280 km. When do they meet and where?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the history of paper money"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the history of jazz"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, supply chain resilience"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: why does adding more data sometimes decrease a model's accuracy?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what causes jet lag and why is it worse eastbound?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the sum of three consecutive multiples of 5 is 405. What are they?"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The flight AA1042 from JFK to LAX departs 07:45, arrives 10:50, gate B22, and is on time.'"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Recipe: pasta with tomato sauce needs 300 g pasta, 400 g tomatoes, 2 garlic cloves, 20 ml olive oil, salt, and 12 minutes of cooking.'"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: an A/B test shows a 12% lift with a p-value of 0.04 after a 1% sample. How would you interpret this?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how does a B-tree differ from a skip list?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: two pipes fill a tank in 4 and 6 hours; a drain empties it in 10 hours. With all three open, how long to fill the tank?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how does TCP avoid duplicate packets flooding a receiver?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the ethics of synthetic data"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the history of the Roman Empire"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The ticket was opened by j.smith, labeled bug and p2, assigned to the storage team, and closed after 3 days.'"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Sensor reading: the air quality index is 42, temperature 21.3 C, humidity 58%, recorded at 08:00 on 2026-11-02 in Berlin.'"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: two identical models differ by 3 points in accuracy. Is the difference meaningful? Describe a procedure to decide."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that finds all anagrams in a list of words grouped by sorted letters."
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The flight AA1042 from JFK to LAX departs 07:45, arrives 10:50, gate B22, and is on time.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about supply chain resilience"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a train leaves A at 9:00 at 60 km/h; another leaves B at 9:30 at 80 km/h toward A. The distance between A and B is 280 km. When do they meet and where?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: explain why a 99.9% uptime guarantee still allows about 52 minutes of downtime a year, and whether that number is right."
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, compiler design"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Meeting notes: the decision was to postpone the launch by two weeks, owned by Priya, with a review on Friday.'"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do GPS satellites account for relativity?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about wildlife corridors"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a clock's hour and minute hands are 120 degrees apart between 2 and 3 o'clock. What time is it?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about distributed systems"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a feature improved lab accuracy but decreased user retention. What does that imply and what should you do next?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: two identical models differ by 3 points in accuracy. Is the difference meaningful? Describe a procedure to decide."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a recommendation system shows more clicks but less time spent. Reconcile the two signals."
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, ancient trade routes"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the ethics of synthetic data"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: 15% of x plus 8 is equal to 27. Find x."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the physics of supersonic flight"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the physics of supersonic flight"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the philosophy of free will"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The incident on 2026-11-01 started at 14:23 UTC, was caused by a bad deployment, and took 3 engineers and 47 minutes to resolve.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, gardening in cold climates"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a thread-safe LRU cache with a fixed capacity and O(1) get/put."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what causes jet lag and why is it worse eastbound?"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the product name, price in cents, and currency from: 'The Nova Desk Lamp, model ND-200, is listed at $49.99 USD in the spring catalog.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about ancient trade routes"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that splits a sentence into words keeping punctuation attached to the preceding word."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about tidal energy"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the sociology of open source"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the sociology of open source"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do black holes have event horizons?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement an exponential backoff scheduler with jitter and a max retry cap."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a hospital sees a spike in flu diagnoses in January with no new virus strain. Give the most likely explanation and the data that would confirm it."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that detects whether two binary trees are isomorphic."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that computes the longest common subsequence length with backtracking."
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Patient record: 34-year-old, 72 kg, height 1.78 m, blood pressure 121/78, heart rate 61 bpm at rest.'"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that finds the longest palindromic substring using dynamic programming."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about wildfire smoke and air quality"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, quantum error correction"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that flattens a nested list of arbitrary depth into a generator."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do magnets attract?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do GPUs use tensor cores for matrix multiplication?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a factory's defect rate drops when a new machine is installed but only on one shift. Form the hypotheses and the test for each."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do neural radiance fields represent 3D scenes?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that computes the longest common subsequence length with backtracking."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do we use logarithmic scales for sound?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: our logs show p99 latency is 10x p50 but averages are stable. What does that distribution shape suggest and what are three common causes?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the history of jazz"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do vaccines train the immune system without causing disease?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do we use logarithmic scales for sound?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the biology of sleep"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do we use logarithmic scales for sound?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, beekeeping"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: two identical models differ by 3 points in accuracy. Is the difference meaningful? Describe a procedure to decide."
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, distributed systems"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about quantum error correction"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, climate adaptation in cities"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only, no prose, the fields name, role, and years of experience from: 'Interview notes: our candidate Marta Kovac works as a lead backend engineer at a logistics company, with 9 years of professional experience after 2 more as a contractor.'"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why does salt melt ice on roads?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: what is 12% of 85 plus 5% of 400?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a hospital sees a spike in flu diagnoses in January with no new virus strain. Give the most likely explanation and the data that would confirm it."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about climate adaptation in cities"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the ethics of facial recognition"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a startup's churn doubled in two months while revenue stayed flat. List the likely causes in order of impact and the metric to check for each."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: two pipes fill a tank in 4 and 6 hours; a drain empties it in 10 hours. With all three open, how long to fill the tank?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about urban agriculture"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about tidal energy"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a hospital sees a spike in flu diagnoses in January with no new virus strain. Give the most likely explanation and the data that would confirm it."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the ethics of facial recognition"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that streams a large JSON array object-by-object without loading it all."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that detects whether two binary trees are isomorphic."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a simple expression evaluator supporting + - * / parentheses with proper precedence."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: if a is 30% more than b, by what percent is b less than a?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that merges two sorted linked lists in place and returns the head."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the economics of public transit"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what causes jet lag and why is it worse eastbound?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a rate limiter using a token bucket that supports multiple named clients."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: an A/B test shows a 12% lift with a p-value of 0.04 after a 1% sample. How would you interpret this?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the psychology of procrastination"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a model that predicts house prices uses the year of renovation. Is that leakage, and how would you test?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: our batch job runs 40 minutes slower on weekends. The hardware is unchanged. What would you check first and why?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that merges two sorted linked lists in place and returns the head."
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Sensor reading: the air quality index is 42, temperature 21.3 C, humidity 58%, recorded at 08:00 on 2026-11-02 in Berlin.'"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what is the tradeoff between recall and precision?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about climate adaptation in cities"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a feature improved lab accuracy but decreased user retention. What does that imply and what should you do next?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, soil microbiome"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a model that predicts house prices uses the year of renovation. Is that leakage, and how would you test?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the average of five numbers is 40. If the largest is removed the average is 32. What was the largest?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the ethics of facial recognition"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about ancient trade routes"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a thread-safe LRU cache with a fixed capacity and O(1) get/put."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that detects a race condition-free counter with a lock and benchmark it."
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the economics of public transit"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do GPS satellites account for relativity?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that normalizes a file path and rejects traversal attempts."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why is UTF-8 more common than UTF-16?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that validates an IPv4 address including leading-zero rejection."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what is the purpose of a residual connection?"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only, no prose, the fields name, role, and years of experience from: 'Interview notes: our candidate Marta Kovac works as a lead backend engineer at a logistics company, with 9 years of professional experience after 2 more as a contractor.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, compiler design"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a rectangle's diagonal is 13 and its area is 30. What is its perimeter?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what is the purpose of a residual connection?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, beekeeping"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The incident on 2026-11-01 started at 14:23 UTC, was caused by a bad deployment, and took 3 engineers and 47 minutes to resolve.'"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that computes the edit distance between two strings with the operation counts."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a ladder 5 m long leans against a wall with its base 1.4 m from the wall. How high up the wall does it reach?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a factory's defect rate drops when a new machine is installed but only on one shift. Form the hypotheses and the test for each."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do crystals form specific shapes?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how does TCP avoid duplicate packets flooding a receiver?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: an A/B test shows a 12% lift with a p-value of 0.04 after a 1% sample. How would you interpret this?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the ratio of boys to girls is 3:4 and there are 35 students. How many girls?"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The flight AA1042 from JFK to LAX departs 07:45, arrives 10:50, gate B22, and is on time.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, wildlife corridors"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the history of jazz"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that balances a binary search tree in order."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: what is 12% of 85 plus 5% of 400?"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The ticket was opened by j.smith, labeled bug and p2, assigned to the storage team, and closed after 3 days.'"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The incident on 2026-11-01 started at 14:23 UTC, was caused by a bad deployment, and took 3 engineers and 47 minutes to resolve.'"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the psychology of procrastination"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only, no prose, the fields name, role, and years of experience from: 'Interview notes: our candidate Marta Kovac works as a lead backend engineer at a logistics company, with 9 years of professional experience after 2 more as a contractor.'"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: find the value of 2^10 - 10^2 divided by 4."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: why can a system be individually rational for each node and collectively unstable? Give a network example."
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Patient record: 34-year-old, 72 kg, height 1.78 m, blood pressure 121/78, heart rate 61 bpm at rest.'"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a model that predicts house prices uses the year of renovation. Is that leakage, and how would you test?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do GPUs use tensor cores for matrix multiplication?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that flattens a nested list of arbitrary depth into a generator."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: what causes auroras?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a circular track is 400 m. Two runners start together going opposite ways at 6 and 9 m/s. How often do they meet in one hour?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a circular track is 400 m. Two runners start together going opposite ways at 6 and 9 m/s. How often do they meet in one hour?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a startup's churn doubled in two months while revenue stayed flat. List the likely causes in order of impact and the metric to check for each."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a number divided by 7 gives a remainder of 3; divided by 5 it gives a remainder of 2. Find the smallest such number."
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the sociology of open source"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do vaccines train the immune system without causing disease?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a database query is 10x slower after a schema change that added an index. Explain how that could happen."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do GPUs use tensor cores for matrix multiplication?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do magnets attract?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a rate limiter using a token bucket that supports multiple named clients."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a simple expression evaluator supporting + - * / parentheses with proper precedence."
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The ticket was opened by j.smith, labeled bug and p2, assigned to the storage team, and closed after 3 days.'"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that finds all anagrams in a list of words grouped by sorted letters."
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do deep learning models need batch normalization?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that finds all anagrams in a list of words grouped by sorted letters."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a rectangle's diagonal is 13 and its area is 30. What is its perimeter?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: if a is 30% more than b, by what percent is b less than a?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the mathematics of voting systems"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: our batch job runs 40 minutes slower on weekends. The hardware is unchanged. What would you check first and why?"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'Sensor reading: the air quality index is 42, temperature 21.3 C, humidity 58%, recorded at 08:00 on 2026-11-02 in Berlin.'"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: 15% of x plus 8 is equal to 27. Find x."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about compiler design"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: what is 12% of 85 plus 5% of 400?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the history of lighthouses"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that finds the longest palindromic substring using dynamic programming."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the history of paper money"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: why can a system be individually rational for each node and collectively unstable? Give a network example."
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a model that predicts house prices uses the year of renovation. Is that leakage, and how would you test?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the average of five numbers is 40. If the largest is removed the average is 32. What was the largest?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the physics of supersonic flight"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about compiler design"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a feature improved lab accuracy but decreased user retention. What does that imply and what should you do next?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the sum of three consecutive multiples of 5 is 405. What are they?"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: how do GPS satellites account for relativity?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: find the value of 2^10 - 10^2 divided by 4."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about distributed systems"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: two pipes fill a tank in 4 and 6 hours; a drain empties it in 10 hours. With all three open, how long to fill the tank?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, quantum error correction"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only the fields from: 'The flight AA1042 from JFK to LAX departs 07:45, arrives 10:50, gate B22, and is on time.'"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do rivers form meanders?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about protein folding"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a train leaves A at 9:00 at 60 km/h; another leaves B at 9:30 at 80 km/h toward A. The distance between A and B is 280 km. When do they meet and where?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, ocean currents"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the physics of supersonic flight"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the psychology of procrastination"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that detects whether two binary trees are isomorphic."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: if a is 30% more than b, by what percent is b less than a?"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: what is 12% of 85 plus 5% of 400?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, urban agriculture"
+ },
+ {
+  "style": "json",
+  "prompt": "Extract as JSON only, no prose, the fields name, role, and years of experience from: 'Interview notes: our candidate Marta Kovac works as a lead backend engineer at a logistics company, with 9 years of professional experience after 2 more as a contractor.'"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: why does adding more data sometimes decrease a model's accuracy?"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a database query is 10x slower after a schema change that added an index. Explain how that could happen."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the history of the printing press"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, machine learning interpretability"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: how many ways can you choose 3 items from 10 without order mattering?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about urban agriculture"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that normalizes a file path and rejects traversal attempts."
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: the average of five numbers is 40. If the largest is removed the average is 32. What was the largest?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about beekeeping"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why do black holes have event horizons?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the biology of sleep"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. implement a function that streams a large JSON array object-by-object without loading it all."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. parse a CSV file with quoted fields, skip blank lines, and return rows as dictionaries."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the mathematics of voting systems"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, supply chain resilience"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the history of lighthouses"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: how many ways can you choose 3 items from 10 without order mattering?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the ethics of synthetic data"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: a circular track is 400 m. Two runners start together going opposite ways at 6 and 9 m/s. How often do they meet in one hour?"
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. write a function that splits a sentence into words keeping punctuation attached to the preceding word."
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the history of lighthouses"
+ },
+ {
+  "style": "math",
+  "prompt": "Solve step by step: how many ways can you choose 3 items from 10 without order mattering?"
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the history of paper money"
+ },
+ {
+  "style": "essay",
+  "prompt": "Write a 250-word essay about the psychology of procrastination"
+ },
+ {
+  "style": "analysis",
+  "prompt": "Analyze step by step: a hospital sees a spike in flu diagnoses in January with no new virus strain. Give the most likely explanation and the data that would confirm it."
+ },
+ {
+  "style": "code",
+  "prompt": "Write a clean Python function. parse a CSV file with quoted fields, skip blank lines, and return rows as dictionaries."
+ },
+ {
+  "style": "essay",
+  "prompt": "Explain like I'm 12, in one paragraph, the philosophy of free will"
+ },
+ {
+  "style": "qa",
+  "prompt": "Answer in a few sentences: why is UTF-8 more common than UTF-16?"
+ }
+]

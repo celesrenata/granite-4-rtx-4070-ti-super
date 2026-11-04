@@ -363,6 +363,17 @@
               type = lib.types.ints.positive;
               default = 8192;
             };
+            eagle.head = lib.mkOption {
+              description = "Trained EAGLE draft head (safetensors, scripts/eagle/export_head.py) for speculative decoding on the GPU engine. The engine's exact greedy verify keeps output identical to plain greedy decoding; null decodes without drafting.";
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "/opt/granite4-rtx-4070-ti-super/eagle/heads/r1.safetensors";
+            };
+            eagle.k = lib.mkOption {
+              description = "Tokens the EAGLE head drafts per verify round (1-15).";
+              type = lib.types.ints.between 1 15;
+              default = 5;
+            };
             gate.minMatch = lib.mkOption {
               description = "Fraction of reference positions that must pass the teacher-forced gate.";
               type = lib.types.numbers.between 0 1;
@@ -405,10 +416,13 @@
               after = [ "network.target" ] ++ lib.optional serving "nvidia-persistenced.service";
               wants = lib.optional serving "nvidia-persistenced.service";
               wantedBy = [ "multi-user.target" ];
-              environment = lib.optionalAttrs serving {
+              environment = lib.optionalAttrs serving ({
                 GRANITE4_GATE = gateFile;
                 GRANITE4_MAX_CONTEXT = toString cfg.maxContext;
-              };
+              } // lib.optionalAttrs (cfg.eagle.head != null) {
+                GRANITE4_EAGLE_HEAD = cfg.eagle.head;
+                GRANITE4_EAGLE_K = toString cfg.eagle.k;
+              });
               serviceConfig = {
                 User = "granite4-rtx";
                 Group = "granite4-rtx";

@@ -45,7 +45,7 @@ if(GRANITE_ENABLE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   list(APPEND GRANITE_ENGINE_SOURCES src/kernels.cu src/kernels_phase2.cu
        src/kernels_phase3.cu src/forward_gpu.cu src/verify_gemv.cu
-       src/prefill_gemm.cu src/attention_split.cu)
+       src/prefill_gemm.cu src/attention_split.cu src/eagle_gpu.cu)
 endif()
 
 add_library(granite4 SHARED ${GRANITE_ENGINE_SOURCES})

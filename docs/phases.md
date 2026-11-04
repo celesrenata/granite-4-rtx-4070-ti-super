@@ -474,6 +474,33 @@ holds two in-flight uint4 weight vectors and two decode pipelines at once,
 which drops blocks-per-SM and hurts latency hiding more than the extra
 MLP helps.
 
+### P4 round 3 — EAGLE draft head (2026-11-04, gremlin-1)
+
+The engine now supports an optional trained EAGLE-style draft head. The head
+reads the target model's final-normed hidden states, proposes up to 15 tokens,
+and the target verifies the anchor plus proposals in one exact batched forward.
+The verify output is bit-identical to ordinary greedy decoding; rejected drafts
+are never emitted. Training data and tooling live in `scripts/eagle/`, while
+`dump-hidden` writes the target features used by training.
+
+Training used 16.0M chat tokens (UltraChat SFT plus ShareGPT), a 232.8M
+parameter head initialized from target layer 39, and two epochs on gremlin-1.
+The held-out self-generated set reached 1.493/1.711/1.799/1.843/1.866/1.880
+verified tokens per round for K=1..6 at the final checkpoint.
+
+The exported head was tested live with the CUDA engine on the six existing
+benchmark prompts. All K settings produced exactly the same token sequence as
+plain greedy decoding. Aggregate throughput was 68.3 tok/s plain, 105.6 tok/s
+at K=3, 102.6 at K=4, and 97.5 at K=5. A live serving check with K=5 measured
+138.0 vs 67.9 tok/s on the summarize prompt, with 84 accepted proposals out
+of 211. K=3 is the default because it provided the best aggregate throughput;
+the service can select another value with `GRANITE4_EAGLE_K`.
+
+The head is opt-in through `GRANITE4_EAGLE_HEAD`; when configured, the NixOS
+module passes it to the resident CUDA engine. The frontend sends the per-request
+K only when a head is loaded. `GRANITE4_EAGLE_K=0` or an unset head disables
+speculation.
+
 ### P4 round 2 — end-to-end speed (2026-11-03, gremlin-1)
 
 Same card and checkpoint as above (RTX 4070 Ti SUPER, CUDA 12.9 toolchain

@@ -46,6 +46,13 @@ _GENERATE_TIMEOUT_S = 600
 SERVE_MAX_CONTEXT = int(os.environ.get("GRANITE4_MAX_CONTEXT", "8192"))
 _SERVE_STARTUP_TIMEOUT_S = 600
 
+# Speculative decoding with a trained EAGLE draft head (engine `--eagle`):
+# the head file and the tokens drafted per round. The engine's exact greedy
+# verify keeps the output identical to plain greedy decoding, so this is a
+# speed setting only; unset (or K = 0) decodes without drafting.
+EAGLE_HEAD = os.environ.get("GRANITE4_EAGLE_HEAD", "")
+EAGLE_K = int(os.environ.get("GRANITE4_EAGLE_K", "3"))
+
 
 class ServingError(Exception):
     """A rejected request (4xx) or engine failure (5xx) with an error body."""
@@ -217,7 +224,8 @@ class EngineService:
     """
 
     def __init__(self, gate: GateStatus, *, timeout_s: int = _GENERATE_TIMEOUT_S,
-                 tok=None, eos_id: int | None = None):
+                 tok=None, eos_id: int | None = None, eagle_head: str | None = None,
+                 eagle_k: int | None = None):
         self.gate = gate
         self.timeout_s = timeout_s
         if tok is None:
@@ -226,9 +234,14 @@ class EngineService:
         else:
             self._tok = tok
         self._eos = self._eos_id(gate.checkpoint) if eos_id is None else eos_id
-        self._serve = (ServeProcess([gate.engine, "serve", "--checkpoint", gate.checkpoint,
-                                     "--gpu", "1", "--max-context", str(SERVE_MAX_CONTEXT)])
-                       if gate.gpu else None)
+        head = EAGLE_HEAD if eagle_head is None else eagle_head
+        k = EAGLE_K if eagle_k is None else eagle_k
+        self._eagle_k = k if (gate.gpu and head and k > 0) else 0
+        cmd = [gate.engine, "serve", "--checkpoint", gate.checkpoint, "--gpu", "1",
+               "--max-context", str(SERVE_MAX_CONTEXT)]
+        if self._eagle_k:
+            cmd += ["--eagle", head]
+        self._serve = ServeProcess(cmd) if gate.gpu else None
 
     @classmethod
     def from_gate_path(cls, path: str | Path) -> "EngineService | None":
@@ -265,6 +278,8 @@ class EngineService:
                                        "seed": 0}
             if self._eos is not None:
                 payload["eos"] = self._eos
+            if self._eagle_k:
+                payload["eagle"] = self._eagle_k
             doc = self._serve.request(payload, self.timeout_s)
             if "error" in doc:
                 raise ServingError(500, "engine_failed",
@@ -338,7 +353,9 @@ class EngineService:
         if not prompt_ids:
             raise ServingError(400, "empty_prompt", "prompt encodes to zero tokens")
         if self._serve is not None:
-            room = SERVE_MAX_CONTEXT - len(prompt_ids)
+            # A draft round reserves positions for the anchor and K drafts.
+            reserve = self._eagle_k + 1 if self._eagle_k else 0
+            room = SERVE_MAX_CONTEXT - len(prompt_ids) - reserve
             if room < 1:
                 raise ServingError(400, "context_length_exceeded",
                                    f"prompt is {len(prompt_ids)} tokens; the context is "

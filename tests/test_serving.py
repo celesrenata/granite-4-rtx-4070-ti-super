@@ -314,8 +314,15 @@ assert args[0] == "serve" and args[args.index("--gpu") + 1] == "1", args
 with open({log!r}, "a") as f:
     f.write("start\\n")
 print(json.dumps({{"ready": True, "max_context": 8192}}), flush=True)
+eagle = args[args.index("--eagle") + 1] if "--eagle" in args else None
 for line in sys.stdin:
     req = json.loads(line)
+    if (req.get("eagle", 0) > 0) != (eagle is not None):
+        print(json.dumps({{"error": "eagle request without a loaded head"}}), flush=True)
+        continue
+    if req["tokens"] == [8]:
+        print(json.dumps({{"generated": [req.get("eagle", 0), 2]}}), flush=True)
+        continue
     if req["tokens"] == [666]:
         sys.exit(3)  # simulate an engine crash
     if req["tokens"] == [7]:
@@ -326,7 +333,7 @@ for line in sys.stdin:
 """
 
 
-def _gpu_engine(tmp_path, monkeypatch):
+def _gpu_engine(tmp_path, monkeypatch, **kw):
     log = tmp_path / "starts.log"
     engine_bin = tmp_path / "engine"
     engine_bin.write_text(_FAKE_SERVE.format(python=sys.executable, log=str(log)))
@@ -343,7 +350,25 @@ def _gpu_engine(tmp_path, monkeypatch):
         raise AssertionError("a GPU gate must not spawn one engine per request")
 
     monkeypatch.setattr(engine_service.subprocess, "run", _no_run)
-    return engine_service.EngineService(gate, tok=_FakeTokenizer(), eos_id=2), log
+    kw.setdefault("eagle_head", "")
+    return engine_service.EngineService(gate, tok=_FakeTokenizer(), eos_id=2, **kw), log
+
+
+def test_gpu_engine_eagle_head_and_k_reach_the_engine(monkeypatch, tmp_path):
+    eng, log = _gpu_engine(tmp_path, monkeypatch, eagle_head="/heads/h.safetensors", eagle_k=4)
+    try:
+        assert eng._generate_ids([8], 8) == [4, 2]  # the fake echoes the request's K
+        assert eng._generate_ids([4], 8) == [5, 2]
+    finally:
+        eng.close()
+
+
+def test_gpu_engine_without_head_does_not_draft(monkeypatch, tmp_path):
+    eng, _ = _gpu_engine(tmp_path, monkeypatch, eagle_k=4)
+    try:
+        assert eng._generate_ids([8], 8) == [0, 2]
+    finally:
+        eng.close()
 
 
 def test_gpu_gate_uses_one_persistent_engine(monkeypatch, tmp_path):

@@ -87,11 +87,23 @@ int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
 // d_logits + (t - logits_from) * vocab. With d_argmax, d_argmax[t -
 // logits_from] also receives each row's greedy token (first maximum, the
 // host sample_greedy_f32 rule). logits_from == end requests no logits.
+// With d_hidden, row t >= hidden_from (-1: logits_from) also gets its
+// final-normed hidden state (the lm_head input, [H] bf16) at
+// d_hidden + (t - hidden_from) * H; d_logits may be nullptr, which skips the
+// lm_head (hidden-state dumps, draft-head features).
 struct GpuForwardOut {
   std::uint16_t* d_logits = nullptr;
   int logits_from = 0;
   std::int32_t* d_argmax = nullptr;
+  std::uint16_t* d_hidden = nullptr;
+  int hidden_from = -1;
 };
+
+// Device views of the target's packed embedding (bf16 [vocab][hidden]) and
+// FP8 lm_head ([vocab][hidden], dequant scale incl. logits_scaling), for a
+// draft head that shares them. Returns -1 before gpu_weights_load.
+int gpu_ctx_shared_weights(GpuCtx* ctx, const std::uint16_t** d_embed,
+                           const std::uint8_t** d_lm_head, float* lm_scale);
 
 // gpu_forward_range with an explicit output plan (same watermark rules).
 int gpu_forward(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
