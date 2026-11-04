@@ -356,6 +356,17 @@ def test_gpu_gate_uses_one_persistent_engine(monkeypatch, tmp_path):
         eng.close()
 
 
+def test_gpu_engine_warm_starts_once(monkeypatch, tmp_path):
+    eng, log = _gpu_engine(tmp_path, monkeypatch)
+    try:
+        eng.warm()
+        eng.warm()
+        assert eng._generate_ids([4], 8) == [5, 2]
+        assert log.read_text().count("start") == 1
+    finally:
+        eng.close()
+
+
 def test_gpu_engine_error_reply_is_500_and_engine_survives(monkeypatch, tmp_path):
     eng, log = _gpu_engine(tmp_path, monkeypatch)
     try:
@@ -378,6 +389,44 @@ def test_gpu_engine_crash_restarts(monkeypatch, tmp_path):
         assert log.read_text().count("start") == 2
     finally:
         eng.close()
+
+
+class _RecordingTokenizer(_FakeTokenizer):
+    def __init__(self):
+        self.decoded: list[list[int]] = []
+
+    def decode(self, ids, *, skip_special_tokens: bool = False) -> str:
+        self.decoded.append(list(ids))
+        return "x" * len(list(ids))
+
+
+def _completion(generated, eos_id, max_tokens):
+    gate = engine_service.GateStatus(
+        passed=True, checkpoint="/tmp/ckpt", checkpoint_sha="x",
+        engine="/tmp/bin", prompt="p", max_tokens=24, min_match=1.0,
+        matched=24, rate=1.0, utc="t", raw={},
+    )
+    eng = _StubEngine(gate, generated, eos_id=eos_id)
+    tok = _RecordingTokenizer()
+    eng._tok = tok
+    body = {"model": MODEL_ID, "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": max_tokens}
+    return eng.chat_completions(body, "id"), tok
+
+
+def test_eos_is_not_part_of_the_text_and_finishes_with_stop():
+    out, tok = _completion([5, 6, 2], eos_id=2, max_tokens=8)
+    assert tok.decoded == [[5, 6]]
+    assert out["choices"][0]["message"]["content"] == "xx"
+    assert out["choices"][0]["finish_reason"] == "stop"
+    assert out["usage"]["completion_tokens"] == 3
+
+
+def test_hitting_max_tokens_finishes_with_length():
+    out, _ = _completion([5, 6, 7], eos_id=2, max_tokens=3)
+    assert out["choices"][0]["finish_reason"] == "length"
+    out, _ = _completion([5, 6, 2], eos_id=2, max_tokens=3)  # eos as the last allowed
+    assert out["choices"][0]["finish_reason"] == "stop"
 
 
 def test_default_health_is_unavailable():

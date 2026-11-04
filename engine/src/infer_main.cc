@@ -579,6 +579,16 @@ int gpu_serve_cmd(const Args& cli) {
   GpuSession s;
   constexpr int kServeLogitRows = 16;  // draft_lookup <= 15
   if (!s.open(cli.dir, cli.max_context, kServeLogitRows, &err)) return fail(err);
+  {
+    // Warm-up: load the lazily loaded kernels and capture the decode graph
+    // before reporting ready, so the first real request pays neither (an
+    // 8-token prompt runs the prefill path, then three chained greedy steps).
+    Args w;
+    w.tokens = {791, 6864, 315, 9822, 374, 13, 578, 7754};
+    w.max_tokens = 4;
+    Generation g;
+    if (cli.max_context >= 16 && !gpu_generate(s, w, &g, &err)) return fail("warm-up: " + err);
+  }
   std::printf("{\"ready\":true,\"max_context\":%d}\n", cli.max_context);
   std::fflush(stdout);
   std::string line;

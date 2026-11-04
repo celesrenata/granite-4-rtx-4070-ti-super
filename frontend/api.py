@@ -317,13 +317,20 @@ def main() -> None:  # pragma: no cover - process entry point
     set_serving_engine(engine_service.load_serving_engine(args.gate_artifact))
     server = make_server(args.host, args.port)
     state = "available" if _SERVING_ENGINE is not None else "unavailable"
-    print(f"{SERVER_NAME}: {args.host}:{args.port} (inference: {state})")
+    print(f"{SERVER_NAME}: {args.host}:{args.port} (inference: {state})", flush=True)
+    if _SERVING_ENGINE is not None:
+        # Load the persistent GPU engine now instead of on the first request.
+        import threading
+
+        threading.Thread(target=_SERVING_ENGINE.warm, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        if _SERVING_ENGINE is not None:
+            _SERVING_ENGINE.close()
 
 
 if __name__ == "__main__":

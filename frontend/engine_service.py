@@ -31,9 +31,11 @@ from typing import Any
 
 from frontend import chat_template, tokenizer
 
-# Hard ceiling per request; the parity-validated engine has been verified at
-# modest lengths, and the host forward is O(context) per step.
+# Hard ceiling per request on the host-oracle path (its forward replays the
+# whole context every step). The GPU engine allows up to its context
+# (SERVE_MAX_CONTEXT - prompt) and defaults to GPU_DEFAULT_MAX_TOKENS.
 MAX_COMPLETION_TOKENS = 128
+GPU_DEFAULT_MAX_TOKENS = 1024
 
 # A per-request timeout generous for host-side greedy decode (the GPU path
 # finishes MAX_COMPLETION_TOKENS in a few seconds).
@@ -41,7 +43,7 @@ _GENERATE_TIMEOUT_S = 600
 
 # The persistent GPU engine: positions per request, and how long its one-time
 # load (checkpoint pack + upload) may take.
-SERVE_MAX_CONTEXT = 8192
+SERVE_MAX_CONTEXT = int(os.environ.get("GRANITE4_MAX_CONTEXT", "8192"))
 _SERVE_STARTUP_TIMEOUT_S = 600
 
 
@@ -116,6 +118,12 @@ class ServeProcess:
             self.close()
             raise ServingError(500, "engine_malformed", "engine emitted a non-object")
         return doc
+
+    def warm(self) -> None:
+        """Start the engine (load the model) if it is not running."""
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None:
+                self._start()
 
     def request(self, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
         with self._lock:
@@ -300,6 +308,18 @@ class EngineService:
                 break
         return out
 
+    def warm(self) -> None:
+        """Load the persistent engine ahead of the first request (no-op for
+        the per-request host path). Failures are logged, not raised: the
+        next request retries."""
+        if self._serve is None:
+            return
+        try:
+            self._serve.warm()
+            print("granite4: GPU engine ready", flush=True)
+        except ServingError as e:
+            print(f"granite4: GPU engine warm-up failed: {e.message}", flush=True)
+
     def close(self) -> None:
         """Stop the persistent engine, if one is running."""
         if self._serve is not None:
@@ -317,18 +337,31 @@ class EngineService:
         prompt_ids = self._tok.encode(text)
         if not prompt_ids:
             raise ServingError(400, "empty_prompt", "prompt encodes to zero tokens")
-        max_tokens = body.get("max_tokens", MAX_COMPLETION_TOKENS)
+        if self._serve is not None:
+            room = SERVE_MAX_CONTEXT - len(prompt_ids)
+            if room < 1:
+                raise ServingError(400, "context_length_exceeded",
+                                   f"prompt is {len(prompt_ids)} tokens; the context is "
+                                   f"{SERVE_MAX_CONTEXT}")
+            ceiling, default = room, min(GPU_DEFAULT_MAX_TOKENS, room)
+        else:
+            ceiling = default = MAX_COMPLETION_TOKENS
+        max_tokens = body.get("max_tokens", default)
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
             raise ServingError(400, "invalid_params",
                                f"max_tokens must be a positive integer (got {max_tokens!r})")
-        max_tokens = min(max_tokens, MAX_COMPLETION_TOKENS)
+        max_tokens = min(max_tokens, ceiling)
         try:
             gen_ids = self._generate_ids(prompt_ids, max_tokens)
         except ServingError:
             raise
         except Exception as e:  # defensive: engine misbehaviour is a 500
             raise ServingError(500, "engine_failed", f"engine error: {e}")
-        text_out = self._tok.decode(gen_ids) if gen_ids else ""
+        # The stop token ends the turn; it is counted but not part of the text.
+        stopped = bool(gen_ids) and self._eos is not None and gen_ids[-1] == self._eos
+        text_ids = gen_ids[:-1] if stopped else gen_ids
+        text_out = self._tok.decode(text_ids) if text_ids else ""
+        finish = "stop" if stopped or (gen_ids and len(gen_ids) < max_tokens) else "length"
         return {
             "id": request_id,
             "object": "chat.completion",
@@ -336,7 +369,7 @@ class EngineService:
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": text_out},
-                "finish_reason": "stop" if gen_ids else "length",
+                "finish_reason": finish,
             }],
             "usage": {
                 "prompt_tokens": len(prompt_ids),
