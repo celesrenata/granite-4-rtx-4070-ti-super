@@ -5,8 +5,8 @@
 #                                metadata, JSON parser, config validation);
 #                                built host-only - CUDA objects target sm_89
 #                                and are enabled on the GPU host, not here
-#   packages.<system>.api        Python stdlib API frontend (Phase 0:
-#                                validates requests, no inference)
+#   packages.<system>.api        Python stdlib API frontend + parity gate
+#                                (granite4-api, granite4-parity-gate)
 #   packages.<system>.default    = api
 #   packages.<system>.engine-cuda  CUDA engine (x86_64-linux only): compiles
 #                                the sm_89 kernels, device test, micro-
@@ -19,7 +19,9 @@
 #   devShell.<system>            cmake + ninja + clang + git + uv + python3
 #                                (regex, pytest), GRANITE4_LIB preset
 #   checks.<system>              engine (runs ctest) and api (runs pytest)
-#   nixosModules.granite4Rtx     NixOS systemd service for the api process
+#   nixosModules.granite4Rtx     NixOS service: the api process, plus (with a
+#                                checkpoint) a GPU parity gate on start and a
+#                                persistent GPU engine behind it
 #
 # The 18 GB local checkpoint under .gt/ and the build trees never enter any
 # derivation: the source filter below keeps only the files the derivations
@@ -217,8 +219,21 @@
               'main()' \
               > $out/bin/granite4-api
             chmod 0755 $out/bin/granite4-api
+            # The parity gate ships with the frontend so a deployment can
+            # (re)validate the engine it serves with; the teacher-forced GPU
+            # mode against the shipped reference needs no torch.
+            mkdir -p $out/lib/scripts
+            cp scripts/parity_gate.py $out/lib/scripts/
+            printf '%s\n' \
+              '#!${interpreter}/bin/python3' \
+              'import os, runpy, sys' \
+              '_lib = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib")' \
+              'sys.argv[0] = "granite4-parity-gate"' \
+              'runpy.run_path(os.path.join(_lib, "scripts", "parity_gate.py"), run_name="__main__")' \
+              > $out/bin/granite4-parity-gate
+            chmod 0755 $out/bin/granite4-parity-gate
           '';
-          meta.description = "Granite 4.2 8B API frontend (Phase 0 scaffold: validates requests, no inference)";
+          meta.description = "Granite 4.2 8B API frontend (OpenAI-style chat completions over the native engine)";
         };
 
       # checks.api additionally runs the Python test suite. It uses an
@@ -292,19 +307,71 @@
 
       # NixOS module for the deployment target (docs/deployment.md Step 5).
       # The remote flake imports this repo as a flake input and enables
-      # services.granite4-rtx, passing the api package from that input.
-      # The module never references this flake's self.
+      # services.granite4-rtx, passing the packages from that input. The
+      # module never references this flake's self.
+      #
+      # Without `checkpoint` the service is the Phase-0 scaffold (validates
+      # requests, 501 for completions). With `checkpoint` (and an
+      # enginePackage), every start first runs the parity gate on the GPU
+      # (granite4-parity-gate, teacher-forced against the shipped
+      # transformers reference); only a passing gate artifact enables
+      # serving, through one persistent `granite4-infer serve --gpu 1`
+      # process that keeps the model resident. A failing gate leaves the API
+      # up in its 501 state.
       nixosModules.granite4Rtx =
-        { config, lib, ... }:
+        { config, lib, pkgs, ... }:
         let
           cfg = config.services.granite4-rtx;
+          serving = cfg.checkpoint != null;
+          stateDir = "/var/lib/granite4-rtx";
+          gateFile = "${stateDir}/parity_gate.json";
+          gateCmd = lib.escapeShellArgs [
+            "${cfg.package}/bin/granite4-parity-gate"
+            "--checkpoint" cfg.checkpoint
+            "--engine" "${cfg.enginePackage}/bin/granite4-infer"
+            "--prompt" "The capital of France is"
+            "--max-tokens" "24"
+            "--gpu"
+            "--mode" "teacher-forced"
+            "--reference" "${cfg.package}/lib/reference/granite/parity_ref.json"
+            "--ulp-tolerance" (toString cfg.gate.ulpTolerance)
+            "--min-match" (toString cfg.gate.minMatch)
+            "--gate-out" gateFile
+            "--out" "${stateDir}/parity_report.json"
+          ];
         in
         {
           options.services."granite4-rtx" = {
-            enable = lib.mkEnableOption "the Granite 4.2 8B API scaffold service";
+            enable = lib.mkEnableOption "the Granite 4.2 8B API service";
             package = lib.mkOption {
               description = "The granite4-api derivation (flake packages.<system>.api)";
               type = lib.types.package;
+            };
+            enginePackage = lib.mkOption {
+              description = "The granite4-engine-cuda derivation (flake packages.<system>.engine-cuda); required when checkpoint is set";
+              type = lib.types.nullOr lib.types.package;
+              default = null;
+            };
+            checkpoint = lib.mkOption {
+              description = "Granite 4.2 8B checkpoint directory (BF16 safetensors + tokenizer). null: Phase-0 scaffold, no inference.";
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              example = "/opt/granite4-rtx-4070-ti-super/ckpt";
+            };
+            maxContext = lib.mkOption {
+              description = "Positions (prompt + completion) per request for the GPU engine; its KV cache costs 160 KiB of VRAM per position.";
+              type = lib.types.ints.positive;
+              default = 8192;
+            };
+            gate.minMatch = lib.mkOption {
+              description = "Fraction of reference positions that must pass the teacher-forced gate.";
+              type = lib.types.numbers.between 0 1;
+              default = 1.0;
+            };
+            gate.ulpTolerance = lib.mkOption {
+              description = "bf16 ULPs the reference token's logit may sit below the engine's top logit (ties and bf16 rounding).";
+              type = lib.types.ints.unsigned;
+              default = 2;
             };
             listenAddress = lib.mkOption {
               type = lib.types.str;
@@ -316,38 +383,73 @@
             };
           };
 
-          config =
-            lib.mkIf cfg.enable {
-              users = {
-                groups."granite4-rtx" = { };
-                users."granite4-rtx" = {
-                  isSystemUser = true;
-                  group = "granite4-rtx";
-                  description = "Granite 4.2 8B API scaffold";
-                };
-              };
-              systemd.services.granite4-rtx = {
-                description = "Granite 4.2 8B API scaffold (Phase 0: validates requests, no inference)";
-                after = [ "network.target" ];
-                wantedBy = [ "multi-user.target" ];
-                serviceConfig = {
-                  User = "granite4-rtx";
-                  Group = "granite4-rtx";
-                  ExecStart = "${cfg.package}/bin/granite4-api --host ${cfg.listenAddress} --port ${toString cfg.listenPort}";
-                  Restart = "on-failure";
-                  RestartSec = 5;
-                  # The Phase 0 process is read-only against the system: it
-                  # only opens a listening socket.
-                  NoNewPrivileges = true;
-                  ProtectSystem = "strict";
-                  ProtectHome = true;
-                  PrivateTmp = true;
-                  PrivateDevices = true;
-                  RestrictAddressFamilies = [ "af_INET" "af_INET6" ];
-                  CapabilityBoundingSet = "";
-                };
+          config = lib.mkIf cfg.enable {
+            assertions = [
+              {
+                assertion = !serving || cfg.enginePackage != null;
+                message = "services.granite4-rtx.checkpoint needs services.granite4-rtx.enginePackage (packages.<system>.engine-cuda)";
+              }
+            ];
+            users = {
+              groups."granite4-rtx" = { };
+              users."granite4-rtx" = {
+                isSystemUser = true;
+                group = "granite4-rtx";
+                description = "Granite 4.2 8B API";
               };
             };
+            systemd.services.granite4-rtx = {
+              description =
+                if serving then "Granite 4.2 8B API (GPU engine, parity-gated)"
+                else "Granite 4.2 8B API scaffold (Phase 0: validates requests, no inference)";
+              after = [ "network.target" ] ++ lib.optional serving "nvidia-persistenced.service";
+              wants = lib.optional serving "nvidia-persistenced.service";
+              wantedBy = [ "multi-user.target" ];
+              environment = lib.optionalAttrs serving {
+                GRANITE4_GATE = gateFile;
+                GRANITE4_MAX_CONTEXT = toString cfg.maxContext;
+              };
+              serviceConfig = {
+                User = "granite4-rtx";
+                Group = "granite4-rtx";
+                ExecStart = "${cfg.package}/bin/granite4-api --host ${cfg.listenAddress} --port ${toString cfg.listenPort}";
+                Restart = "on-failure";
+                RestartSec = 5;
+                NoNewPrivileges = true;
+                ProtectSystem = "strict";
+                ProtectHome = true;
+                PrivateTmp = true;
+                RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+                CapabilityBoundingSet = "";
+              } // (if serving then {
+                StateDirectory = "granite4-rtx";
+                # A stale artifact must never enable serving for a new engine
+                # or checkpoint: drop it, then re-run the gate ("-": a failing
+                # gate leaves the API up in its 501 state).
+                ExecStartPre = [
+                  "${pkgs.coreutils}/bin/rm -f ${gateFile}"
+                  "-${gateCmd}"
+                ];
+                TimeoutStartSec = 900;
+                # The engine needs the NVIDIA device nodes and the host
+                # driver libraries (/run/opengl-driver, read-only).
+                PrivateDevices = false;
+                DevicePolicy = "closed";
+                DeviceAllow = [
+                  "/dev/nvidiactl rw"
+                  "/dev/nvidia0 rw"
+                  "/dev/nvidia-uvm rw"
+                  "/dev/nvidia-uvm-tools rw"
+                  "/dev/nvidia-modeset rw"
+                  "char-nvidia-caps r"
+                ];
+                LimitMEMLOCK = "infinity";
+              } else {
+                # The Phase 0 process only opens a listening socket.
+                PrivateDevices = true;
+              });
+            };
+          };
         };
     };
 

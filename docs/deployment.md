@@ -1,24 +1,19 @@
-# Deployment runbook — Phase 0 scaffold
+# Deployment runbook
 
-> **Status: planning only.** Every command below is written for a later,
-> separate deployment session. Nothing in this document has been executed as
-> part of the Phase 0 scaffold work. The companion script
-> [`scripts/deploy-dry-run.sh`](../scripts/deploy-dry-run.sh) prints these
-> commands without executing any of them.
+> **Status (2026-11-03): deployed on gremlin-1.** `services.granite4-rtx`
+> serves chat completions from the GPU engine behind a parity gate (Step 5).
+> The staging/copy steps below remain the way to try an unpushed tree.
 
-## What is true right now (Phase 0)
+## What is true right now
 
-- The API is **intentionally unavailable**: `POST /v1/chat/completions`
-  returns **501 `inference_unavailable`** for valid requests (400 for
-  invalid ones), and `GET /health` reports `"inference": "unavailable"`.
-  This is the documented Phase 0 boundary ([`frontend/api.py`](../frontend/api.py),
-  [phases.md](phases.md)) — it is not a deployment bug and must not be
-  "fixed" into serving tokens.
-- **CUDA and remote checks are unverified.** The CUDA path
-  ([`engine/src/kernels.cu`](../engine/src/kernels.cu)) has not been
-  compiled or run on an sm_89 machine, and nothing in this tree has been
-  tested on the remote host. No claim about GPU behavior or remote state may
-  be made until a real build runs there in a later phase.
+- gremlin-1 runs the flake's NixOS module with a checkpoint configured. Each
+  service start runs the parity gate on the GPU; on PASS the API reports
+  `"inference": "available"` and answers `POST /v1/chat/completions` through
+  one resident `granite4-infer serve --gpu 1` process. On FAIL the API stays
+  up in its Phase-0 state (501 `inference_unavailable`) - a gate failure is
+  never "fixed" into serving.
+- Without `services.granite4-rtx.checkpoint` the module is still the Phase-0
+  scaffold (validates requests, 501 for completions, `PrivateDevices=true`).
 - No secrets are stored anywhere in this repository; do not add any as part
   of deployment.
 
@@ -110,43 +105,75 @@ Expected: 90 files (91 tracked entries = 90 files + 1 gitlink for the
 `reference/qwen3-27b-5090` submodule, which `git archive` does not expand).
 `diff` must be empty.
 
-## Step 5 — Flake integration (separate step, only after explicit user approval)
+## Step 5 — Flake integration
 
-1. Review the current remote flake before touching it:
+The host flake (`/etc/nixos/flake.nix` on gremlin-1) takes this repo as the
+`granite4` input and enables the module:
 
-   ```sh
-   ssh root@10.1.1.12 "cat /etc/nixos/flake.nix"
-   ```
-
-2. Review the proposed flake module against it and present the exact diff
-   to the user. **Integration happens only after the user approves the
-   diff.**
-3. Apply the module on the remote, then rebuild and restart:
-
-   ```sh
-   ssh root@10.1.1.12 "sudo nixos-rebuild build --use-rollback-switch"
-   ssh root@10.1.1.12 "sudo nixos-rebuild switch"
-   ssh root@10.1.1.12 "sudo systemctl restart <service>"
-   ```
-
-## Step 6 — Verification (expected Phase 0 behavior)
-
-```sh
-curl -s http://10.1.1.12:8080/health     # -> 200, "inference":"unavailable"
-curl -s http://10.1.1.12:8080/metrics    # -> 200, engine status as built
-curl -s http://10.1.1.12:8080/v1/models  # -> 200, status "unavailable"
-curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-  http://10.1.1.12:8080/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"granite-4.2-8b","messages":[{"role":"user","content":"hi"}]}'
-# -> 501 (intentional in Phase 0; see tests/test_api.py)
+```nix
+granite4.nixosModules.granite4Rtx
+({ ... }: {
+  services.granite4-rtx = {
+    enable = true;
+    package = granite4.packages.${system}.api;
+    enginePackage = granite4.packages.${system}.engine-cuda;
+    checkpoint = "/opt/granite4-rtx-4070-ti-super/ckpt";  # BF16 safetensors + tokenizer
+    maxContext = 8192;            # positions per request (160 KiB VRAM each)
+    listenAddress = "127.0.0.1";
+    listenPort = 2701;
+  };
+})
 ```
 
-A healthy Phase 0 deployment is exactly this: the API process is up,
-endpoints respond, and inference is **explicitly** unavailable. Do not
-treat the 501 as a failure, and do not declare CUDA or remote success from
-any of this — GPU behavior remains unverified until Phase 1+ work lands and
-is exercised on the sm_89 machine.
+What the module does with a checkpoint:
+
+| Unit step | What runs |
+| --- | --- |
+| `ExecStartPre` | remove the previous gate artifact, then `granite4-parity-gate --gpu --mode teacher-forced --reference <api>/lib/reference/granite/parity_ref.json` (one GPU forward, ~10 s); writes `/var/lib/granite4-rtx/parity_gate.json` on PASS and `parity_report.json` always. A failing gate does not fail the unit (`-` prefix). |
+| `ExecStart` | `granite4-api` with `GRANITE4_GATE` / `GRANITE4_MAX_CONTEXT`; on a passing GPU gate it starts the resident engine in the background (load + warm-up ~8 s) |
+| sandbox | `ProtectSystem=strict`, `ProtectHome`, `NoNewPrivileges`, `DevicePolicy=closed` with only the NVIDIA device nodes allowed, `StateDirectory=granite4-rtx` |
+
+The gate (`scripts/parity_gate.py`) compares the engine against a shipped
+fp32 transformers greedy reference for "The capital of France is" (24
+tokens), teacher-forced: each position passes when the reference token is the
+engine's top-1 or within `gate.ulpTolerance` (default 2) bf16 ULPs of it;
+`gate.minMatch` (default 1.0) of positions must pass. On gremlin-1: 24/24
+within 2 ULP, 21/24 exact top-1 (the three misses are two exact bf16 ties and
+one 2-ULP gap). Free-running token matching is still available
+(`--mode free`, the original P3 gate) for the f32 host oracle; for the bf16
+GPU path one near-tie would flip the rest of the sequence.
+
+Deploy a pushed commit:
+
+```sh
+ssh root@10.1.1.12 'cd /etc/nixos && nix flake update granite4 && \
+  nixos-rebuild build --flake .#gremlin-1 && \
+  nix store diff-closures /run/current-system ./result && \
+  nixos-rebuild switch --flake .#gremlin-1'
+```
+
+Try an unpushed tree (Step 4 copy at `$D`, committed in a throwaway git repo):
+`nixos-rebuild build --flake .#gremlin-1 --override-input granite4 git+file://$D`
+then `./result/bin/switch-to-configuration test` (not added to the boot menu).
+
+## Step 6 — Verification
+
+```sh
+ssh root@10.1.1.12 'journalctl -u granite4-rtx -b -o cat | grep -E "PARITY|engine ready"'
+# -> PARITY PASS (min-match 100.0%) ... granite4: GPU engine ready
+ssh root@10.1.1.12 'curl -s 127.0.0.1:2701/health'      # "inference":"available"
+ssh root@10.1.1.12 "curl -s -X POST 127.0.0.1:2701/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{\"model\":\"granite-4.2-8b\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France? Answer in one sentence.\"}]}'"
+# -> "The capital of France is Paris.", finish_reason "stop", ~0.23 s
+ssh root@10.1.1.12 'cat /var/lib/granite4-rtx/parity_report.json'   # per-position detail
+```
+
+Request limits on the GPU path: `max_tokens` defaults to 1024 and is capped
+at `maxContext - prompt_tokens`; a prompt longer than the context is a 400
+`context_length_exceeded`. Generation stops at the checkpoint's
+`eos_token_id` (`<|im_end|>`), which is counted in `completion_tokens` but
+not included in the text.
 
 ## Step 7 — Rollback
 
@@ -167,29 +194,20 @@ git revert <commit>
 Rollback relies on NixOS generations; it must never require hand-editing
 `/etc/nixos/flake.nix` back.
 
-## Known box issue: `nvidia-smi` segfaults (not an NVIDIA problem)
+## Fixed box issue: `nvidia-smi` segfaulted (patchelf, 2026-11-03)
 
-`nvidia-smi` (from `nix/store/…-nvidia-x11-615.78.08-bin`) crashes with
-SIGSEGV *inside `ld-linux-x86-64.so.2` during loader init* (fault at the
-binary's ELF program-header region, before any library is loaded). Diagnosis
-on gremlin-1 (2026-10-23): the CPU has Intel **PKU** (`pku`/`ospke`), the
-box runs a bleeding-edge **7.2.11** kernel, and the loader is the store's
-**glibc 2.44-57** dynamic linker — a loader/kernel interaction, *not* the
-GPU. The store's glibc 2.42 loader runs fine, the CUDA runtime talks to the
-615 driver cleanly (`cudaGetDeviceCount()` → RTX 4070 Ti SUPER, sm 8.9,
-driver 13.4), and the device tests + benchmark pass. Until the box's kernel
-or the nixpkgs glibc changes (re-evaluate after either), use these instead:
-
-```sh
-granite4-kernel-test    # exercises the driver + GPU
-granite4-kernel-bench   # bandwidth + memory baseline (JSON below)
-cat /proc/driver/nvidia/version   # kernel module version (615.78.08)
-```
-The P1 residency criterion (measured memory) is read from
-`granite4-kernel-bench`'s `mem_total_mib` / `mem_free_mib` fields — the
-CUDA runtime's `cudaMemGetInfo` view, which works where `nvidia-smi` does
-not. Run it after the model is loaded (P3) and the difference from the
-pre-load free memory is the residency figure.
+`nvidia-smi`, `nvidia-powerd` and `nvidia-cuda-mps-control` from the 615.78.08
+driver package crashed in `ld-linux-x86-64.so.2` before `main` ("error 7" =
+write fault at 0x401568). Cause: nixpkgs' driver builder rewrites the
+binaries' interpreter and RUNPATH with patchelf 0.18/0.19, which moved
+`.dynamic` into a LOAD segment that is mapped read-only; ld.so writes
+`DT_DEBUG` there at startup. Making that segment writable, or re-patching the
+untouched `origBin/` copies with patchelf 0.15, fixes it (the earlier
+PKU/kernel theory was wrong). gremlin-1's `modules/graphics.nix` now
+overrides the driver package's `postFixup` to re-patch those binaries with
+`nixpkgs-stable`'s patchelf (0.15.2); the kernel module derivation is
+unchanged. Drop the override once nixpkgs ships a patchelf that keeps
+`.dynamic` writable (check: `nvidia-smi -L` on a build without it).
 
 ## P2 — GPU re-verification (gremlin-1)
 

@@ -14,8 +14,10 @@ prompt-lookup drafts in one batched forward. On an RTX 4070 Ti Super, steady
 batch-1 decode is about **13.95 ms/token (~72 tps)** at short context and
 14.5 ms/token at 2 K context (the weight-streaming roofline is 13.3 ms); a
 500-token prompt prefills in ~122 ms. See [`docs/phases.md`](docs/phases.md)
-for commands and conditions. The Python HTTP layer remains a thin API
-scaffold that shells out to the native engine.
+for commands and conditions. The stdlib Python HTTP layer serves
+OpenAI-style chat completions through a resident engine process, gated by a
+GPU parity check against the fp32 transformers reference; gremlin-1 runs it
+as a NixOS service (~0.23 s for a short answer).
 
 `reference/qwen3-27b-5090/` is a different model/GPU kept for layout
 conventions only. No kernels, code or numbers were copied from it.
@@ -39,23 +41,24 @@ checkpoint's `config.json` and rejects it on any mismatch.
 
 ## API
 
-| Endpoint | Response (Phase 0) |
+| Endpoint | Response |
 | --- | --- |
-| `GET /health` | 200 — `{"status":"ok","inference":"unavailable",...}` |
-| `GET /metrics` | 200 — model constants, GPU target, engine status (probes the optional built `.so`) |
-| `GET /v1/models` | 200 — model card with `"status":"unavailable"` |
-| `POST /v1/chat/completions` | 400 + error body when the request is invalid; **501** `inference_unavailable` when valid |
+| `GET /health` | 200 — `{"status":"ok","inference":"available"\|"unavailable",...}` |
+| `GET /metrics` | 200 — model constants, GPU target, engine status |
+| `GET /v1/models` | 200 — model card; `"status"` follows the parity gate |
+| `POST /v1/chat/completions` | 200 completion when a passing parity-gate artifact is loaded; 400 for invalid requests; **501** `inference_unavailable` without a gate |
 
-Run it (no dependencies beyond Python ≥ 3.10):
+Serving is gate-driven: `scripts/parity_gate.py` writes an artifact on PASS
+and `granite4-api --gate-artifact <path>` serves only with it. A GPU gate
+(`--gpu`) makes the API keep one `granite4-infer serve --gpu 1` process
+resident. The NixOS module wires all of this up (see
+[docs/deployment.md](docs/deployment.md)).
 
 ```sh
-python3 -m frontend.api --port 8080
-curl -s localhost:8080/health
-curl -s localhost:8080/v1/models
+python3 -m frontend.api --port 8080 --gate-artifact .gt/parity_gate.json
 curl -s -X POST localhost:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"granite-4.2-8b","messages":[{"role":"user","content":"hi"}]}'
-# -> 501 {"error":{"message":"...inference is not implemented...", "code":"inference_unavailable"}}
 ```
 
 ## Build
@@ -71,9 +74,9 @@ cmake -S . -B build -G Ninja
 cmake --build build
 ```
 
-The CUDA path is compile-only in Phase 0: [`engine/src/kernels.cu`](engine/src/kernels.cu)
-contains a single arch-probe kernel so the toolchain and arch selection are
-exercised before any real kernel lands.
+CUDA objects target sm_89 only. The device tests (`granite4-kernel-test`,
+`granite4-verify-gemv-test`) need a live GPU, so the Nix build skips them and
+they are re-run on the GPU host.
 
 ## Tests
 
@@ -98,8 +101,10 @@ All tests run without a GPU or CUDA toolkit:
 - [docs/phases.md](docs/phases.md) — P0→P4 plan with exit criteria
 - [docs/memory.md](docs/memory.md) — weight/KV budget math for the 16 GB card (planning figures)
 
-## Limitations (by design, at this phase)
+## Limitations
 
-- No inference, no weight loading, no real kernels — endpoints say so explicitly.
-- No performance claims anywhere in this tree.
-- The CUDA path is unverified until it is compiled and run on an sm_89 machine.
+- Batch 1: the engine serves one request at a time (the API serializes them).
+- Greedy only on the GPU serving path; seeded top-p exists in the CLI.
+- `maxContext` (default 8192) bounds prompt + completion per request.
+- Weights are FP8 e4m3 with per-tensor scales; outputs agree with the fp32
+  reference within bf16 rounding, not bit for bit (see docs/phases.md).
