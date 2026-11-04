@@ -1,0 +1,39 @@
+{
+ "schema": "granite4.parity-ref.v1",
+ "prompt": "The capital of France is",
+ "prompt_ids": [
+  791,
+  6864,
+  315,
+  9822,
+  374
+ ],
+ "checkpoint_sha": "17cec0a4e56f0423",
+ "source": "transformers fp32 greedy (scripts/parity_gate.py reference_tokens) on the Granite 4.2 8B BF16 checkpoint",
+ "tokens": [
+  12366,
+  1210,
+  198,
+  198,
+  4071,
+  279,
+  7754,
+  2795,
+  25,
+  330,
+  2675,
+  527,
+  264,
+  11190,
+  18328,
+  430,
+  11263,
+  11470,
+  9193,
+  1664,
+  1210,
+  2100,
+  584,
+  2011
+ ]
+}
