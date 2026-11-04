@@ -240,7 +240,7 @@ class EngineService:
         cmd = [gate.engine, "serve", "--checkpoint", gate.checkpoint, "--gpu", "1",
                "--max-context", str(SERVE_MAX_CONTEXT)]
         if self._eagle_k:
-            cmd += ["--eagle", head]
+            cmd += ["--eagle", head, "--eagle-k", str(self._eagle_k)]
         self._serve = ServeProcess(cmd) if gate.gpu else None
 
     @classmethod

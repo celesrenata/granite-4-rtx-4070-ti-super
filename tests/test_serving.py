@@ -315,6 +315,10 @@ with open({log!r}, "a") as f:
     f.write("start\\n")
 print(json.dumps({{"ready": True, "max_context": 8192}}), flush=True)
 eagle = args[args.index("--eagle") + 1] if "--eagle" in args else None
+ek = args[args.index("--eagle-k") + 1] if "--eagle-k" in args else None
+if eagle is not None and ek is None:
+    print(json.dumps({{"error": "head loaded without --eagle-k"}}), flush=True)
+    sys.exit(4)
 for line in sys.stdin:
     req = json.loads(line)
     if (req.get("eagle", 0) > 0) != (eagle is not None):
