@@ -474,6 +474,120 @@ holds two in-flight uint4 weight vectors and two decode pipelines at once,
 which drops blocks-per-SM and hurts latency hiding more than the extra
 MLP helps.
 
+### P4 round 2 — end-to-end speed (2026-11-03, gremlin-1)
+
+Same card and checkpoint as above (RTX 4070 Ti SUPER, CUDA 12.9 toolchain
+from the flake, BF16 checkpoint packed to FP8 at load). Device times are
+`G4_TIMESTEP=1` event times; wall times are `/usr/bin/time` of the whole
+CLI run. Baseline = the parent commit, built the same way.
+
+| Measurement | Baseline | Now |
+| --- | ---: | ---: |
+| Decode, ms/token, 5-token prompt (positions 5–68) | 15.11–15.39 | 13.95 |
+| Decode, ms/token, 2000-token prompt | 65.6 | 14.54 |
+| Prefill, 5 tokens | 76.3 ms | 24.4 ms |
+| Prefill, 500 tokens | 8017 ms | 122 ms |
+| Prefill, 2000 tokens | 77985 ms | 503 ms |
+| `generate --gpu 1`, 5-token prompt, 64 tokens, wall | 131 s | 7.4 s |
+| Repeated-text prompt, 96 tokens, `--draft-lookup 4`, device ms/token | — | 9.24 (vs 14.35 greedy) |
+
+What changed, by size of effect:
+
+1. **Load path** (131 s → 7.4 s wall). The GPU paths no longer build the
+   host oracle's ~34 GB float copy and re-quantize it on one thread
+   (`load_weights` + `pack_gpu_model` was 2:10 of the 2:11). `gpu_pack.cc`
+   streams each shard tensor with parallel `pread`s straight into the packed
+   blob; BF16 and per-tensor FP8 sources have at most 65536 / 256 distinct
+   values, so the max-abs scan and `fp8_e4m3_encode` run once per distinct
+   value through a lookup table. Byte-identical to the old packer (blob and
+   scales; `test_weights` checks both packers on BF16, FP8 per-tensor and
+   per-channel checkpoints). `G4_LOAD_TIMING=1` prints the phases (pack
+   4.8 s, upload 1.0 s).
+2. **Tensor-core prefill** (`prefill_gemm.cu`). Prompts and any suffix of
+   5+ rows run as chunks of up to 512 rows: every projection is one
+   `mma.sync.m16n8k16` BF16 GEMM with the FP8 weight tile decoded in shared
+   memory (q|k|v and gate|up are contiguous in the packed layout and run as
+   one GEMM each, with per-segment scales); a 4-stage `cp.async` pipeline and
+   a 16-row tile for short chunks keep short prompts near the weight-stream
+   floor, split-K fills the card when a chunk has too few output tiles.
+   Causal attention is a flash-style tensor-core kernel over the chunk; the
+   lm_head runs only for rows whose logits are requested. 500 and 2000-token
+   prompts sustain ~67 TFLOPS (~76% of the card's BF16/FP32-accumulate
+   peak).
+3. **Split-KV decode attention** (`attention_split.cu`). The fused GQA kernel
+   ran 32 blocks with a serial kv_len-long value loop: 190 µs/layer at 2 K
+   context. Split-KV (64-position tiles, K/V staged once per KV head for its
+   4 query heads, online softmax, ordered combine) takes ~4 µs/layer at short
+   context and keeps 2 K-context decode at 14.5 ms/token (the old build: 65.6
+   ms, where past 512 positions the fused kernel also ran its exp() terms
+   serially; with the parallel-exp limit raised to 3584 it was 21.5 ms).
+   Decode and verify rows use the same split layout (it depends only on the
+   cache stride), so a verify row is bit-identical to the decode step at that
+   position.
+4. **Decode step as a CUDA graph, greedy on the device**. Every
+   single-position kernel reads the position from device memory, so the step
+   is captured once and replayed; `argmax_rows_kernel` writes the next token
+   into the token buffer and advances the position, so `gpu_decode_greedy`
+   enqueues all steps without a host round trip (no per-token 200 KB logits
+   copy, host argmax, or token re-upload). With `--eos` the ids come back in
+   8-token chunks, one chunk ahead.
+5. **Hardware FP8 decode** in every GEMV (`cvt.rn.f16x2.e4m3x2`, exact for
+   all finite codes): replaces ~10 integer ops per weight; the decode GEMVs
+   were close to integer-issue bound. Bit-identical outputs.
+6. **RMSNorm**: 1024 threads with the row in registers, and the sum of
+   squares as a compensated float pair instead of FP64 (consumer Ada runs
+   FP64 at 1/64 rate): 7.8 → 2.9 µs per call, 81 calls per token.
+7. **Fixes found on the way**: `verify_gemv.cu` rounded with `0x7ff` instead
+   of `0x7fff` (near-truncation instead of RNE — why the fused-K lm_head was
+   only "within 2 ULP"; it is now bit-identical to the decode GEMV, and the
+   test asserts that). The batched fused-GQA launcher under-sized shared
+   memory once a batch straddled the parallel-softmax limit (rows below the
+   limit used the exp buffer the allocation did not include). The serving
+   layer compared generated ids against the tokenizer's eos *string*, so it
+   never stopped at EOS; it now reads `eos_token_id` from `config.json` and
+   passes `--eos` so the engine stops computing there.
+
+Persistent engine: `granite4-infer serve --gpu 1` loads once and answers
+JSON-line requests; the API uses one such process for a GPU gate
+(`parity_gate.py --gpu` records `"gpu": true`), so a chat request costs its
+prefill + decode instead of a 7 s load.
+
+Parity: decode-path changes 1, 4, 5 are bit-identical. The tensor-core
+prefill, split-KV attention and FP32 RMSNorm change summation order (and
+the split attention keeps f32 probabilities), so logits move within bf16
+rounding; device tests bound each kernel against its reference
+(`test_prefill_gemm_device`, `test_prefill_attention_device`,
+`test_attn_split_device`). Greedy output is self-consistent across paths:
+draft vs no-draft is token-identical (5/5 `test_granite42_gpu_drafter.py`,
+plus 48-token checks on three prompts), and the graph / no-graph /
+batched-verify / compact-KV switches give identical ids. Against the old
+build, the 64-token generate for `791,6864,315,9822,374` can flip at
+generated token 12, a near tie (bf16 logits 18.0 vs 17.75–17.875); the fp32
+transformers reference on the same prefix ranks the *other* candidate first
+(18.42 vs 17.78), so neither build is "the" reference there. With
+`G4_PREFILL_GEMM=0 G4_SPLIT_ATTN=0` the 64 ids match the old build exactly.
+
+A/B switches (all default on): `G4_PREFILL_GEMM`, `G4_SPLIT_ATTN`,
+`G4_GRAPH`, `G4_BATCH_VERIFY`, `G4_DIRECT_KV`.
+
+Reproduction (gremlin-1, from a checkout):
+```
+nix build .#engine-cuda
+B=./result/bin/granite4-infer C=/opt/granite4-rtx-4070-ti-super/ckpt
+./result/bin/granite4-kernel-test                 # all device kernel tests passed
+G4_TIMESTEP=1 $B generate --checkpoint $C --tokens 791,6864,315,9822,374 \
+  --max-tokens 64 --gpu 1                         # prefill + per-step (graph) ms
+G4_LOAD_TIMING=1 /usr/bin/time $B generate --checkpoint $C \
+  --tokens 791,6864,315,9822,374 --max-tokens 64 --gpu 1   # load phases + wall
+```
+
+What is left: decode GEMVs run at 590–630 GB/s per shape against the
+632 GB/s measured roofline, so the 13.95 ms step is ~95% of the
+weight-stream floor (13.3 ms); more single-stream speed needs fewer bytes
+per token (lower-precision weights, a quality decision) or more accepted
+tokens per weight pass (drafting). Long prefill is MMA bound at ~76% of the
+BF16 peak; FP8 activations would double the MMA rate at a numerics cost.
+
 ## Rules across phases
 
 - No kernel or code is copied from `reference/qwen3-27b-5090/`; it is kept

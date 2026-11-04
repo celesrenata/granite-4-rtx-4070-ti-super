@@ -7,17 +7,15 @@ kernels are written for this one model on this one GPU.
 
 **Status: P4 engine / speculative-decoding wired in.** The CUDA engine loads
 FP8 weights, runs the full Granite 4.2 8B forward pass, and serves deterministic
-GPU generation through the native inference binary. Phase 4 launcher hardening
-has been rebuilt and device-tested on gremlin-1; the prompt-lookup drafter is
-now wired into the production decode loop (`generate --draft-lookup K`, greedy
-only, acceptance measured via `G4_DRAFT`). The fused speculative GEMV primitive
-and attention/QKV staging APIs are verified, but the one-position-at-a-time
-verify path still runs per position, so the fused-k verify GEMV and batched
-causal attention are the next integration step. On an RTX 4070 Ti Super,
-steady batch-1 decode is currently about **15.2 ms/token (~65 tps)** for the
-5-token prompt benchmark; see [`docs/phases.md`](docs/phases.md) for commands
-and conditions. The Python HTTP layer remains a thin API scaffold while the
-native engine and speculative-decoding kernels evolve.
+GPU generation through the native inference binary. A prompt is one
+tensor-core prefill call, greedy decode is a CUDA graph chained on the device
+(no host round trip per token), and `generate --draft-lookup K` verifies
+prompt-lookup drafts in one batched forward. On an RTX 4070 Ti Super, steady
+batch-1 decode is about **13.95 ms/token (~72 tps)** at short context and
+14.5 ms/token at 2 K context (the weight-streaming roofline is 13.3 ms); a
+500-token prompt prefills in ~122 ms. See [`docs/phases.md`](docs/phases.md)
+for commands and conditions. The Python HTTP layer remains a thin API
+scaffold that shells out to the native engine.
 
 `reference/qwen3-27b-5090/` is a different model/GPU kept for layout
 conventions only. No kernels, code or numbers were copied from it.
