@@ -28,23 +28,53 @@ namespace granite4 {
 // RoPE tables). Defined in forward_gpu.cu.
 struct GpuCtx;
 
+// Opaque persistent weight upload (packed FP8 blob + pinned dequant
+// scales). Owned independently of GpuCtx so that several contexts can
+// attach to the same object: the ~9.5 GiB packed blob then lives once per
+// device instead of once per sequence, which is what lets N sequences fit
+// in VRAM at all.
+struct GpuWeights;
+
+// Allocate an empty weight object (no device memory). nullptr on failure.
+GpuWeights* gpu_weights_create();
+
+// Free a weight object and its device memory (idempotent on the buffers).
+void gpu_weights_free_obj(GpuWeights* w);
+
+// Upload packed weights + scales into a weight object (replacing any
+// existing upload; idempotent semantics). Host memory in, device memory
+// out. Returns 0 on success, -1 with a message in `error`.
+int gpu_weights_load(GpuWeights* w, const std::uint8_t* h_weights,
+                     std::size_t bytes, const float* h_scales,
+                     std::size_t n_scales, char* error,
+                     std::size_t error_size);
+
+// Attach a weight object to a context without taking ownership (the
+// caller keeps the object alive for the lifetime of every context that
+// uses it). Replaces any previously attached/owned weights.
+int gpu_ctx_use_weights(GpuCtx* ctx, GpuWeights* w);
+
 // Allocate a context sized for sequences up to max_positions. Model
 // dimensions come from `model`; `spec` is the forward spec (copied in at
 // create time - the caller need not keep it alive). The RoPE theta is
 // spec.rope_theta. Returns a context, or nullptr on allocation failure.
+// (A context has no weights until gpu_weights_load / gpu_ctx_use_weights.)
 GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
                         int max_positions);
 
 // Free a context and all its device memory.
 void gpu_ctx_free(GpuCtx* ctx);
 
-// Upload (or replace) the persistent packed weights used by
-// gpu_forward_range. h_weights is HOST memory (GpuWeightsLayout-packed); it
-// is copied to the current device once and kept there for the lifetime of
-// ctx (freed by gpu_weights_free or on gpu_ctx_free). h_scales is HOST
-// memory with [num_layers * kGpuScalesPerLayer + 1] dequant scales (copied).
-// Must be called before gpu_forward_range. Returns 0 on success, -1 on
-// failure with a null-terminated message in `error`.
+// (See gpu_weights_load above for the weight-object upload; the
+// legacy per-ctx signatures below delegate to it.)
+
+// Upload (or replace) the persistent packed weights on a context.
+// Equivalent to gpu_weights_load into a context-owned GpuWeights:
+// h_weights is HOST memory (GpuWeightsLayout-packed); it is copied to the
+// current device once and kept there for the lifetime of the context
+// (freed by gpu_weights_free or on gpu_ctx_free). Must be called before
+// gpu_forward_range. Returns 0 on success, -1 on failure with a
+// null-terminated message in `error`.
 int gpu_weights_load(GpuCtx* ctx, const std::uint8_t* h_weights,
                      std::size_t bytes, const float* h_scales,
                      std::size_t n_scales, char* error, std::size_t error_size);

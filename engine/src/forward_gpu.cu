@@ -47,6 +47,7 @@
 #include <cstring>
 #include <climits>
 #include <algorithm>
+#include <new>
 #include <vector>
 
 #include "forward_gpu.h"      // GpuWeightsLayout
@@ -556,6 +557,89 @@ int granite4_kernel_rmsnorm_batched(const std::uint16_t* d_x,
 }  // namespace
 
 // ---------------------------------------------------------------------------
+// Persistent weight upload, shared across contexts (namespace granite4 -
+// GpuWeights, forward-declared in forward_gpu_api.h).
+//
+// Owns the packed weight blob (device) and the dequant scales (pinned host)
+// independently of any GpuCtx. gpu_weights_load uploads into the object;
+// every context that needs the model attaches to it with gpu_ctx_use_weights
+// and keeps it alive for its own lifetime. One object can therefore serve
+// N contexts, so the ~9.5 GiB blob lives once per device instead of once
+// per sequence.
+// ---------------------------------------------------------------------------
+struct GpuWeights {
+  std::uint8_t* weights = nullptr;  // [weights_bytes] packed GpuWeightsLayout (device)
+  float* scales = nullptr;          // [scales_count] dequant scales (HOST, pinned, host-read)
+  std::size_t weights_bytes = 0;
+  std::size_t scales_count = 0;
+};
+
+// Free the persistent packed weights/scales if loaded (idempotent).
+void gpu_weights_free(GpuCtx* ctx);
+
+GpuWeights* gpu_weights_create() {
+  GpuWeights* w = new (std::nothrow) GpuWeights();
+  return w;
+}
+
+void gpu_weights_free_obj(GpuWeights* w) {
+  if (w == nullptr) return;
+  if (w->weights != nullptr) cudaFree(w->weights);
+  if (w->scales != nullptr) cudaFreeHost(w->scales);
+  delete w;
+}
+
+// Upload packed weights + scales into a weight object (replaces any
+// existing upload).
+int gpu_weights_load(GpuWeights* w, const std::uint8_t* h_weights,
+                     std::size_t bytes, const float* h_scales,
+                     std::size_t n_scales, char* error,
+                     std::size_t error_size) {
+  auto seterr = [&](const char* what) {
+    if (error != nullptr && error_size > 0)
+      std::snprintf(error, error_size, "%s", what);
+    return -1;
+  };
+  if (w == nullptr || h_weights == nullptr || bytes == 0 ||
+      h_scales == nullptr || n_scales == 0 ||
+      n_scales > SIZE_MAX / sizeof(float))
+    return seterr("invalid arguments");
+  for (std::size_t i = 0; i < n_scales; ++i) {
+    if (!std::isfinite(h_scales[i])) return seterr("non-finite scale");
+  }
+  // Replacing existing weights: free first (idempotent semantics).
+  if (w->weights != nullptr) cudaFree(w->weights);
+  if (w->scales != nullptr) cudaFreeHost(w->scales);
+  w->weights = nullptr;
+  w->scales = nullptr;
+  w->weights_bytes = 0;
+  w->scales_count = 0;
+  std::uint8_t* d_weights = nullptr;
+  if (cudaMalloc(&d_weights, bytes) != cudaSuccess)
+    return seterr("cudaMalloc weights failed");
+  if (cudaMemcpy(d_weights, h_weights, bytes, cudaMemcpyHostToDevice) !=
+      cudaSuccess) {
+    cudaFree(d_weights);
+    return seterr("cudaMemcpy weights failed");
+  }
+  // The dequant scales are read on the host (every kernel launcher takes
+  // them by value), so they must stay in HOST memory - pinned for the
+  // lifetime of the upload.
+  float* h_scales_pin = nullptr;
+  if (cudaHostAlloc(&h_scales_pin, n_scales * sizeof(float),
+                    cudaHostAllocDefault) != cudaSuccess) {
+    cudaFree(d_weights);
+    return seterr("cudaHostAlloc scales failed");
+  }
+  std::memcpy(h_scales_pin, h_scales, n_scales * sizeof(float));
+  w->weights = d_weights;
+  w->weights_bytes = bytes;
+  w->scales = h_scales_pin;
+  w->scales_count = n_scales;
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Persistent per-sequence context (namespace granite4 - the public API's
 // GpuCtx, forward-declared in forward_gpu_api.h).
 // ---------------------------------------------------------------------------
@@ -594,11 +678,16 @@ struct GpuCtx {
   int written = 0;  // KV positions written so far
 
   // Persistent packed weights + scales (uploaded once via gpu_weights_load;
-  // the per-step forward must not re-upload ~9.5 GB).
-  std::uint8_t* weights = nullptr;  // [total_bytes] packed GpuWeightsLayout (device)
-  float* scales = nullptr;          // [num_layers*kGpuScalesPerLayer+1] dequant scales (HOST, host-read)
-  std::size_t weights_bytes = 0;
-  std::size_t scales_count = 0;
+  // the per-step forward must not re-upload ~9.5 GB). `weights`/`scales` are
+  // raw pointers into a GpuWeights object so every view helper keeps
+  // reading them unchanged. The object is either context-owned
+  // (gpu_weights_load on the ctx) or externally shared
+  // (gpu_ctx_use_weights), recorded in owns_weights so gpu_ctx_free frees
+  // it only when it owns it.
+  std::uint8_t* weights = nullptr;  // [weights_bytes] packed GpuWeightsLayout (device)
+  float* scales = nullptr;          // [num_layers*kGpuScalesPerLayer+1] dequant scales (HOST)
+  GpuWeights* weights_obj = nullptr;  // owner of the above buffers
+  bool owns_weights = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -771,7 +860,12 @@ void gpu_ctx_free(GpuCtx* ctx) {
   if (ctx->decode_graph != nullptr) cudaGraphExecDestroy(ctx->decode_graph);
   cudaFree(ctx->cos_tbl);
   cudaFree(ctx->sin_tbl);
-  gpu_weights_free(ctx);
+  if (ctx->owns_weights && ctx->weights_obj != nullptr)
+    gpu_weights_free_obj(ctx->weights_obj);
+  ctx->weights_obj = nullptr;
+  ctx->weights = nullptr;
+  ctx->scales = nullptr;
+  ctx->owns_weights = false;
   delete ctx;
 }
 
@@ -1525,6 +1619,11 @@ bool capture_decode_graph(GpuCtx* g, std::int32_t* d_tokens, std::uint16_t* d_lo
 }  // namespace
 
 // Public API (forward_gpu_api.h), namespace granite4.
+//
+// Legacy per-ctx upload: creates (or replaces) a context-OWNED GpuWeights
+// and attaches it. The context frees the object on gpu_ctx_free. Use
+// gpu_weights_create + gpu_ctx_use_weights for weights shared across
+// several contexts.
 int gpu_weights_load(GpuCtx* ctx, const std::uint8_t* h_weights,
                      std::size_t bytes, const float* h_scales,
                      std::size_t n_scales, char* error,
@@ -1534,48 +1633,58 @@ int gpu_weights_load(GpuCtx* ctx, const std::uint8_t* h_weights,
       std::snprintf(error, error_size, "%s", what);
     return -1;
   };
-  if (ctx == nullptr || h_weights == nullptr || bytes == 0 ||
-      h_scales == nullptr || n_scales == 0 ||
-      n_scales > SIZE_MAX / sizeof(float))
-    return seterr("invalid arguments");
-  for (std::size_t i = 0; i < n_scales; ++i) {
-    if (!std::isfinite(h_scales[i])) return seterr("non-finite scale");
+  if (ctx == nullptr) return seterr("null context");
+  // Reuse the context-owned object if there is one (reload in place);
+  // otherwise allocate a fresh owned object.
+  GpuWeights* w = (ctx->owns_weights && ctx->weights_obj != nullptr)
+                      ? ctx->weights_obj
+                      : gpu_weights_create();
+  if (w == nullptr) return seterr("out of memory (weight object)");
+  if (gpu_weights_load(w, h_weights, bytes, h_scales, n_scales, error,
+                       error_size) != 0) {
+    // Release the object either way (we own it, whether fresh or reused)
+    // and clear the context: a failed reload leaves the context without
+    // weights.
+    gpu_weights_free_obj(w);
+    ctx->weights_obj = nullptr;
+    ctx->weights = nullptr;
+    ctx->scales = nullptr;
+    ctx->owns_weights = false;
+    return -1;
   }
-  // Replacing existing weights: free first (idempotent semantics).
-  gpu_weights_free(ctx);
-  std::uint8_t* d_weights = nullptr;
-  if (cudaMalloc(&d_weights, bytes) != cudaSuccess)
-    return seterr("cudaMalloc weights failed");
-  if (cudaMemcpy(d_weights, h_weights, bytes, cudaMemcpyHostToDevice) !=
-      cudaSuccess) {
-    cudaFree(d_weights);
-    return seterr("cudaMemcpy weights failed");
-  }
-  // The dequant scales are read on the host (every kernel launcher takes
-  // them by value), so they must stay in HOST memory - pinned for the
-  // lifetime of the upload.
-  float* h_scales_pin = nullptr;
-  if (cudaHostAlloc(&h_scales_pin, n_scales * sizeof(float),
-                    cudaHostAllocDefault) != cudaSuccess) {
-    cudaFree(d_weights);
-    return seterr("cudaHostAlloc scales failed");
-  }
-  std::memcpy(h_scales_pin, h_scales, n_scales * sizeof(float));
-  ctx->weights = d_weights;
-  ctx->weights_bytes = bytes;
-  ctx->scales = h_scales_pin;
-  ctx->scales_count = n_scales;
+  ctx->weights = w->weights;
+  ctx->scales = w->scales;
+  ctx->weights_obj = w;
+  ctx->owns_weights = true;
   return 0;
 }
 
+// Free a context-owned weight object, or detach a shared one (neither
+// frees the shared object - the owner does). Idempotent.
 void gpu_weights_free(GpuCtx* ctx) {
   if (ctx == nullptr) return;
-  if (ctx->weights != nullptr) cudaFree(ctx->weights);
+  if (ctx->owns_weights && ctx->weights_obj != nullptr)
+    gpu_weights_free_obj(ctx->weights_obj);
+  ctx->weights_obj = nullptr;
   ctx->weights = nullptr;
-  ctx->weights_bytes = 0;
-  if (ctx->scales != nullptr) cudaFreeHost(ctx->scales);
   ctx->scales = nullptr;
-  ctx->scales_count = 0;
+  ctx->owns_weights = false;
+}
+
+// Attach an externally-owned weight object (shared across contexts). The
+// caller keeps `w` alive for the lifetime of every context that uses it.
+// Replaces any previously attached weights. Returns 0, -1 on bad args.
+int gpu_ctx_use_weights(GpuCtx* ctx, GpuWeights* w) {
+  if (ctx == nullptr || w == nullptr || w->weights == nullptr) return -1;
+  // If this context owns a previous object, release it; if it merely used
+  // one, just detach (do not free).
+  if (ctx->owns_weights && ctx->weights_obj != nullptr)
+    gpu_weights_free_obj(ctx->weights_obj);
+  ctx->weights_obj = w;
+  ctx->weights = w->weights;
+  ctx->scales = w->scales;
+  ctx->owns_weights = false;
+  return 0;
 }
 
 int gpu_verify_attention_stage(
