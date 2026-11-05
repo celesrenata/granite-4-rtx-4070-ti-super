@@ -100,6 +100,7 @@ struct Args {
   long seed = 0;
   long eos = -1;  // stop token (-1: none)
   int max_context = 8192;  // serve: positions per request
+  int sessions = 1;        // serve: number of concurrent sessions sharing weights
 
   bool is_eos(std::int32_t tok) const { return eos >= 0 && tok == eos; }
 };
@@ -130,6 +131,8 @@ bool parse_args(int argc, char** argv, Args* a) {
       a->eos = std::atol(argv[++i]);
     } else if (s == "--max-context" && i + 1 < argc) {
       a->max_context = std::atoi(argv[++i]);
+    } else if (s == "--sessions" && i + 1 < argc) {
+      a->sessions = std::atoi(argv[++i]);
     } else if (s == "--eagle" && i + 1 < argc) {
       a->eagle = argv[++i];
     } else if (s == "--eagle-k" && i + 1 < argc) {
@@ -142,7 +145,8 @@ bool parse_args(int argc, char** argv, Args* a) {
       return false;
     }
   }
-  if (a->sub == "serve") return !a->dir.empty() && a->max_context > 0;
+  if (a->sub == "serve")
+    return !a->dir.empty() && a->max_context > 0 && a->sessions > 0;
   if (a->sub == "dump-hidden")
     return !a->dir.empty() && !a->in.empty() && !a->out.empty() && a->max_context > 0;
   return !a->sub.empty() && !a->dir.empty() && !a->tokens.empty();
@@ -255,6 +259,36 @@ class GpuSession {
     G4_HOST_CUDA_CHECK(cudaMalloc(&d_logits_, sizeof(std::uint16_t) *
                                                   static_cast<std::size_t>(logit_rows) *
                                                   vocab_));
+    return true;
+  }
+
+  // Open a session that ATTACHES to a shared weight object instead of
+  // uploading its own copy. The caller owns `weights` and keeps it alive
+  // for the lifetime of every session using it - this is what lets N
+  // sessions coexist in VRAM at 9.4 + N x 1.5 GiB instead of N x 9.5 GiB.
+  bool open_shared(const std::string& dir, int max_pos, int logit_rows,
+                   GpuWeights* weights, std::string* error) {
+    dir_ = dir;
+    ModelConfig cfg;
+    if (!load_model_config(dir, &cfg, error, /*enforce_spec=*/true)) return false;
+    max_pos_ = max_pos;
+    vocab_ = static_cast<int>(cfg.vocab_size);
+    hidden_ = static_cast<int>(cfg.hidden_size);
+    logit_rows_ = logit_rows;
+    ctx_ = gpu_ctx_create(cfg, kForwardSpec, max_pos);
+    if (ctx_ == nullptr) {
+      *error = "gpu_ctx_create failed";
+      return false;
+    }
+    if (gpu_ctx_use_weights(ctx_, weights) != 0) {
+      *error = "gpu_ctx_use_weights failed";
+      return false;
+    }
+    G4_HOST_CUDA_CHECK(cudaMalloc(&d_tokens_, sizeof(std::int32_t) * max_pos));
+    G4_HOST_CUDA_CHECK(cudaMalloc(&d_argmax_, sizeof(std::int32_t) * logit_rows));
+    G4_HOST_CUDA_CHECK(cudaMalloc(&d_logits_, sizeof(std::uint16_t) *
+                                               static_cast<std::size_t>(logit_rows) *
+                                               vocab_));
     return true;
   }
 
@@ -839,30 +873,84 @@ int gpu_dump_hidden_cmd(const Args& a) {
 // JSON line on stdout (see the file header). Errors are reported per request
 // ({"error": "..."}) and do not end the loop; EOF on stdin does.
 int gpu_serve_cmd(const Args& cli) {
-  std::string err;
-  GpuSession s;
   constexpr int kServeLogitRows = 16;  // draft_lookup <= 15
-  EagleHead* head = nullptr;
-  if (!s.open(cli.dir, cli.max_context, kServeLogitRows, &err) ||
-      !open_eagle(s, cli.eagle, &head, &err))
+  const int n_sessions = std::max(1, cli.sessions);
+  std::string err;
+
+  // 1. Load and upload the weight object ONCE (the ~9.5 GiB blob lives
+  //    once per device); every session attaches to it via
+  //    gpu_ctx_use_weights, so VRAM is 9.4 + N x 1.5 GiB, not N x 9.5.
+  ModelConfig cfg;
+  if (!load_model_config(cli.dir, &cfg, &err, /*enforce_spec=*/true))
     return fail(err);
+  GpuModel gm;
+  if (!pack_gpu_model_from_checkpoint(cli.dir, cfg, &gm, &err))
+    return fail(err);
+  GpuWeights* weights = gpu_weights_create();
+  if (weights == nullptr) return fail("gpu_weights_create failed");
+  {
+    char werr[256] = "";
+    if (gpu_weights_load(weights, gm.weights.get(), gm.bytes,
+                         gm.scales.data(), gm.scales.size(), werr,
+                         sizeof werr) != 0)
+      return fail(std::string("gpu_weights_load: ") + werr);
+  }
+  struct WtGuard {
+    GpuWeights* w;
+    ~WtGuard() { gpu_weights_free_obj(w); }
+  } wt_guard{weights};
+
+  // 2. Create N sessions (a stack array: GpuSession must never be
+  //    copied/moved - it owns CUDA pointers), each sharing the weights.
+  constexpr int kMaxSessions = 16;
+  if (n_sessions > kMaxSessions)
+    return fail("--sessions exceeds " + std::to_string(kMaxSessions));
+  GpuSession sessions[kMaxSessions];
+  for (int i = 0; i < n_sessions; ++i) {
+    if (!sessions[i].open_shared(cli.dir, cli.max_context, kServeLogitRows,
+                                 weights, &err))
+      return fail("open_shared[" + std::to_string(i) + "]: " + err);
+  }
+
+  // 3. EAGLE head: the head carries its own scratch + KV cache + decode
+  //    watermark, so one head cannot be safely shared across sessions.
+  //    Fail fast instead of silently corrupting state; N>1 without
+  //    --eagle is the intended shared-weight serve shape.
+  EagleHead* head = nullptr;
+  if (!cli.eagle.empty()) {
+    if (n_sessions > 1)
+      return fail("--eagle requires --sessions 1 (the head's scratch/KV "
+                  "are per-session; shared-weight serving is greedy)");
+    if (!open_eagle(sessions[0], cli.eagle, &head, &err)) return fail(err);
+  }
   struct HeadGuard {
     EagleHead* h;
     ~HeadGuard() { eagle_free(h); }
   } head_guard{head};
-  {
-    // Warm-up: load the lazily loaded kernels and capture the decode graph
-    // before reporting ready, so the first real request pays neither (an
-    // 8-token prompt runs the prefill path, then three chained greedy steps).
+
+  // 4. Warm-up: load the lazily loaded kernels and capture the decode
+  //    graph on EVERY session (the graph references that session's
+  //    device pointers, so a warm-up on session 0 does not help the
+  //    others). Uses an 8-token prompt, three greedy steps.
+  for (int i = 0; i < n_sessions; ++i) {
     Args w;
     w.tokens = {791, 6864, 315, 9822, 374, 13, 578, 7754};
     w.max_tokens = 4;
     Generation g;
-    if (cli.max_context >= 16 && !gpu_generate(s, w, &g, &err)) return fail("warm-up: " + err);
+    if (cli.max_context >= 16 &&
+        !gpu_generate(sessions[i], w, &g, &err, head))
+      return fail("warm-up[" + std::to_string(i) + "]: " + err);
   }
-  std::printf("{\"ready\":true,\"max_context\":%d,\"eagle\":%s}\n", cli.max_context,
-              head != nullptr ? "true" : "false");
+
+  std::printf("{\"ready\":true,\"max_context\":%d,\"sessions\":%d,"
+              "\"eagle\":%s}\n",
+              cli.max_context, n_sessions, head != nullptr ? "true" : "false");
   std::fflush(stdout);
+
+  // 5. Requests round-robin across the session pool; each request resets
+  //    its session's KV (truncate(0) inside gpu_generate) and runs to
+  //    completion before the next is dispatched.
+  int next = 0;
   std::string line;
   for (int c; (c = std::getchar()) != EOF;) {
     if (c != '\n') {
@@ -874,6 +962,8 @@ int gpu_serve_cmd(const Args& cli) {
     Args a;
     Generation g;
     std::string reply;
+    GpuSession& s = sessions[next];
+    next = (next + 1) % n_sessions;
     if (!json::parse(line.data(), line.size(), &req, &perr) ||
         req.kind != json::Value::Kind::Object) {
       err = "bad request: " + perr;
@@ -890,7 +980,8 @@ int gpu_serve_cmd(const Args& cli) {
       a.eos = static_cast<long>(req.get_int("eos", -1));
       a.eagle_k = static_cast<int>(req.get_int("eagle", 0));
       err.clear();
-      if (gpu_generate(s, a, &g, &err, head)) reply = generate_document(g.ids, g.drafted ? &g.report : nullptr);
+      if (gpu_generate(s, a, &g, &err, head))
+        reply = generate_document(g.ids, g.drafted ? &g.report : nullptr);
     }
     if (reply.empty()) {
       std::string esc;
@@ -906,7 +997,6 @@ int gpu_serve_cmd(const Args& cli) {
   }
   return 0;
 }
-
 #endif  // GRANITE_CUDA
 
 // ---------------------------------------------------------------------------
