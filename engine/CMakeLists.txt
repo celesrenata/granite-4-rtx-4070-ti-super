@@ -22,6 +22,8 @@ set(GRANITE_ENGINE_SOURCES
   src/draft_lookup.cc
   src/speculative_verify.h
   src/speculative_verify.cc
+  src/serve_resume.h
+  src/serve_resume.cc
   src/weights.h
   src/weights.cc
   src/gpu_pack.h
@@ -116,6 +118,15 @@ add_test(NAME draft_lookup COMMAND granite4-draft-lookup-test)
 add_executable(granite4-speculative-verify-test tests/test_speculative_verify.cc)
 target_link_libraries(granite4-speculative-verify-test PRIVATE granite4_static)
 add_test(NAME speculative_verify COMMAND granite4-speculative-verify-test)
+
+# Serve-loop session selection (host-only): the decision that picks the
+# session whose KV prefix is a full prefix of the new prompt and how many
+# leading tokens to skip in the prefill. No CUDA; the serve loop (CUDA
+# only) delegates to it, so the prefix-matching / round-robin-fallback
+# invariants are testable on a box without a GPU.
+add_executable(granite4-serve-resume-test tests/test_serve_resume.cc)
+target_link_libraries(granite4-serve-resume-test PRIVATE granite4_static)
+add_test(NAME serve_resume COMMAND granite4-serve-resume-test)
 
 if(GRANITE_ENABLE_CUDA)
   add_executable(granite4-kernel-test tests/test_kernels.cu)

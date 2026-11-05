@@ -86,6 +86,7 @@
 #include "forward_gpu.h"
 #include "forward_gpu_api.h"
 #include "gpu_pack.h"
+#include "serve_resume.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -466,20 +467,34 @@ class TokenStream {
 };
 
 // The generate modes run on an already open session (one-shot CLI or the
-// persistent `serve` loop) and start from an empty KV cache. Preconditions
-// (checked by check_request): prompt + max_tokens (+ draft_k) fits the
-// session's positions and draft_k + 1 fits its logits rows.
+// persistent `serve` loop). When prefix >= 0, the session's KV watermark
+// starts at `prefix` (the first `prefix` positions of a.tokens are already
+// cached; the host uploads only the tail and forwards [prefix, plen)).
+// When prefix < 0 (the CLI one-shot path and the first turn of a serve
+// session), the cache is reset to empty and the full prompt is prefilled.
+// Preconditions (checked by check_request): the final watermark
+// plen + max_tokens (+ draft_k) fits the session's positions and
+// draft_k + 1 fits its logits rows.
 struct Generation {
   std::vector<std::int32_t> ids;
   DraftReport report;
   bool drafted = false;
 };
 
-bool check_request(const GpuSession& s, const Args& a, std::string* error) {
-  const long need = static_cast<long>(a.tokens.size()) + a.max_tokens + a.draft_k +
+bool check_request(const GpuSession& s, const Args& a, int prefix, std::string* error) {
+  const long plen = static_cast<long>(a.tokens.size());
+  // The KV watermark ends at the absolute position plen + max_tokens (+
+  // draft_k), independent of `prefix` — the prefix saves prefill compute
+  // (only [prefix, plen) is forwarded) but not KV capacity, since the cache
+  // is indexed by absolute position. Bound on the final watermark.
+  const long need = plen + a.max_tokens + a.draft_k +
                     (a.eagle_k > 0 ? a.eagle_k + 1 : 0);
   if (a.tokens.empty() || a.max_tokens <= 0) {
     *error = "empty prompt or max_tokens <= 0";
+    return false;
+  }
+  if (prefix > static_cast<int>(plen)) {
+    *error = "resume prefix exceeds prompt length";
     return false;
   }
   if (need > s.max_pos()) {
@@ -507,11 +522,15 @@ bool check_request(const GpuSession& s, const Args& a, std::string* error) {
   return true;
 }
 
-bool generate_greedy(GpuSession& s, const Args& a, Generation* out, std::string* error) {
+bool generate_greedy(GpuSession& s, const Args& a, Generation* out, std::string* error,
+                     int prefix = -1) {
   const int plen = static_cast<int>(a.tokens.size());
   // Prefill: the prompt's KV plus the last row's greedy token, written on the
   // device straight into d_tokens[plen]; the decode chain continues from it.
-  if (!s.truncate(0) || !s.upload(a.tokens, 0, plen, error) ||
+  // With prefix >= 0 the watermark already holds the first `prefix` positions,
+  // so only the tail is uploaded and only [prefix, plen) is forwarded.
+  const int p = prefix > 0 ? prefix : 0;
+  if (!s.truncate(prefix >= 0 ? p : 0) || !s.upload(a.tokens, p, plen, error) ||
       !s.forward(plen, plen - 1, error) || !s.argmax_to_token(plen, error))
     return false;
   if (a.eos < 0) {
@@ -555,10 +574,12 @@ bool generate_greedy(GpuSession& s, const Args& a, Generation* out, std::string*
   return ok;
 }
 
-bool generate_sampled(GpuSession& s, const Args& a, Generation* out, std::string* error) {
+bool generate_sampled(GpuSession& s, const Args& a, Generation* out, std::string* error,
+                      int prefix = -1) {
   std::vector<std::int32_t> seq = a.tokens;
   const int plen = static_cast<int>(seq.size());
-  if (!s.truncate(0) || !s.upload(seq, 0, plen, error)) return false;
+  const int pre = prefix > 0 ? prefix : 0;
+  if (!s.truncate(prefix >= 0 ? pre : 0) || !s.upload(seq, pre, plen, error)) return false;
   const int V = s.vocab();
   std::vector<std::uint16_t> row;
   std::vector<float> p(static_cast<std::size_t>(V));
@@ -576,7 +597,8 @@ bool generate_sampled(GpuSession& s, const Args& a, Generation* out, std::string
   return true;
 }
 
-bool generate_draft(GpuSession& s, const Args& a, Generation* out, std::string* error) {
+bool generate_draft(GpuSession& s, const Args& a, Generation* out, std::string* error,
+                    int prefix = -1) {
   std::vector<std::int32_t> seq = a.tokens;
   const int plen = static_cast<int>(seq.size());
   const int max_pos = plen + a.max_tokens + a.draft_k;
@@ -587,7 +609,11 @@ bool generate_draft(GpuSession& s, const Args& a, Generation* out, std::string* 
   // Prefill once: the KV watermark then advances by only the committed
   // tokens, so a step costs O(draft_k) instead of replaying the prefix.
   // `anchor` is the target's greedy token after the last committed position.
-  if (!s.truncate(0) || !s.upload(seq, 0, plen, error) ||
+  // With prefix >= 0 the watermark already holds the first `prefix` positions,
+  // so only the tail is uploaded and only [prefix, plen) is forwarded; the
+  // loop's invariant (len == seq.size() == watermark) is unchanged.
+  const int pre = prefix > 0 ? prefix : 0;
+  if (!s.truncate(prefix >= 0 ? pre : 0) || !s.upload(seq, pre, plen, error) ||
       !s.forward(plen, plen - 1, error) || !s.argmax(1, &ids, error))
     return false;
   std::int32_t anchor = ids[0];
@@ -785,11 +811,12 @@ bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* o
 }
 
 bool gpu_generate(GpuSession& s, const Args& a, Generation* out, std::string* error,
-                  EagleHead* head = nullptr) {
-  if (!check_request(s, a, error)) return false;
+                  EagleHead* head = nullptr, int prefix = -1) {
+  if (!check_request(s, a, prefix, error)) return false;
   if (a.eagle_k > 0) return generate_eagle(s, head, a, out, error);
-  if (a.draft_k > 0) return generate_draft(s, a, out, error);
-  return a.seed == 0 ? generate_greedy(s, a, out, error) : generate_sampled(s, a, out, error);
+  if (a.draft_k > 0) return generate_draft(s, a, out, error, prefix);
+  return a.seed == 0 ? generate_greedy(s, a, out, error, prefix)
+                     : generate_sampled(s, a, out, error, prefix);
 }
 
 // Load the --eagle head for an open session (nullptr when none requested).
@@ -947,9 +974,25 @@ int gpu_serve_cmd(const Args& cli) {
               cli.max_context, n_sessions, head != nullptr ? "true" : "false");
   std::fflush(stdout);
 
-  // 5. Requests round-robin across the session pool; each request resets
-  //    its session's KV (truncate(0) inside gpu_generate) and runs to
-  //    completion before the next is dispatched.
+  // 4b. Warm-up left each session's watermark advanced past the synthetic
+  //     8-token prompt. Reset so the first serve request starts from an
+  //     empty KV (matching the empty hist below); without this the
+  //     watermark==hist.size() match check would treat every session as
+  //     stale and force a full re-prefill (correct but wasteful, and it
+  //     breaks the invariant that a fresh session has watermark 0).
+  for (int i = 0; i < n_sessions; ++i) sessions[i].truncate(0);
+
+  // 5. Requests dispatch to the session whose KV prefix is the longest
+  //    full prefix of the new prompt; that session resumes from its
+  //    watermark (only the tail is uploaded and prefilled). When no session
+  //    matches (or the pool is empty), the request goes to the next
+  //    session in round-robin and gets a full re-prefill (truncate(0)).
+  //    Each session's `hist` holds the token sequence whose KV is cached
+  //    in that session; after a successful generate, hist extends by the
+  //    generated ids. A new prompt that shares a prefix with an existing
+  //    hist reuses the cached KV positions instead of re-prefilling them,
+  //    which is the primary cost of a long context in a chat conversation.
+  std::vector<std::vector<std::int32_t>> hist(n_sessions);
   int next = 0;
   std::string line;
   for (int c; (c = std::getchar()) != EOF;) {
@@ -962,8 +1005,9 @@ int gpu_serve_cmd(const Args& cli) {
     Args a;
     Generation g;
     std::string reply;
-    GpuSession& s = sessions[next];
-    next = (next + 1) % n_sessions;
+    err.clear();
+    int picked = -1;
+    int resume = 0;
     if (!json::parse(line.data(), line.size(), &req, &perr) ||
         req.kind != json::Value::Kind::Object) {
       err = "bad request: " + perr;
@@ -979,11 +1023,82 @@ int gpu_serve_cmd(const Args& cli) {
       a.draft_k = static_cast<int>(req.get_int("draft_lookup", 0));
       a.eos = static_cast<long>(req.get_int("eos", -1));
       a.eagle_k = static_cast<int>(req.get_int("eagle", 0));
+      // Delegate the session pick to the host-tested serve_decide:
+      // longest session whose KV prefix is a full prefix of a.tokens
+      // (watermark == history.size() required; a failed turn leaves the
+      // watermark stale and is treated as a miss). On a miss, the
+      // round-robin pointer's next session with a full re-prefill.
+      // The Eagle head always re-prefills from 0 (generate_eagle truncates
+      // the session and resets its own scratch from scratch; it cannot
+      // resume from a cached prefix), so force resume == 0 for the eagle
+      // path. Note: the head is a single shared object across all
+      // sessions, so eagle is a perf feature for the 1-session case, not
+      // for a multi-session pool (a per-session head is out of scope here).
+      std::vector<ServeSessionState> state(n_sessions);
+      for (int i = 0; i < n_sessions; ++i) {
+        state[i].history = hist[i];
+        state[i].watermark = sessions[i].written();
+      }
+      const ServeDecision dec = serve_decide(state, next, a.tokens);
+      picked = dec.picked;
+      resume = (a.eagle_k > 0) ? 0 : dec.resume;
+      next = dec.next;
       err.clear();
-      if (gpu_generate(s, a, &g, &err, head))
-        reply = generate_document(g.ids, g.drafted ? &g.report : nullptr);
+      GpuSession& s = sessions[picked];
+      // The watermark before this turn. Used below to tell a check_request
+      // rejection (no GPU work ran, session untouched) apart from a
+      // mid-generation failure (a forward completed and the watermark
+      // advanced past hist, leaving the KV ahead of the recorded prefix).
+      const int wm_before = s.written();
+      const bool ok = gpu_generate(s, a, &g, &err, head, resume);
+      if (ok) reply = generate_document(g.ids, g.drafted ? &g.report : nullptr);
+      // On success, record what the session's KV actually holds so the next
+      // turn can resume from it. On failure, reset ONLY if the watermark
+      // actually moved: a check_request rejection (empty prompt,
+      // max_tokens <= 0, token out of range, context overflow) runs no GPU
+      // work, so the session is untouched and its cached conversation must
+      // be kept; a mid-generation failure advances the watermark past the
+      // recorded prefix, so the next request must re-prefill from scratch.
+      if (ok) {
+        auto& h = hist[picked];
+        h.assign(a.tokens.begin(), a.tokens.end());
+        for (std::int32_t t : g.ids) h.push_back(t);
+        // The committed length is a.tokens + g.ids, but the watermark does
+        // not always equal it: the greedy-EOS chunked path enqueues a full
+        // chunk past the stop and discards it (overshoot), and the
+        // sampled-EOS path commits the stop token without forwarding its KV
+        // (undershoot by one). The positions guaranteed to hold the
+        // committed prefix's KV are [0, min(written, h.size())). Clamp the
+        // watermark down to that and keep hist == the cached prefix, so the
+        // invariant serve_decide relies on (watermark == history.size())
+        // holds and a resume never reads past valid KV. truncate() only
+        // moves the watermark down; positions [0, valid) are untouched.
+        const int valid = std::min(s.written(), static_cast<int>(h.size()));
+        if (!s.truncate(valid)) {
+          // Should be unreachable (valid <= written <= max_pos), but if it
+          // happens the watermark is in an unknown state: reset so the next
+          // request re-prefills instead of resuming into bad KV.
+          h.clear();
+          s.truncate(0);
+        } else {
+          h.resize(static_cast<std::size_t>(valid));
+          if (valid > cli.max_context) {
+            // Over the context bound: the session's KV can't hold this
+            // conversation anymore. Reset so the next request starts
+            // fresh.
+            h.clear();
+            s.truncate(0);
+          }
+        }
+      } else if (s.written() != wm_before) {
+        hist[picked].clear();
+        s.truncate(0);
+      }
     }
-    if (reply.empty()) {
+    if (picked < 0) {
+      // Bad request: no session touched, round-robin pointer unchanged.
+    }
+    if (reply.empty() && !err.empty()) {
       std::string esc;
       for (char ch : err) {
         if (ch == '"' || ch == '\\') esc.push_back('\\');
