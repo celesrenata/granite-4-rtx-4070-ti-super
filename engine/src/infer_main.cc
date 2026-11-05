@@ -1042,6 +1042,12 @@ int gpu_serve_cmd(const Args& cli) {
       const ServeDecision dec = serve_decide(state, next, a.tokens);
       picked = dec.picked;
       resume = (a.eagle_k > 0) ? 0 : dec.resume;
+      // G4_FORCE_REPREFILL: override the resume decision so this request
+      // full-prefills even when the session's cached prefix matches the
+      // prompt (resume == 0 truncates the watermark to 0 and forwards the
+      // whole prompt). An A/B switch for benchmarking the value of resume;
+      // the post-turn watermark/hist bookkeeping is identical either way.
+      if (std::getenv("G4_FORCE_REPREFILL") != nullptr) resume = 0;
       next = dec.next;
       err.clear();
       GpuSession& s = sessions[picked];
