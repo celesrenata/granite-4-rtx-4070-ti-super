@@ -356,7 +356,7 @@ static void test_kv8_device() {
   cudaFree(d_s);
 
   int bad_code = 0, bad_scale = 0, bad_dequant = 0, bad_bound = 0;
-  float worst_rel = 0.0f;
+  float worst_step_frac = 0.0f;
   for (int r = 0; r < rows; ++r) {
     float amax = 0.0f;
     for (int i = 0; i < d; ++i)
@@ -387,19 +387,25 @@ static void test_kv8_device() {
                       dq_ref);
         ++bad_dequant;
       }
-      if (x != 0.0f && hs[r] != 0.0f) {
-        const float rel = std::fabs(x - dq_dev) / std::fabs(x);
-        worst_rel = std::max(worst_rel, rel);
-        if (rel > 0.006f) ++bad_bound;  // > 2 * (1/127) = ~1.57% (safety margin)
+      // Absolute error is bounded by half a quantization step (s/2) plus one
+      // ULP of the dequant product (s*q) for the multiplication rounding.
+      if (hs[r] != 0.0f) {
+        const float err = std::fabs(x - dq_dev);
+        const float half_step = hs[r] * 0.5f;
+        worst_step_frac = std::max(worst_step_frac, err / half_step);
+        // Tolerance: s/2 + one ULP at the dequant magnitude (s * 127).
+        const float tol = half_step + hs[r] * 127.0f * 1.19e-7f;  // 2^-23
+        if (err > tol) ++bad_bound;
       }
     }
   }
   expect(bad_code == 0, "kv8 int8 quantize codes bit-exact device vs host");
   expect(bad_scale == 0, "kv8 row scale bit-exact device vs host");
   expect(bad_dequant == 0, "kv8 dequant bit-exact device vs host");
-  expect(bad_bound == 0, "kv8 round-trip within 2*step (per-element rel error)");
+  expect(bad_bound == 0, "kv8 round-trip within half a step (abs error)");
   if (g_failures == 0)
-    std::printf("  kv8 worst per-element rel error: %.4f (bound 0.0079)\n", worst_rel);
+    std::printf("  kv8 worst abs error = %.4f of a half step (bound 1.0)\n",
+                worst_step_frac);
 }
 
 static void test_rmsnorm_device() {

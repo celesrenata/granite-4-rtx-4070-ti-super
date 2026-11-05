@@ -107,12 +107,24 @@ __device__ __forceinline__ float kv8_scale(float amax) {
   return amax / 127.0f;
 }
 
+// Round-half-away-from-zero to a long, bit-identical to the host twin's
+// std::round(float). The IEEE division feeding it is correctly rounded on
+// both sides, so the code matches. RNE (__float2ll_rn) and away-from-zero
+// differ only at exact +/-0.5 fractions, where RNE keeps the even side; the
+// fmodf correction catches exactly those. (floorf(x + 0.5f) would NOT
+// match: the float addition itself RNE-rounds, e.g. 0.5 - 2^-25 + 0.5f ==
+// 1.0f.)
+__device__ __forceinline__ long kv8_round_away(float r) {
+  long i = __float2ll_rn(r);
+  const float fr = fmodf(r, 1.0f);  // exact fractional part for finite r
+  if (fr == 0.5f) i = static_cast<long>(ceilf(r));
+  else if (fr == -0.5f) i = static_cast<long>(floorf(r));
+  return i;
+}
+
 __device__ __forceinline__ std::int8_t kv8_quant(float x, float scale) {
   if (scale == 0.0f) return 0;
-  // Round-half-away-from-zero (matches the host twin's std::round exactly);
-  // the IEEE division x / s is correctly rounded, so device and host agree on
-  // the code bit-for-bit.
-  const long r = __float2round(x / scale);
+  const long r = kv8_round_away(x / scale);
   const long clamped = r > 127 ? 127 : (r < -127 ? -127 : r);
   return static_cast<std::int8_t>(clamped);
 }
