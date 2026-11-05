@@ -603,6 +603,28 @@ draft path still re-prefills from 0 (`resume` is forced to 0 there because
 shared across all sessions — a per-session head is out of scope), so eagle
 remains a one-session performance feature.
 
+Performance (gremlin-1, 5-turn conversation, 3000-token base prompt growing
+by 11 tokens per turn, 8 generated/turn, `seed 0`; A/B via
+`G4_FORCE_REPREFILL` on the same binary):
+
+| Turn | Prompt | Resume (s) | Re-prefill (s) | Saved (s) |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 3000 | 0.855 | 0.854 | — (cold, both full-prefill) |
+| 2 | 3011 | 0.122 | 0.870 | 0.748 |
+| 3 | 3022 | 0.122 | 0.872 | 0.750 |
+| 4 | 3033 | 0.122 | 0.872 | 0.750 |
+| 5 | 3044 | 0.122 | 0.871 | 0.749 |
+| **total** | | **1.343** | **4.339** | **2.996** |
+
+Total wall is **3.23x** faster with resume; the per-turn saving (~750 ms)
+matches the standalone prefill device time for a 3000-token prompt (749 ms
+via `G4_TIMESTEP`). The win scales with prompt length: prefill is
+~62 ms at 200 tokens, ~1.6 s at 6000, while decode is a flat ~14–16 ms/token
+— so on long-context conversations every follow-up turn costs its small
+tail prefill + decode instead of the full prefill. (An earlier A/B that
+reported 1.00x was invalid: the driver consumed the engine's `ready` line as
+a warm-up reply, so no follow-up prompt ever matched the session history.)
+
 Parity: decode-path changes 1, 4, 5 are bit-identical. The tensor-core
 prefill, split-KV attention and FP32 RMSNorm change summation order (and
 the split attention keeps f32 probabilities), so logits move within bf16
