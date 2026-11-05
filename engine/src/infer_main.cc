@@ -918,16 +918,21 @@ int gpu_kv_bench_cmd(const Args& a) {
 
   // Prefill: forward all N prompt positions; the argmax for the last prompt
   // row (position N-1) is placed at d_tokens[N] via argmax_to_token.
-  // Same convention as generate_greedy.
+  // Same convention as generate_greedy. cudaDeviceSynchronize makes this GPU
+  // time, not the host time to enqueue the kernels.
   const auto t0 = std::chrono::steady_clock::now();
   if (!s.forward(N, N - 1, &err)) return fail(err);
   if (!s.argmax_to_token(N, &err)) return fail(err);
+  cudaDeviceSynchronize();
   const auto t1 = std::chrono::steady_clock::now();
 
   // Decode: device-side greedy chain — same path as generate_greedy.
-  // Reads d_tokens[N] as the first token; writes tokens N+1..N+D.
+  // Reads d_tokens[N] as the first token; writes tokens N+1..N+D. Sync on the
+  // stream before stopping the clock so this is GPU time, not the host time
+  // to enqueue D async graph replays.
   const auto t2 = std::chrono::steady_clock::now();
   if (!s.decode_greedy(D, &err)) return fail(err);
+  cudaDeviceSynchronize();
   const auto t3 = std::chrono::steady_clock::now();
 
   const double prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

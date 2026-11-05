@@ -538,26 +538,47 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
         }
       }
     } else {
-      // KV8: dequant each K row (row-major, one thread per dim) and V element
-      // into the same bf16 Ks/Vt tiles the bf16 path writes. Out-of-tile
-      // positions store 0 (the bf16 path's zero fill), so the masked logits
-      // (and the Vt columns the PV mma still reads) stay 0.
-      const int ntiles = min(KT, kv_end - j0);
-      for (int idx = threadIdx.x; idx < KT * D; idx += kAttnWarps * 32) {
-        const int r = idx / D, c = idx % D;
+      // KV8: dequant each K row (row-major, one thread per 8-byte chunk) and V
+      // element into the same bf16 Ks/Vt tiles the bf16 path writes. Codes are
+      // read as aligned uint64 (8 per lane) instead of scalar int8, and the
+      // dequant runs over the register codes; out-of-tile positions store 0
+      // (the bf16 path's zero fill), so the masked logits (and the Vt columns
+      // the PV mma still reads) stay 0.
+      for (int idx = threadIdx.x; idx < KT * D / 8; idx += kAttnWarps * 32) {
+        const int r = idx / (D / 8), w = (idx % (D / 8)) * 8;
         const int j = j0 + r;
-        Ks[r][c] =
-            r < ntiles ? f32_to_bf16(dev::kv8_dequant(k8[static_cast<std::size_t>(j) * D + c],
-                                                      ksc[j]))
-                       : std::uint16_t{0};
+        if (j < kv_end) {
+          const std::size_t off = static_cast<std::size_t>(j) * D + w;
+          const float sk = ksc[j];
+          const uint64_t kraw = *reinterpret_cast<const uint64_t*>(k8 + off);
+          const std::int8_t* const kp =
+              reinterpret_cast<const std::int8_t*>(&kraw);
+          std::uint16_t kc[8];
+          #pragma unroll
+          for (int e = 0; e < 8; ++e)
+            kc[e] = f32_to_bf16(dev::kv8_dequant(kp[e], sk));
+          *reinterpret_cast<uint4*>(&Ks[r][w]) =
+              *reinterpret_cast<const uint4*>(kc);
+        } else {
+          *reinterpret_cast<uint4*>(&Ks[r][w]) = zero;
+        }
       }
-      for (int idx = threadIdx.x; idx < KT * D; idx += kAttnWarps * 32) {
-        const int r = idx / D, c = idx % D;
+      for (int idx = threadIdx.x; idx < KT * D / 8; idx += kAttnWarps * 32) {
+        const int r = idx / (D / 8), w = (idx % (D / 8)) * 8;
         const int j = j0 + r;
-        Vt[c][r] =
-            r < ntiles ? f32_to_bf16(dev::kv8_dequant(v8[static_cast<std::size_t>(j) * D + c],
-                                                      vsc[j]))
-                       : std::uint16_t{0};
+        if (j < kv_end) {
+          const std::size_t off = static_cast<std::size_t>(j) * D + w;
+          const float sv = vsc[j];
+          const uint64_t vraw = *reinterpret_cast<const uint64_t*>(v8 + off);
+          const std::int8_t* const vp =
+              reinterpret_cast<const std::int8_t*>(&vraw);
+          #pragma unroll
+          for (int e = 0; e < 8; ++e)
+            Vt[w + e][r] = f32_to_bf16(dev::kv8_dequant(vp[e], sv));
+        } else {
+          #pragma unroll
+          for (int e = 0; e < 8; ++e) Vt[w + e][r] = std::uint16_t{0};
+        }
       }
     }
     __syncthreads();
