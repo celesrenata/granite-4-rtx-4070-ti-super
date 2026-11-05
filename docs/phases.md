@@ -579,6 +579,30 @@ JSON-line requests; the API uses one such process for a GPU gate
 (`parity_gate.py --gpu` records `"gpu": true`), so a chat request costs its
 prefill + decode instead of a 7 s load.
 
+**Session resume (prefix cache, 2026-11-05, gremlin-1).** The serve loop runs
+`--sessions N` KV contexts that share one weight copy (`GpuWeights` is split
+out of `GpuCtx`; `forward_gpu.cu`), so N concurrent conversations cost
+weights × 1 + KV × N instead of the full model × N. Each request is assigned
+to the session whose cached KV prefix is the longest *exact* prefix of the
+incoming prompt (`serve_resume.{h,cc}`, `test_serve_resume.cc`); that session
+uploads and forwards only the tail, resuming from its watermark, while a
+request that matches no session goes to the next one round-robin and
+full-prefills (`truncate(0)`). The watermark records the guaranteed-cached
+prefix and deliberately *undershoots* the last generated row (whose KV row is
+not forwarded, only its id is read back), so a follow-up whose prompt extends
+the cached prefix resumes the maximum safe span; any token mismatch in the
+prefix falls back to a full re-prefill, which is correct, just slower. With
+`G4_SERVE_DEBUG` set, each request logs `session=<i> resume=<k> prompt=<n>
+wm=<w>` to stderr — the audit for whether a turn actually resumed. Verified on
+gremlin-1 end-to-end: a 3-turn conversation on one serve process and an
+interleaved A/B/A/B on a 2-session pool both reproduce fresh one-shot
+`generate` ids byte-for-byte, with the debug log showing `resume` growing
+(0→16→24 single-session; 0,0→13,13 per session interleaved). The EAGLE
+draft path still re-prefills from 0 (`resume` is forced to 0 there because
+`generate_eagle` truncates the session and its head is a single object
+shared across all sessions — a per-session head is out of scope), so eagle
+remains a one-session performance feature.
+
 Parity: decode-path changes 1, 4, 5 are bit-identical. The tensor-core
 prefill, split-KV attention and FP32 RMSNorm change summation order (and
 the split attention keeps f32 probabilities), so logits move within bf16
