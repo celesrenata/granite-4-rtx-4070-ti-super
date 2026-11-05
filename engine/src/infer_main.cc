@@ -102,6 +102,8 @@ struct Args {
   long eos = -1;  // stop token (-1: none)
   int max_context = 8192;  // serve: positions per request
   int sessions = 1;        // serve: number of concurrent sessions sharing weights
+  int bench_ctx = 0;       // kv-bench: prefill token count
+  int bench_decode = 0;    // kv-bench: decode token count
 
   bool is_eos(std::int32_t tok) const { return eos >= 0 && tok == eos; }
 };
@@ -109,7 +111,8 @@ struct Args {
 bool parse_args(int argc, char** argv, Args* a) {
   for (int i = 1; i < argc; ++i) {
     const std::string s = argv[i];
-    if (s == "forward" || s == "generate" || s == "serve" || s == "dump-hidden") {
+    if (s == "forward" || s == "generate" || s == "serve" || s == "dump-hidden" ||
+        s == "kv-bench") {
       a->sub = s;
     } else if (s == "--checkpoint" && i + 1 < argc) {
       a->dir = argv[++i];
@@ -134,6 +137,10 @@ bool parse_args(int argc, char** argv, Args* a) {
       a->max_context = std::atoi(argv[++i]);
     } else if (s == "--sessions" && i + 1 < argc) {
       a->sessions = std::atoi(argv[++i]);
+    } else if (s == "--bench-ctx" && i + 1 < argc) {
+      a->bench_ctx = std::atoi(argv[++i]);
+    } else if (s == "--bench-decode" && i + 1 < argc) {
+      a->bench_decode = std::atoi(argv[++i]);
     } else if (s == "--eagle" && i + 1 < argc) {
       a->eagle = argv[++i];
     } else if (s == "--eagle-k" && i + 1 < argc) {
@@ -150,6 +157,8 @@ bool parse_args(int argc, char** argv, Args* a) {
     return !a->dir.empty() && a->max_context > 0 && a->sessions > 0;
   if (a->sub == "dump-hidden")
     return !a->dir.empty() && !a->in.empty() && !a->out.empty() && a->max_context > 0;
+  if (a->sub == "kv-bench")
+    return !a->dir.empty() && a->bench_ctx >= 2 && a->bench_decode > 0;
   return !a->sub.empty() && !a->dir.empty() && !a->tokens.empty();
 }
 
@@ -299,6 +308,11 @@ class GpuSession {
   int logit_rows() const { return logit_rows_; }
   int written() const { return gpu_ctx_written(ctx_); }
   bool truncate(int written) { return gpu_ctx_truncate(ctx_, written) == 0; }
+  // Resolved KV-cache mode (after the split-attention capability check in
+  // gpu_ctx_create) and active attention path - so callers can report ground
+  // truth instead of trusting G4_KV8.
+  bool kv8() const { return gpu_ctx_is_kv8(ctx_); }
+  bool split_attn() const { return gpu_ctx_is_split_attn(ctx_); }
 
 
   bool upload(const std::vector<std::int32_t>& seq, int from, int to, std::string* error) {
@@ -847,8 +861,92 @@ int gpu_generate_cmd(const Args& a) {
   return 0;
 }
 
-// `dump-hidden`: final-normed hidden states for every position of every
-// input record (see the file header).
+// `kv-bench`: load, time prefill (a.bench_ctx tokens from 0 to N), then time
+// decode (a.bench_decode greedy tokens from N to N + D). Emits one JSON
+// object per run on stdout:
+//   {"prefill_ms":..., "decode_ms":..., "kv_free_before":...,
+//    "kv_free_after":..., "tokens_generated":..., "decode_tps":...}
+//
+// Memory is measured with cudaMemGetInfo around the GPU forward calls, so
+// "kv_free_before/after" reports the *free* device memory at each phase —
+// the difference between runs (bf16 vs int8) is the persistent KV pool
+// delta on the same GPU with weights already resident.
+int gpu_kv_bench_cmd(const Args& a) {
+  std::string err;
+  const int N = a.bench_ctx;
+  const int D = a.bench_decode;
+  if (N < 2 || D <= 0) return fail("kv-bench: need --bench-ctx N>=2 --bench-decode D");
+  // max_pos must hold the prompt plus every generated token plus one (the
+  // decode chain writes d_tokens[written..written+steps], written = N after
+  // prefill, steps = D; gpu_decode_greedy requires written + steps + 1 <= max_pos).
+  const int max_pos = N + D + 1;
+  GpuSession s;
+  if (!s.open(a.dir, max_pos, 1, &err)) return fail(err);
+
+  // Deterministic pseudo-tokens so bf16 and int8 runs process identical ids.
+  const int V = s.vocab();
+  std::vector<std::int32_t> tokens(static_cast<std::size_t>(N));
+  std::uint64_t r = a.seed != 0 ? static_cast<std::uint64_t>(a.seed)
+                                : 0x9E3779B97F4A7C15ull;
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    r = r * 6364136223846793005ull + 1442695040888963407ull;
+    tokens[i] = static_cast<std::int32_t>(
+        (r >> 16) % static_cast<std::uint64_t>(V > 0 ? V : 1));
+  }
+  if (!s.upload(tokens, 0, N, &err)) return fail(err);
+
+  const char* kv8_env = std::getenv("G4_KV8");
+  const bool kv8_requested = kv8_env != nullptr && kv8_env[0] == '1';
+  const bool kv8 = s.kv8();  // resolved (after the split-attention check)
+  if (kv8_requested && !kv8)
+    std::fprintf(stderr,
+                 "kv-bench: WARNING G4_KV8=1 requested but the session fell "
+                 "back to bf16 (config not split-attention capable: needs "
+                 "d==128 and Hq==4*Hk)\n");
+
+  // Free memory right after the session is fully open (weights + KV pool +
+  // fixed scratch are resident; the KV pool is the only thing that differs
+  // between bf16 and int8). Measuring here — not around the forward calls,
+  // which allocate transient activation scratch that is identical in both
+  // modes — isolates the persistent KV cache footprint.
+  long long free_after_load = 0;
+  {
+    std::size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
+      free_after_load = static_cast<long long>(free_b);
+  }
+
+  // Prefill: forward all N prompt positions; the argmax for the last prompt
+  // row (position N-1) is placed at d_tokens[N] via argmax_to_token.
+  // Same convention as generate_greedy.
+  const auto t0 = std::chrono::steady_clock::now();
+  if (!s.forward(N, N - 1, &err)) return fail(err);
+  if (!s.argmax_to_token(N, &err)) return fail(err);
+  const auto t1 = std::chrono::steady_clock::now();
+
+  // Decode: device-side greedy chain — same path as generate_greedy.
+  // Reads d_tokens[N] as the first token; writes tokens N+1..N+D.
+  const auto t2 = std::chrono::steady_clock::now();
+  if (!s.decode_greedy(D, &err)) return fail(err);
+  const auto t3 = std::chrono::steady_clock::now();
+
+  const double prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  const double decode_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+  const double tps = D > 0 ? 1000.0 * static_cast<double>(D) / decode_ms : 0.0;
+
+  // Report the persistent KV-pool footprint as the free-memory difference
+  // between this run (bf16 or int8 pool) measured right after load. The
+  // cross-run delta is the KV cache size difference at the same max_pos.
+  std::fprintf(stdout,
+      "{\"kv8\":%s,\"split_attn\":%s,\"prefill_ms\":%.3f,\"decode_ms\":%.3f,"
+      "\"decode_tps\":%.3f,\"free_after_load\":%lld,\"max_pos\":%d,"
+      "\"ctx\":%d,\"decode\":%d}\n",
+      kv8 ? "true" : "false",
+      s.split_attn() ? "true" : "false",
+      prefill_ms, decode_ms, tps, free_after_load, max_pos, N, D);
+  std::fflush(stdout);
+  return 0;
+}
 int gpu_dump_hidden_cmd(const Args& a) {
   std::string err;
   GpuSession s;
@@ -1221,11 +1319,17 @@ int main(int argc, char** argv) {
         "         [--eagle HEAD.safetensors --eagle-k K]\n"
         "       granite4-infer serve --checkpoint DIR --gpu 1 [--max-context N] [--eagle HEAD]\n"
         "       granite4-infer dump-hidden --checkpoint DIR --gpu 1 --in TOKENS.bin "
-        "--out HIDDEN.bin [--max-context N]\n");
+        "--out HIDDEN.bin [--max-context N]\n"
+        "       granite4-infer kv-bench --checkpoint DIR --gpu 1 --bench-ctx N "
+        "--bench-decode D [--seed S]   (G4_KV8=1 switches the KV cache to int8)\n");
     return 2;
   }
   if (a.sub == "generate" && a.max_tokens <= 0) {
     std::fprintf(stderr, "generate: --max-tokens required\n");
+    return 2;
+  }
+  if (a.sub == "kv-bench" && (a.bench_ctx < 2 || a.bench_decode <= 0)) {
+    std::fprintf(stderr, "kv-bench: --bench-ctx N (>=2) and --bench-decode D required\n");
     return 2;
   }
   if (a.sub == "generate" && a.draft_k > 0 && a.seed != 0) {
@@ -1242,6 +1346,7 @@ int main(int argc, char** argv) {
     if (a.sub == "forward") return gpu_forward_cmd(a);
     if (a.sub == "serve") return gpu_serve_cmd(a);
     if (a.sub == "dump-hidden") return gpu_dump_hidden_cmd(a);
+    if (a.sub == "kv-bench") return gpu_kv_bench_cmd(a);
     return gpu_generate_cmd(a);
 #else
     std::fprintf(stderr, "granite4-infer was built without CUDA support\n");

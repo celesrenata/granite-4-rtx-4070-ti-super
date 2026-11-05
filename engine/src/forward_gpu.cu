@@ -2042,6 +2042,14 @@ void gpu_ctx_reset(GpuCtx* ctx) {
   if (ctx != nullptr) (void)gpu_ctx_truncate(ctx, 0);
 }
 
+bool gpu_ctx_is_kv8(const GpuCtx* ctx) {
+  return ctx != nullptr && ctx->kv8;
+}
+
+bool gpu_ctx_is_split_attn(const GpuCtx* ctx) {
+  return ctx != nullptr && ctx->split_attn;
+}
+
 // Test launcher for the coalesced GEMV (consumed by tests/test_kernels.cu and
 // the verify-GEMV parity test): one block per output row, at the forward's
 // launch width. The width matters for bit-identity - the per-lane strided

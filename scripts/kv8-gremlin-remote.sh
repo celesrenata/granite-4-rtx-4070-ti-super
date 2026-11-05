@@ -90,6 +90,7 @@ cmake -B build -S . -G Ninja \
 
 cmake --build build --target granite4-kernel-math-test -j4
 cmake --build build --target granite4-kernel-test -j4
+cmake --build build --target granite4-infer granite4-checkpoint -j4
 
 echo '=== host math test ==='
 ./build/engine/granite4-kernel-math-test

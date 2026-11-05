@@ -92,6 +92,19 @@ int gpu_ctx_written(GpuCtx* ctx);
 // Returns 0 on success, -1 for an invalid/null context or forward position.
 int gpu_ctx_truncate(GpuCtx* ctx, int written);
 
+// True when the persistent KV cache is stored as int8 codes + per-row float
+// scale (Q8_0). Reports the *resolved* mode - i.e. after the split-attention
+// capability check in gpu_ctx_create - so a config that requested KV8 but
+// fell back to bf16 reports false.
+bool gpu_ctx_is_kv8(const GpuCtx* ctx);
+
+// True when the split-KV attention (decode / verify / prefill) is the active
+// path. Implied by gpu_ctx_is_kv8() in the current implementation (KV8 can
+// only use split-KV), but exposed separately because the bf16 mode may use
+// either split-KV or the fused GQA depending on the model shape and
+// G4_SPLIT_ATTN.
+bool gpu_ctx_is_split_attn(const GpuCtx* ctx);
+
 // Compatibility helper: discard the entire KV watermark.
 void gpu_ctx_reset(GpuCtx* ctx);
 

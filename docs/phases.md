@@ -501,6 +501,56 @@ module passes it to the resident CUDA engine. The frontend sends the per-request
 K only when a head is loaded. `GRANITE4_EAGLE_K=0` or an unset head disables
 speculation.
 
+### P4 — KV8 int8 KV-cache A/B (2026-11-04, gremlin-1)
+
+First live measurement of the KV8 (Q8_0 int8) persistent KV cache in the
+forward pass (`G4_KV8=1`), A/B against the bf16 cache, on the same card,
+checkpoint, and build. New `granite4-infer kv-bench` subcommand: loads,
+prefills N deterministic pseudo-tokens (LCG, `--seed 1234`), then runs a
+device-side greedy decode chain of D tokens (the same `gpu_decode_greedy`
+path `generate` uses), and reports prefill/decode times plus free device
+memory right after load. Both modes run split-KV attention
+(`gpu_ctx_is_split_attn` is true in both, reported in the JSON).
+
+| ctx / decode | bf16 prefill | int8 prefill | bf16 decode tps | int8 decode tps | int8 pool saving |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2048 / 256 | 369.1 ms | 452.2 ms | 1680 | 1180 | 184.0 MiB |
+| 4096 / 256 | 897.3 ms | 1361.7 ms | 1542 | 840 | 348.0 MiB |
+| 8192 / 128 | 2109.7 ms | 4265.1 ms | 678 | 267 | 664.0 MiB |
+
+(lowest of 3 runs per cell; `scripts/kv8-ab-bench.sh`). The pool saving is
+the free-memory difference right after load (weights and fixed scratch are
+identical, so the delta is the persistent KV pool): 81.7 KiB/position,
+matching the theory (bf16 K+V 160 KiB/pos → int8 codes 80 KiB + scales
+2.5 KiB = 82.5 KiB; the bf16 path additionally carries no compact-prefix
+scratch, worth ~0.25 KiB/pos). At a 32K pool the int8 cache is ~512 MiB
+smaller per session — enough to double reader slots on the 16 GB card.
+
+Two honest findings:
+
+1. **int8 is slower, not faster.** Prefill 0.50–0.82×, decode 0.39–0.70×,
+   and the decode ratio *worsens with context length* (305 µs/token at
+   4K vs 108 µs/token at 2K for int8, i.e. ~3.4 µs/token/K of context).
+   The split-KV tile-fill dequantizes the int8 codes on every tile read
+   (per-element `kv8_dequant` + `f32_to_bf16` per code, scalar int8 loads
+   instead of the bf16 path's vectorized uint4 loads), while the bf16
+   path copies its cache to shared memory as-is. The decode cost is
+   proportional to the whole KV history, so it scales with context.
+2. **int8 is not token-identical to bf16.** Same 512-token prompt, greedy,
+   40 tokens: first ~15 tokens match, then argmax flips on near-ties and
+   the sequences diverge (expected for per-row-scale int8 KV; the kernel
+   unit tests pass at max |Δ| 0.00098 vs a bf16 reference). KV8 is a
+   memory trade, not a speed feature.
+
+Repro: `scripts/kv8-gremlin-build.sh` then
+`G4_KV8=0 granite4-infer kv-bench --checkpoint CKPT --gpu 1 --bench-ctx
+2048 --bench-decode 256 --seed 1234` (and `G4_KV8=1`). Token-equivalence:
+same command shape via `generate --max-tokens 40`.
+
+Follow-up: vectorize the int8 tile-fill (read codes as uint2/uint4,
+dequant to the bf16 tile in registers, or keep the int8 codes in shared
+memory and dequant in the MMA-ready path) before KV8 can be default.
+
 ### P4 round 2 — end-to-end speed (2026-11-03, gremlin-1)
 
 Same card and checkpoint as above (RTX 4070 Ti SUPER, CUDA 12.9 toolchain
