@@ -390,6 +390,54 @@ __global__ void kv_append_batched_kernel(const std::uint16_t* src_k,
   cache_v[cache_row + static_cast<std::size_t>(pos) * d + i] = src_v[src_off];
 }
 
+// KV8 (Q8_0): int8 form of the batched verify append - `rows` consecutive KV
+// positions, one block per (KV head, row), blockDim.x == d so the row amax is
+// a block reduce. Quantized per row with dev::kv8_* (the committed math).
+__global__ void kv_append_int8_batched_kernel(
+    const std::uint16_t* __restrict__ src_k, const std::uint16_t* __restrict__ src_v,
+    std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
+    float* __restrict__ cache_k_scale, float* __restrict__ cache_v_scale,
+    int base_pos, int rows, int stride, int Hk, int d) {
+  const int hkv = blockIdx.x;
+  const int r = blockIdx.y;
+  const int i = threadIdx.x;  // blockDim.x == d
+  const int pos = base_pos + r;
+  const std::size_t src = (static_cast<std::size_t>(r) * Hk + hkv) * d + i;
+  const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + pos) * d + i;
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + pos;
+  const float x = bf16_to_f32(src_k[src]);
+  const float y = bf16_to_f32(src_v[src]);
+  __shared__ float smax[2];
+  const int lane = i & 31;
+  float ax = fabsf(x), ay = fabsf(y);
+  for (int off = 16; off > 0; off >>= 1) {
+    ax = fmaxf(ax, __shfl_down_sync(0xffffffffu, ax, off));
+    ay = fmaxf(ay, __shfl_down_sync(0xffffffffu, ay, off));
+  }
+  __shared__ float wmax[2][32];
+  if (lane == 0) {
+    wmax[0][i >> 5] = ax;
+    wmax[1][i >> 5] = ay;
+  }
+  __syncthreads();
+  float mk = 0.0f, mv = 0.0f;
+  for (int w = 0; w < (d + 31) >> 5; ++w) {
+    mk = fmaxf(mk, wmax[0][w]);
+    mv = fmaxf(mv, wmax[1][w]);
+  }
+  if (i == 0) {
+    const float sk = dev::kv8_scale(mk);
+    const float sv = dev::kv8_scale(mv);
+    smax[0] = sk;
+    smax[1] = sv;
+    cache_k_scale[sc] = sk;
+    cache_v_scale[sc] = sv;
+  }
+  __syncthreads();
+  cache_k[cache] = dev::kv8_quant(x, smax[0]);
+  cache_v[cache] = dev::kv8_quant(y, smax[1]);
+}
+
 // Row blockIdx.y attends to its causal prefix [0, base_kv + row + 1).
 __global__ void gqa_fused_batched_kernel(const std::uint16_t* q,
                                          const std::uint16_t* k,
@@ -910,6 +958,31 @@ int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
       dim3(static_cast<unsigned int>((static_cast<std::size_t>(Hk) * d + 255u) / 256u),
            static_cast<unsigned int>(rows)),
       256>>>(d_src_k, d_src_v, d_cache_k, d_cache_v, base_pos, rows, stride, Hk, d);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
+int granite4_kernel_kv_append_int8_batched(const std::uint16_t* d_src_k,
+                                           const std::uint16_t* d_src_v,
+                                           std::int8_t* d_cache_k,
+                                           std::int8_t* d_cache_v,
+                                           float* d_cache_k_scale,
+                                           float* d_cache_v_scale, int base_pos,
+                                           int rows, int stride, int Hk, int d) {
+  if (d_src_k == nullptr || d_src_v == nullptr || d_cache_k == nullptr ||
+      d_cache_v == nullptr || d_cache_k_scale == nullptr ||
+      d_cache_v_scale == nullptr || base_pos < 0 || rows <= 0 ||
+      rows > granite4::kMaxVerifyRows || Hk <= 0 || d <= 0 || d > 1024 ||
+      base_pos > INT_MAX - rows || stride < base_pos + rows ||
+      static_cast<long long>(Hk) * d > INT_MAX || stride > INT_MAX / std::max(Hk, 1))
+    return -1;
+  // One block per (KV head, row); blockDim.x == d so the row amax is a block
+  // reduce (the bf16 form uses a flat per-element grid).
+  granite4::kv_append_int8_batched_kernel<<<dim3(static_cast<unsigned int>(Hk),
+                                                 static_cast<unsigned int>(rows)),
+                                             static_cast<unsigned int>(d)>>>
+      (d_src_k, d_src_v, d_cache_k, d_cache_v, d_cache_k_scale, d_cache_v_scale,
+       base_pos, rows, stride, Hk, d);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }

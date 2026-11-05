@@ -154,10 +154,17 @@ std::size_t attn_split_scratch_bytes(int Hq, int rows, int stride);
 int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                int kv_base, const int* d_pos, int rows, int stride, void* scratch,
-               std::uint16_t* out);
+               std::uint16_t* out, const std::int8_t* cache_k8 = nullptr,
+               const std::int8_t* cache_v8 = nullptr,
+               const float* cache_k_scale = nullptr,
+               const float* cache_v_scale = nullptr, bool int8 = false);
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
-                      int base_pos, int rows, int stride, std::uint16_t* out);
+                      int base_pos, int rows, int stride, std::uint16_t* out,
+                      const std::int8_t* cache_k8 = nullptr,
+                      const std::int8_t* cache_v8 = nullptr,
+                      const float* k_scale = nullptr, const float* v_scale = nullptr,
+                      bool int8 = false);
 }
 
 namespace {
