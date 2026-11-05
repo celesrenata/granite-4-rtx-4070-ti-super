@@ -121,10 +121,16 @@ Findings:
   2 sessions; single long context tops out at 32768.
 - Consequence for the serve loop: `--sessions` is bounded by VRAM, not just by
   the `kMaxSessions = 16` code limit. On this card, `--sessions N` is only
-  safe for `N × max_context ≤ ~32768`. Production runs `--sessions 1` with
-  `GRANITE4_MAX_CONTEXT=8192` (8192 pool, 10350 MiB) and has room to either
-  widen the single context to 32768 or raise sessions to 4 before the pool
-  would exceed the measured ceiling.
+  safe for `N × max_context ≤ ~32768`. Note the live deployment's serve
+  command never passes `--sessions` (API default 1), and EAGLE requires
+  `--sessions 1` (the head's scratch/KV are per-session), so **context
+  length is the only production axis**. Production (deployed 2026-11-05) now
+  runs `--sessions 1` with `maxContext = 32768` at the measured ceiling:
+  ~14.5–14.9 GiB with the EAGLE r8 head (the 32768 rows above are headless;
+  the head adds ~420 MiB), leaving ~1.5–2 GiB for the co-resident venv
+  python. Verified live: a 14,838-token prompt (1.8× the old 8192 limit)
+  served end-to-end through the EAGLE path, and the API's
+  `context_length_exceeded` error now reports the 32768 bound.
 
 ## Budget (FP8 weights + FP8 KV), ~14.9 GiB usable
 
