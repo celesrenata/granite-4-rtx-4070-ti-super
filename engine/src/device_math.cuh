@@ -81,6 +81,46 @@ __device__ __forceinline__ void fp8x4_to_f32(std::uint32_t w, float& b0, float& 
   b3 = hi.y;
 }
 
+// ---------------------------------------------------------------------------
+// KV8 (Q8_0) int8 KV cache math.
+//
+// The persistent KV cache (and the EAGLE head's own cache) is stored int8:
+// each (head, position) row of d elements shares one float scale, s, chosen
+// from the row's absolute maximum so the largest magnitude maps to the
+// largest int8 code (127). Quantize: q_i = clamp(round(x_i / s), -127, 127).
+// Dequant: x_i ~= q_i * s.
+//
+// Round-trip error is bounded by half a quantization step, |x_i - q_i*s| <=
+// s/2, so the worst-case relative error is (1/127)/2 ~= 0.4% ~= 2^-8. That
+// is below BF16 precision but enough to move a 2-ULP teacher-forced parity
+// gate, so KV8 is opt-in (G4_KV8) and the BF16 cache stays the default the
+// production gate runs on.
+//
+// The device and host twins below stay bit-identical: IEEE RNE division
+// (x / s), RNE round-to-even for the int code, then clamp to [-127, 127].
+// A zero row keeps s == 0 and quantizes to all-zero codes (dequant exactly
+// 0.0; no NaN from dividing by zero).
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float kv8_scale(float amax) {
+  // s = amax / 127 (IEEE RNE division). amax is a max of absolute values.
+  return amax / 127.0f;
+}
+
+__device__ __forceinline__ std::int8_t kv8_quant(float x, float scale) {
+  if (scale == 0.0f) return 0;
+  // Round-half-away-from-zero (matches the host twin's std::round exactly);
+  // the IEEE division x / s is correctly rounded, so device and host agree on
+  // the code bit-for-bit.
+  const long r = __float2round(x / scale);
+  const long clamped = r > 127 ? 127 : (r < -127 ? -127 : r);
+  return static_cast<std::int8_t>(clamped);
+}
+
+__device__ __forceinline__ float kv8_dequant(std::int8_t q, float scale) {
+  return scale * static_cast<float>(q);
+}
+
 }  // namespace dev
 }  // namespace granite4
 

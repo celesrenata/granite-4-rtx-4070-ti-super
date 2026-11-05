@@ -61,6 +61,31 @@ inline float fp8_to_f32_host(std::uint8_t x) {
 }
 
 // ---------------------------------------------------------------------------
+// KV8 (Q8_0) int8 KV cache - host twin of dev::kv8_*.
+//
+// s = amax / 127 (IEEE RNE); q = clamp(round_even(x / s), -127, 127);
+// dequant = s * q. Must stay bit-identical to the device math so the GPU
+// round-trip test compares against the exact host reference.
+// ---------------------------------------------------------------------------
+
+inline float kv8_scale_host(float amax) {
+  return amax / 127.0f;
+}
+
+inline std::int8_t kv8_quant_host(float x, float scale) {
+  if (scale == 0.0f) return 0;
+  // Float division + round-half-away-from-zero, mirroring dev::kv8_quant
+  // (__float2round) exactly so device and host produce identical codes.
+  const float r = std::round(x / scale);
+  const long long clamped = r > 127.0f ? 127 : (r < -127.0f ? -127 : static_cast<long long>(r));
+  return static_cast<std::int8_t>(clamped);
+}
+
+inline float kv8_dequant_host(std::int8_t q, float scale) {
+  return scale * static_cast<float>(q);
+}
+
+// ---------------------------------------------------------------------------
 // RMSNorm (float reference). n is the hidden size (one row).
 // ---------------------------------------------------------------------------
 

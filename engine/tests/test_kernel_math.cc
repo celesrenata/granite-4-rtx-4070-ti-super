@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using namespace granite4;
@@ -717,6 +718,51 @@ static void test_gemm_dequant() {
     expect(std::fabs(C[i] - want[i]) < 1e-4f, "gemm dequant element");
 }
 
+// ---------------------------------------------------------------------------
+// KV8 (Q8_0) int8 KV cache - host reference math.
+// ---------------------------------------------------------------------------
+static void test_kv8() {
+  // s = amax / 127 exactly when 127 divides cleanly.
+  expect(kv8_scale_host(127.0f) == 1.0f, "kv8 scale(127) == 1");
+  // Quantize: round-half-away-from-zero, clamped to [-127, 127].
+  expect(kv8_quant_host(0.0f, 1.0f) == 0, "kv8 quant(0) == 0");
+  expect(kv8_quant_host(1.0f, 1.0f) == 1, "kv8 quant(1) == 1");
+  expect(kv8_quant_host(-1.0f, 1.0f) == -1, "kv8 quant(-1) == -1");
+  expect(kv8_quant_host(127.0f, 1.0f) == 127, "kv8 quant(127) == 127");
+  expect(kv8_quant_host(-127.0f, 1.0f) == -127, "kv8 quant(-127) == -127");
+  expect(kv8_quant_host(127.4f, 1.0f) == 127, "kv8 quant clamps to +127");
+  expect(kv8_quant_host(-127.4f, 1.0f) == -127, "kv8 quant clamps to -127");
+  // A zero scale (all-zero row) quantizes everything to 0 (no divide-by-zero).
+  expect(kv8_quant_host(1.0f, 0.0f) == 0, "kv8 quant scale==0 -> 0");
+  expect(kv8_dequant_host(0, 0.0f) == 0.0f, "kv8 dequant zero row == 0");
+  // Round-half-away-from-zero at an exact half code.
+  expect(kv8_quant_host(0.5f, 1.0f) == 1, "kv8 quant(0.5) -> 1 (half away)");
+  expect(kv8_quant_host(-0.5f, 1.0f) == -1, "kv8 quant(-0.5) -> -1 (half away)");
+
+  // Row round-trip: worst absolute error is bounded by half a quantization
+  // step (s/2 = amax/254), and dequant is exact.
+  Xorshift64 rng(0x8ab4);
+  const int rows = 512, d = 128;
+  float worst = 0.0f;
+  for (int r = 0; r < rows; ++r) {
+    const float amax = std::fabs(rng.next_float_range(1.0f)) * (1.0f + r % 7);
+    float s = kv8_scale_host(amax);
+    for (int i = 0; i < d; ++i) {
+      const float x = rng.next_float_range(amax);
+      const std::int8_t q = kv8_quant_host(x, s);
+      const float dq = kv8_dequant_host(q, s);
+      if (dq != s * static_cast<float>(q)) expect(false, "kv8 dequant == s*q");
+      // Error bounded by half a step: |x - s*q| <= s/2.
+      const float err = std::fabs(x - dq);
+      const float half_step = (amax != 0.0f) ? (s * 0.5f) : 0.0f;
+      if (err > half_step + 1e-7f) expect(false, "kv8 round-trip within half step");
+      worst = std::max(worst, amax != 0.0f ? err / std::max(amax, 1e-30f) : 0.0f);
+    }
+  }
+  // The relative-to-row-max error never exceeds 1/254 (= 0.5 * 1/127).
+  expect(worst <= 1.0f / 254.0f + 1e-6f, "kv8 worst relative error <= amax/254");
+}
+
 static void test_rng() {
   Xorshift64 a(123), b(123), c(456);
   for (int i = 0; i < 1000; ++i) expect(a.next() == b.next(), "rng same seed same stream");
@@ -757,6 +803,7 @@ int main() {
   test_silu_gate_up();
   test_sampling();
   test_gemm_dequant();
+  test_kv8();
   test_rng();
   if (g_failures == 0) std::printf("all kernel-math reference tests passed\n");
   return g_failures == 0 ? 0 : 1;

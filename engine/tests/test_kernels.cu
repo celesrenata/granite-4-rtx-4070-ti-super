@@ -289,6 +289,119 @@ static void test_fp8_hw_decode() {
   expect(bad == 0, "fp8x4_to_f32 hardware decode bit-exact on all finite codes");
 }
 
+// ---------------------------------------------------------------------------
+// KV8 (Q8_0) int8 KV cache: the device quantize/dequant (dev::kv8_*) must match
+// the host twin bit-for-bit (identical int codes, identical dequant) and the
+// row round-trip must stay within half a quantization step.
+// ---------------------------------------------------------------------------
+
+// One thread per row: quantize a bf16 row (amax -> scale -> codes) on the
+// device and write codes + scale. The host recomputes the same and compares.
+__global__ void kv8_row_quant_kernel(const std::uint16_t* x, std::int8_t* q,
+                                    float* scale, int rows, int d) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  const std::uint16_t* row = x + static_cast<std::size_t>(r) * d;
+  float amax = 0.0f;
+  for (int i = 0; i < d; ++i)
+    amax = fmaxf(amax, fabsf(granite4::dev::bf16_to_f32(row[i])));
+  const float s = granite4::dev::kv8_scale(amax);
+  scale[r] = s;
+  std::int8_t* codes = q + static_cast<std::size_t>(r) * d;
+  for (int i = 0; i < d; ++i)
+    codes[i] = granite4::dev::kv8_quant(granite4::dev::bf16_to_f32(row[i]), s);
+}
+
+static void test_kv8_device() {
+  const int rows = 256, d = 128;  // head_dim of the model
+  Xorshift64 rng(0x8abc);
+  // A mix of magnitudes so the scale is exercised across its range: small,
+  // typical (O(1)) and large, plus an all-zero row (scale == 0) and a
+  // near-tie row.
+  std::vector<std::uint16_t> hx(static_cast<std::size_t>(rows) * d);
+  for (int r = 0; r < rows; ++r) {
+    float scale = 1.0f;
+    if (r == 0) scale = 0.0f;                        // all-zero row
+    else if (r == 1) scale = 1e-5f;                  // subnormal-ish amax
+    else if (r % 4 == 0) scale = 0.25f;
+    else if (r % 4 == 1) scale = 3.0f;
+    else if (r % 4 == 2) scale = 32.0f;
+    else scale = 256.0f;
+    for (int i = 0; i < d; ++i) {
+      const float v = rng.next_float_range(scale);
+      hx[static_cast<std::size_t>(r) * d + i] = f32_to_bf16_host(v);
+    }
+  }
+  std::uint16_t* d_x = nullptr;
+  std::int8_t* d_q = nullptr;
+  float* d_s = nullptr;
+  if (cudaMalloc(&d_x, hx.size() * 2) != cudaSuccess ||
+      cudaMalloc(&d_q, hx.size()) != cudaSuccess ||
+      cudaMalloc(&d_s, rows * sizeof(float)) != cudaSuccess ||
+      cudaMemcpy(d_x, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice) !=
+          cudaSuccess) {
+    ++g_failures;
+    if (d_x) cudaFree(d_x);
+    if (d_q) cudaFree(d_q);
+    if (d_s) cudaFree(d_s);
+    return;
+  }
+  kv8_row_quant_kernel<<<(rows + 255) / 256, 256>>>(d_x, d_q, d_s, rows, d);
+  std::vector<std::int8_t> hq(hx.size());
+  std::vector<float> hs(rows);
+  CUDA_CHECK(cudaMemcpy(hq.data(), d_q, hx.size(), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hs.data(), d_s, rows * sizeof(float), cudaMemcpyDeviceToHost));
+  cudaFree(d_x);
+  cudaFree(d_q);
+  cudaFree(d_s);
+
+  int bad_code = 0, bad_scale = 0, bad_dequant = 0, bad_bound = 0;
+  float worst_rel = 0.0f;
+  for (int r = 0; r < rows; ++r) {
+    float amax = 0.0f;
+    for (int i = 0; i < d; ++i)
+      amax = std::max(amax, std::fabs(bf16_to_f32_host(hx[static_cast<std::size_t>(r) * d + i])));
+    const float s_ref = kv8_scale_host(amax);
+    if (hs[r] != s_ref && bad_scale < 4) {
+      std::printf("  kv8 scale mismatch row=%d dev=%a ref=%a\n", r, hs[r], s_ref);
+      ++bad_scale;
+    }
+    for (int i = 0; i < d; ++i) {
+      const float x = bf16_to_f32_host(hx[static_cast<std::size_t>(r) * d + i]);
+      const std::int8_t q_ref = kv8_quant_host(x, s_ref);
+      const std::int8_t q_dev = hq[static_cast<std::size_t>(r) * d + i];
+      if (q_dev != q_ref && bad_code < 8) {
+        std::printf("  kv8 code mismatch row=%d i=%d x=%a dev=%d ref=%d\n", r, i, x,
+                    q_dev, q_ref);
+        ++bad_code;
+      }
+      // dequant bit-exact + round-trip error bound.
+      const float dq_dev = hs[r] * static_cast<float>(q_dev);
+      const float dq_ref = kv8_dequant_host(q_ref, s_ref);
+      std::uint32_t bits_dev, bits_ref;
+      std::memcpy(&bits_dev, &dq_dev, 4);
+      std::memcpy(&bits_ref, &dq_ref, 4);
+      if (bits_dev != bits_ref) {
+        if (bad_dequant < 8)
+          std::printf("  kv8 dequant mismatch row=%d i=%d dev=%a ref=%a\n", r, i, dq_dev,
+                      dq_ref);
+        ++bad_dequant;
+      }
+      if (x != 0.0f && hs[r] != 0.0f) {
+        const float rel = std::fabs(x - dq_dev) / std::fabs(x);
+        worst_rel = std::max(worst_rel, rel);
+        if (rel > 0.006f) ++bad_bound;  // > 2 * (1/127) = ~1.57% (safety margin)
+      }
+    }
+  }
+  expect(bad_code == 0, "kv8 int8 quantize codes bit-exact device vs host");
+  expect(bad_scale == 0, "kv8 row scale bit-exact device vs host");
+  expect(bad_dequant == 0, "kv8 dequant bit-exact device vs host");
+  expect(bad_bound == 0, "kv8 round-trip within 2*step (per-element rel error)");
+  if (g_failures == 0)
+    std::printf("  kv8 worst per-element rel error: %.4f (bound 0.0079)\n", worst_rel);
+}
+
 static void test_rmsnorm_device() {
   const int rows = 64, cols = 256;
   const float eps = 1e-5f;
@@ -1695,6 +1808,7 @@ int main() {
   test_arch_probe();
   test_fp8_decode_all();
   test_fp8_hw_decode();
+  test_kv8_device();
   test_rmsnorm_device();
   test_rope_device();
   test_softmax_device();
