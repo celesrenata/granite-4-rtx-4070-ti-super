@@ -128,8 +128,13 @@ Findings:
   runs `--sessions 1` with `maxContext = 32768` at the measured ceiling:
   ~14.5–14.9 GiB with the EAGLE r8 head (the 32768 rows above are headless;
   the head adds ~420 MiB), leaving ~1.5–2 GiB for the co-resident venv
-  python. Verified live: a 14,838-token prompt (1.8× the old 8192 limit)
-  served end-to-end through the EAGLE path, and the API's
+  python; the first prefill then lazily claims a bounded ~0.8 GiB of
+  activation scratch (one-time, does not scale with prompt length — a
+  ~29000-token prompt holds at the same ~15.2 GiB), so steady state is
+  ~15.2 GiB for the engine (~0.4 GiB free on the card after the
+  co-resident venv python). Verified live: a 14,838-token
+  prompt (1.8× the old 8192 limit) and a ~29000-token prompt both served
+  end-to-end through the EAGLE path, and the API's
   `context_length_exceeded` error now reports the 32768 bound.
 
 ## Budget (FP8 weights + FP8 KV), ~14.9 GiB usable
