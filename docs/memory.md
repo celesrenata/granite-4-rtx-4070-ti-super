@@ -81,6 +81,51 @@ sequence's pages into the contiguous `[Hk, kv_len, d]` layout the P2 attention
 kernel consumes; the byte placement it compacts from is exactly the
 `KvLayout::offset` layout above.
 
+## Measured KV ceiling (implemented GPU direct-KV, gremlin-1)
+
+The above layout is what the live serve path uses (bf16 KV, one persistent
+`[L][Hk][max_pos][d]` K and V buffer per session; weights shared across
+sessions). Measured on the RTX 4070 Ti SUPER (16376 MiB) by launching
+`serve --sessions N --max-context C`, waiting for the `ready` line (printed
+after weights + all session KV + per-session warm-up), and sampling the
+process's `nvidia-smi` `used_memory`:
+
+| sessions | max_context | pool (positions) | used (MiB) |
+| ---: | ---: | ---: | ---: |
+| 1 | 8192 | 8192 | 10350 |
+| 1 | 16384 | 16384 | 11698 |
+| 1 | 24576 | 24576 | 13000 |
+| 1 | 32768 | 32768 | 14332 |
+| 2 | 16384 | 32768 | 14408 |
+| 4 | 8192 | 32768 | 14432 |
+| 1 | 40960 | 40960 | **OOM** (`gpu_ctx_create failed`) |
+| 2 | 24576 | 49152 | **OOM** |
+| 5 | 8192 | 40960 | **OOM** |
+
+Findings:
+
+- **Weights + CUDA runtime + fixed per-session scratch ≈ 8.8 GiB** (the
+  10350 MiB baseline minus the 8192-position KV and compact buffers). This is
+  the floor: even a zero-KV engine holds ~9 GiB. (The live production process
+  adds the EAGLE r8 head, ~420 MiB — hence its ~10.8 GiB footprint.)
+- **KV + compact costs ~162 MiB per 1000 positions per session** (theoretical
+  KV is 160 KiB/position; the extra ~2 KiB is the per-layer compact buffer).
+  Each 8192-position block costs ~1.30–1.35 GiB, so the pool grows linearly
+  and predictably.
+- **Practical ceiling ≈ 32768 pool positions** (~14.3–14.4 GiB, leaving ~2 GiB
+  headroom). Anything at a 40960-position pool OOMs at `cudaMalloc`. The
+  pool is `sessions × max_context`; the same 32768 positions can be shaped as
+  1×32768, 2×16384, or 4×8192 — session count and context trade off one-for-
+  one against each other.
+- **Max concurrency at 8192 context = 4 sessions** (5 OOMs); at 16384 it is
+  2 sessions; single long context tops out at 32768.
+- Consequence for the serve loop: `--sessions` is bounded by VRAM, not just by
+  the `kMaxSessions = 16` code limit. On this card, `--sessions N` is only
+  safe for `N × max_context ≤ ~32768`. Production runs `--sessions 1` with
+  `GRANITE4_MAX_CONTEXT=8192` (8192 pool, 10350 MiB) and has room to either
+  widen the single context to 32768 or raise sessions to 4 before the pool
+  would exceed the measured ceiling.
+
 ## Budget (FP8 weights + FP8 KV), ~14.9 GiB usable
 
 | Item | Budget |
