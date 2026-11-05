@@ -1045,6 +1045,9 @@ int gpu_serve_cmd(const Args& cli) {
       next = dec.next;
       err.clear();
       GpuSession& s = sessions[picked];
+      if (std::getenv("G4_SERVE_DEBUG") != nullptr)
+        std::fprintf(stderr, "G4_SERVE session=%d resume=%d prompt=%ld wm=%d\n",
+                     picked, resume, static_cast<long>(a.tokens.size()), s.written());
       // The watermark before this turn. Used below to tell a check_request
       // rejection (no GPU work ran, session untouched) apart from a
       // mid-generation failure (a forward completed and the watermark
