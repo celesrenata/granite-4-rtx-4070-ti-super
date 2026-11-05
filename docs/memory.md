@@ -137,6 +137,50 @@ Findings:
   end-to-end through the EAGLE path, and the API's
   `context_length_exceeded` error now reports the 32768 bound.
 
+## Reader-tier deployment target (2026-11-04)
+
+Granite 4.2 8B is deployed as a dedicated reader on this card. Context is a
+tier, not a capacity: readers are bounded investigations returning short
+structured summaries, so slots are sized per job class.
+
+| Reader tier | Context | Parallelism target |
+| --- | ---: | ---: |
+| `reader/fast` | 32K | 4 slots |
+| `reader/standard` | 64K | 2 slots |
+| `reader/long` | 128K | 1 slot (escalation only) |
+
+These tiers share one pool: 4×32K, 2×64K, and 1×128K are all 131072 pool
+positions (the same 32K-shape trade-off as before, re-expressed). Output
+budget per slot: reserve 2–4K tokens for the response. Do not carry the
+hybrid-attention Qwen readers' 262K/slot configuration over: Granite's full
+attention makes that ~41 GiB at Q4_0 KV.
+
+The working deployment (llama.cpp, outside this engine) baselines on:
+
+- Weights **Q4_K_M** (~5 GiB) with Q5_K_M as the quality benchmark.
+- KV **Q4_0** (llama.cpp block storage, 4.25 bits/element + 64-element
+  block scales): 5.63 GiB at 128K pool positions, 1.41 GiB at 32K.
+- Full-attention reference: 40 layers × 8 KV heads × 128 head dim, 131072
+  configured context. llama.cpp table, per sequence: FP16 20 GiB @ 128K,
+  Q8_0 10.63 GiB, Q4_0 5.63 GiB.
+
+Reconciliation against *this* engine (measured 8.8 GiB floor, ~14.9 GiB
+usable, pool = sessions × context):
+
+| Engine KV format | Bytes/pos | Capacity at FP8 weights |
+| --- | ---: | --- |
+| BF16 (live path, measured) | 160 KiB | 32768 positions (the ceiling above) |
+| int8 Q8_0-style (KV8; `engine/src/kernel_math.h`, device + host tests) | ~82.5 KiB | ~78K ⇒ **64K × 1 / 32K × 2** |
+| Q4_0-style (follow-up) | ~41 KiB | ~156K ⇒ **64K × 2 / 128K × 1 / 32K × 4** |
+
+So in-engine: int8 KV8 unlocks `reader/standard` (64K) today; Q4_0 KV is the
+follow-up that unlocks the full 2-slot baseline. A Q4_K_M *weight* path is
+not yet supported by this engine (FP8/BF16 only), so the llama.cpp server
+remains the reference deployment until it lands. The FP8 paged pool
+(`kv_pool.h`, `kernels_phase3.cu`) stays test-only until the live path
+switches to it; the EAGLE draft head keeps its 1-layer BF16 KV (per-session
+footprint is negligible; conversion is deferred with the quality evidence).
+
 ## Budget (FP8 weights + FP8 KV), ~14.9 GiB usable
 
 | Item | Budget |
