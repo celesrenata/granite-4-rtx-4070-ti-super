@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -52,6 +53,22 @@ int granite4_kernel_verify_qkv_stage(const std::uint16_t*, const std::uint16_t*,
                                      const std::uint16_t*, const float*, const float*, int, int,
                                      int, int, int, int, std::uint16_t*, std::uint16_t*,
                                      std::uint16_t*, std::uint16_t*);
+// Quantized draft KV: rotate K in place at [pos0..pos0+rows) (Q rotation is
+// done by the caller on the bf16 q), then append the rotated K + raw V to the
+// persistent pool with a per-row scale. int8 (Q8_0) and int4 (Q4_0) forms.
+int granite4_kernel_kv_append_int8_batched(const std::uint16_t* d_src_k,
+                                           const std::uint16_t* d_src_v,
+                                           std::int8_t* d_cache_k, std::int8_t* d_cache_v,
+                                           float* d_cache_k_scale, float* d_cache_v_scale,
+                                           int base_pos, int rows, int stride, int Hk, int d);
+int granite4_kernel_kv_append_int4_batched(const std::uint16_t* d_src_k,
+                                           const std::uint16_t* d_src_v,
+                                           std::uint8_t* d_cache_k, std::uint8_t* d_cache_v,
+                                           float* d_cache_k_scale, float* d_cache_v_scale,
+                                           int base_pos, int rows, int stride, int Hk, int d);
+int granite4_kernel_rope_at_pos_batched(const std::uint16_t* d_x,
+                                        const float* d_cos, const float* d_sin, int rows,
+                                        int heads, int d, std::uint16_t* d_out);
 int granite4_rope_tables_build(double, int, int, float**, float**);
 }
 
@@ -167,6 +184,15 @@ struct EagleHead {
   const std::uint16_t* embed = nullptr;
   std::int32_t* vocab = nullptr;
   std::uint16_t *kv_k = nullptr, *kv_v = nullptr;
+  // Quantized persistent draft KV (G4_DRAFT_KV, default 16 = bf16): 8 or 4-bit
+  // Q8_0/Q4_0 codes + a per-(head,position) float scale. bf16 kv_k/kv_v hold
+  // the 16-bit pool; the *_8/_4 pools hold the quantized ones. kv_bits is the
+  // selected width (16/8/4).
+  int kv_bits = 16;
+  std::int8_t *kv8_k = nullptr, *kv8_v = nullptr;
+  float *kv8_k_scale = nullptr, *kv8_v_scale = nullptr;
+  std::uint8_t *kv4_k = nullptr, *kv4_v = nullptr;
+  float *kv4_k_scale = nullptr, *kv4_v_scale = nullptr;
   float *cos_tbl = nullptr, *sin_tbl = nullptr;
   void* attn_scratch = nullptr;
   std::uint16_t* scratch = nullptr;  // per-row buffers for kMaxVerifyRows rows
@@ -349,12 +375,47 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
       !h->alloc(&h->lm, static_cast<std::size_t>(h->Vd) * H, err))
     return nullptr;
   gather_rows_kernel<<<dim3((h->H + 255) / 256, h->Vd), 256>>>(lm_head, h->vocab, h->H, h->lm);
+  // G4_DRAFT_KV sets the persistent draft KV width: 16 (bf16, default), 8
+  // (Q8_0), or 4 (Q4_0). The quantized pools are 2x (8-bit) and 4x (4-bit)
+  // smaller than the bf16 pool, which is what lets the 131K reader pool fit
+  // the draft head on a 16 GiB card. Both require the split-KV attention
+  // shape (d==128, Hq==4*Hk); anything else falls back to bf16.
+  const char* const dkv_env = std::getenv("G4_DRAFT_KV");
+  h->kv_bits = 16;
+  if (dkv_env != nullptr) {
+    const char* end = nullptr;
+    const long v = std::strtol(dkv_env, const_cast<char**>(&end), 10);
+    if (end != nullptr && *end == '\0' && (v == 8 || v == 4) && h->d == 128 &&
+        h->Hq == 4 * h->Hk)
+      h->kv_bits = static_cast<int>(v);
+  }
   const std::size_t kv = static_cast<std::size_t>(h->Hk) * max_pos * h->d * 2;
-  if (!h->alloc(&h->kv_k, kv, err) || !h->alloc(&h->kv_v, kv, err) ||
-      !h->alloc(&h->attn_scratch, attn_split_scratch_bytes(h->Hq, kMaxVerifyRows, max_pos), err) ||
-      !h->alloc(&h->scratch, row_elems(*h) * kMaxVerifyRows * 2, err) ||
-      !h->alloc(&h->logits, static_cast<std::size_t>(h->Vd) * 2, err))
-    return nullptr;
+  const std::size_t kv_quant = static_cast<std::size_t>(h->Hk) * max_pos *
+                               static_cast<std::size_t>(h->d);
+  const std::size_t kv4_quant = kv_quant / 2;
+  const std::size_t kv_scale = static_cast<std::size_t>(h->Hk) * max_pos * 4;
+  bool ok = true;
+  switch (h->kv_bits) {
+  case 8:
+    ok = h->alloc(&h->kv8_k, kv_quant, err) && h->alloc(&h->kv8_v, kv_quant, err) &&
+         h->alloc(&h->kv8_k_scale, kv_scale, err) &&
+         h->alloc(&h->kv8_v_scale, kv_scale, err);
+    break;
+  case 4:
+    ok = h->alloc(&h->kv4_k, kv4_quant, err) && h->alloc(&h->kv4_v, kv4_quant, err) &&
+         h->alloc(&h->kv4_k_scale, kv_scale, err) &&
+         h->alloc(&h->kv4_v_scale, kv_scale, err);
+    break;
+  default:
+    ok = h->alloc(&h->kv_k, kv, err) && h->alloc(&h->kv_v, kv, err);
+    break;
+  }
+  if (ok)
+    ok = h->alloc(&h->attn_scratch, attn_split_scratch_bytes(h->Hq, kMaxVerifyRows, max_pos),
+                  err);
+  if (ok) ok = h->alloc(&h->scratch, row_elems(*h) * kMaxVerifyRows * 2, err);
+  if (ok) ok = h->alloc(&h->logits, static_cast<std::size_t>(h->Vd) * 2, err);
+  if (!ok) return nullptr;
   if (granite4_rope_tables_build(spec.rope_theta, h->d, max_pos, &h->cos_tbl, &h->sin_tbl) != 0) {
     *err = "eagle head: rope tables";
     return nullptr;
@@ -400,14 +461,45 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
     bias_kernel<<<dim3((H + 255) / 256, R), 256>>>(x, h->bias, H);
     if (granite4_kernel_rmsnorm(x, h->ln1, h->eps, R, H, xn) != 0 ||
         granite4_verify_qkv(xn, h->wq, h->wk, h->wv, h->sc[1], h->sc[2], h->sc[3], R, nq, nk, nk,
-                            H, q, k, v) != 0 ||
-        granite4_kernel_verify_qkv_stage(q, k, v, h->cos_tbl + static_cast<std::size_t>(p) * half,
-                                         h->sin_tbl + static_cast<std::size_t>(p) * half, p, R,
-                                         h->Hq, h->Hk, h->d, h->max_pos, qr, kr, h->kv_k,
-                                         h->kv_v) != 0 ||
-        attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
-                   h->max_pos, h->attn_scratch, att) != 0 ||
-        granite4_verify_gemv_resid(att, h->wo, h->sc[4], x, 1.0f, R, H, nq, hh) != 0 ||
+                            H, q, k, v) != 0)
+      return -1;
+    if (h->kv_bits == 4 || h->kv_bits == 8) {
+      // Quantized draft KV: rotate Q and K into qr/kr at [p, p+R) (in-place
+      // would race on the +/-half pairs), append the rotated K + raw V to the
+      // persistent pool (Q8_0/Q4_0 codes + per-row scale), and attend over the
+      // full prefix with dequant on load.
+      const std::size_t cosp = static_cast<std::size_t>(p) * half;
+      if (granite4_kernel_rope_at_pos_batched(q, h->cos_tbl + cosp, h->sin_tbl + cosp, R,
+                                              h->Hq, h->d, qr) != 0 ||
+          granite4_kernel_rope_at_pos_batched(k, h->cos_tbl + cosp, h->sin_tbl + cosp, R,
+                                              h->Hk, h->d, kr) != 0)
+        return -1;
+      if (h->kv_bits == 8) {
+        if (granite4_kernel_kv_append_int8_batched(kr, v, h->kv8_k, h->kv8_v, h->kv8_k_scale,
+                                                  h->kv8_v_scale, p, R, h->max_pos, h->Hk,
+                                                  h->d) != 0 ||
+            attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
+                       h->max_pos, h->attn_scratch, att, h->kv8_k, h->kv8_v, h->kv8_k_scale,
+                       h->kv8_v_scale, true, nullptr, nullptr, false) != 0)
+          return -1;
+      } else {
+        if (granite4_kernel_kv_append_int4_batched(kr, v, h->kv4_k, h->kv4_v, h->kv4_k_scale,
+                                                  h->kv4_v_scale, p, R, h->max_pos, h->Hk,
+                                                  h->d) != 0 ||
+            attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
+                       h->max_pos, h->attn_scratch, att, nullptr, nullptr, nullptr, nullptr,
+                       false, h->kv4_k, h->kv4_v, true) != 0)
+          return -1;
+      }
+    } else if (granite4_kernel_verify_qkv_stage(
+                   q, k, v, h->cos_tbl + static_cast<std::size_t>(p) * half,
+                   h->sin_tbl + static_cast<std::size_t>(p) * half, p, R, h->Hq, h->Hk, h->d,
+                   h->max_pos, qr, kr, h->kv_k, h->kv_v) != 0 ||
+               attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
+                          h->max_pos, h->attn_scratch, att) != 0) {
+      return -1;
+    }
+    if (granite4_verify_gemv_resid(att, h->wo, h->sc[4], x, 1.0f, R, H, nq, hh) != 0 ||
         granite4_kernel_rmsnorm(hh, h->ln2, h->eps, R, H, hn) != 0 ||
         granite4_verify_silu(h->wg, h->wu, hn, h->sc[5], h->sc[6], I, H, R, act) != 0 ||
         granite4_verify_gemv_resid(act, h->wd, h->sc[7], hh, 1.0f, R, H, I, hh) != 0 ||
