@@ -177,7 +177,10 @@ So in-engine: int8 KV8 unlocks `reader/standard` (64K) today, and the
 int4 KV4 path (`G4_KV8=4`, flake option `kv4 = true`) is the one that
 unlocks the full 131072-position reader pool on a 16 GiB card — the
 capacity arithmetic is exact ("Q4_0-KV (int4) footprint" below) and the
-serve-level A/B is pending a free GPU. A Q4_K_M *weight* path is
+serve-level A/B is measured there: int4 holds ~1.5× more positions than
+int8 for the same budget but is slower (prefill penalty grows with
+context), so pick it only when the pool must exceed int8's ceiling. A
+Q4_K_M *weight* path is
 not yet supported by this engine (FP8/BF16 only), so the llama.cpp server
 remains the reference deployment until it lands. The FP8 paged pool
 (`kv_pool.h`, `kernels_phase3.cu`) stays test-only until the live path
@@ -232,7 +235,7 @@ prompt does diverge (168/512 tokens from position 340), but that prompt
 degenerates into a repetition loop in *both* modes, so it measures chaotic
 loop sensitivity, not int8 error — the teacher-forced comparison above is the
 honest quality number.
-## Q4_0-KV (int4) footprint (exact arithmetic + unit-test bounds, 2026-11-04)
+## Q4_0-KV (int4) footprint (exact arithmetic + unit-test bounds + serve A/B, 2026-11-05)
 
 `G4_KV8=4` stores the persistent K/V cache as Q4_0-style int4: two 4-bit
 codes per byte + one per-row float scale, dequantized on load (the int4
@@ -267,10 +270,36 @@ Quality bounds (unit tests, gremlin-1 CUDA build, binary at worktree HEAD):
   Hk=2 d=128 rows=8). This is within the int4 dequantization noise floor;
   it is the attention-level analogue of the KV8 test_attn_split bound.
 
-Pending: the serve-level A/B (prefill/decode latency, full-card margin with
-the EAGLE head co-resident) needs a free GPU — gremlin-1's card was held by
-the live serve during this work. `scripts/kv8-ab-bench.sh 4` runs it
-(int4 vs bf16, 3 repeats, same harness as the int8 table above).
+Serve-level A/B (gremlin-1, 2026-11-05, card freed from the live serve):
+`scripts/kv8-ab-bench.sh 4` — int4 vs bf16, 3 repeats, best kept:
+
+| max_pos | KV pool delta (int4 smaller) | prefill ms bf16→int4 | decode t/s bf16→int4 |
+| ---: | ---: | --- | --- |
+| 2305 (2048 ctx + 256 decode) | 276.0 MiB (289,406,976 B) | 520.6 → 555.4 (+6.7%) | 68.4 → 67.2 (−1.8%) |
+| 4353 (4096 ctx + 256 decode) | 520.2 MiB (545,259,520 B) | 1065.5 → 1203.4 (+12.9%) | 65.6 → 64.2 (−2.1%) |
+| 8321 (8192 ctx + 128 decode) | 988.6 MiB (1,035,993,088 B) | 2307.1 → 2879.2 (+24.8%) | 60.7 → 58.8 (−3.1%) |
+
+Read:
+
+- **Capacity: int4 pool is ~122 KiB/pos smaller than bf16** (42.5 KiB/pos
+  codes+scales vs 160 KiB bf16; the measured delta is a hair above the
+  arithmetic because the bf16 run also reserves per-position scratch the
+  quantized runs skip). That is ~1.5× the saving of int8 (~82 KiB/pos)
+  — for the same budget int4 fits ~2× the positions, which is what unlocks
+  the full 131072-position reader pool where int8 tops out at ~64K × 2.
+- **Decode: int4 tracks int8** (−1.8…3.1% t/s) — both are
+  dequant-on-load and bandwidth-bound, so the halved-vs-quartered KV
+  bandwidth does not pay back the dequant cost; int4 is not faster than
+  int8 at decode, it just holds more.
+- **Prefill: int4 is slower than int8, and the penalty grows with context**
+  (+6.7…24.8% vs bf16; int8's equivalent band is +3.7…13.9%). The int4
+  append (pack-2-codes/byte + a per-row amax) and the int4 attention dequant
+  do more work per position than the int8 path, and it scales with the
+  quantized K/V the attention reads. At 8K ctx int4 prefill is 1.25× bf16 vs
+  int8's 1.14×.
+- **Net: int4 is a pure capacity play.** Pick int8 when latency matters and
+  64K × 2 fits; pick int4 only when the context pool must exceed what int8
+  can hold (the 131K reader path), accepting the larger prefill penalty.
 
 
 ## Budget (FP8 weights + FP8 KV), ~14.9 GiB usable

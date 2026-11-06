@@ -168,18 +168,21 @@ than bf16). It is the only KV format that lets the full 131072-position
 reader pool fit a 16 GiB card alongside the FP8 weights for the *greedy*
 path: 131072 positions × 42.5 KiB = **5436 MiB** of KV, which sits under
 the ~16376 MiB card alongside the ~9.2–9.8 GiB weights/scratch floor
-(see `docs/memory.md`, "Q4_0-KV (int4) footprint"). The serve-level int4
-latency A/B and the exact free margin are pending a free GPU (gremlin-1's
-card was occupied by the live serve); `scripts/kv8-ab-bench.sh 4` runs it
-on demand. The speculative EAGLE drafter keeps its own bf16 KV, which
+(see `docs/memory.md`, "Q4_0-KV (int4) footprint"). Serve-level A/B
+(measured on a freed gremlin-1, `scripts/kv8-ab-bench.sh 4`): int4 holds
+~122 KiB/pos less than bf16 (~1.5× int8's saving, ~2× the positions for
+the same budget) but is **slower, not faster** — prefill +6.7…24.8%
+(worse than int8's +3.7…13.9%, the penalty grows with context) and decode
+−1.8…3.1% t/s (tracking int8). Pick int8 when latency matters and 64K × 2
+fits; pick int4 only when the context pool must exceed what int8 can hold.
+The speculative EAGLE drafter keeps its own bf16 KV, which
 scales with the pool and is a separate budget — int4 unlocks 131K for the
 reader path, and the drafter would need the same treatment (or a reduced
 pool) to run at 131K. The
 int4 quantization error is ~16× the per-row int8 error, so the int8
 quality result (argmax identical except on 1-ULP near-ties) is a *bound*,
 not a promise, for int4: the kernel tests bound the int4 round-trip and
-split-KV attention ("Q4_0-KV (int4) footprint" in `docs/memory.md`), and
-the gate-prompt flip rate under int4 is pending the same free-GPU A/B.
+split-KV attention ("Q4_0-KV (int4) footprint" in `docs/memory.md`).
 
 Deploy a pushed commit:
 
