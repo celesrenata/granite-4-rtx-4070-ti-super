@@ -157,14 +157,17 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                std::uint16_t* out, const std::int8_t* cache_k8 = nullptr,
                const std::int8_t* cache_v8 = nullptr,
                const float* cache_k_scale = nullptr,
-               const float* cache_v_scale = nullptr, bool int8 = false);
+               const float* cache_v_scale = nullptr, bool int8 = false,
+               const std::uint8_t* cache_k4 = nullptr,
+               const std::uint8_t* cache_v4 = nullptr, bool int4 = false);
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                       int base_pos, int rows, int stride, std::uint16_t* out,
                       const std::int8_t* cache_k8 = nullptr,
                       const std::int8_t* cache_v8 = nullptr,
                       const float* k_scale = nullptr, const float* v_scale = nullptr,
-                      bool int8 = false);
+                      bool int8 = false, const std::uint8_t* cache_k4 = nullptr,
+                      const std::uint8_t* cache_v4 = nullptr, bool int4 = false);
 }
 
 namespace {
@@ -413,6 +416,237 @@ static void test_kv8_device() {
   if (g_failures == 0)
     std::printf("  kv8 worst abs error = %.4f of a half step (bound 1.0)\n",
                 worst_step_frac);
+}
+
+// ---------------------------------------------------------------------------
+// KV4 (Q4_0) int4 KV cache: same guarantee as KV8 - the device quantize
+// (dev::q4_*) must match the host twin bit-for-bit and the row round-trip must
+// stay within half a quantization step. The packing differs (two codes per
+// byte), so the device kernel emits a d/2-byte row.
+// ---------------------------------------------------------------------------
+
+// One thread per row: quantize a bf16 row into packed int4 codes (two per
+// byte, even dim = lower nibble) + a per-row scale. The host recomputes and
+// compares. d must be even.
+__global__ void kv4_row_quant_kernel(const std::uint16_t* x, std::uint8_t* q,
+                                    float* scale, int rows, int d) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  const std::uint16_t* row = x + static_cast<std::size_t>(r) * d;
+  float amax = 0.0f;
+  for (int i = 0; i < d; ++i)
+    amax = fmaxf(amax, fabsf(granite4::dev::bf16_to_f32(row[i])));
+  const float s = granite4::dev::q4_scale(amax);
+  scale[r] = s;
+  std::uint8_t* codes = q + static_cast<std::size_t>(r) * (d / 2);
+  for (int w = 0; w < d / 2; ++w) {
+    const float x0 = granite4::dev::bf16_to_f32(row[2 * w]);
+    const float x1 = granite4::dev::bf16_to_f32(row[2 * w + 1]);
+    codes[w] = static_cast<std::uint8_t>(
+        (granite4::dev::q4_quant(x0, s) & 0x0fu) |
+        (granite4::dev::q4_quant(x1, s) << 4));
+  }
+}
+
+static void test_kv4_device() {
+  const int rows = 256, d = 128;  // head_dim of the model
+  Xorshift64 rng(0x4e8a);
+  std::vector<std::uint16_t> hx(static_cast<std::size_t>(rows) * d);
+  for (int r = 0; r < rows; ++r) {
+    float scale = 1.0f;
+    if (r == 0) scale = 0.0f;                        // all-zero row
+    else if (r == 1) scale = 1e-5f;                  // subnormal-ish amax
+    else if (r % 4 == 0) scale = 0.25f;
+    else if (r % 4 == 1) scale = 3.0f;
+    else if (r % 4 == 2) scale = 32.0f;
+    else scale = 256.0f;
+    for (int i = 0; i < d; ++i) {
+      const float v = rng.next_float_range(scale);
+      hx[static_cast<std::size_t>(r) * d + i] = f32_to_bf16_host(v);
+    }
+  }
+  const std::size_t codes = static_cast<std::size_t>(rows) * (d / 2);
+  std::uint16_t* d_x = nullptr;
+  std::uint8_t* d_q = nullptr;
+  float* d_s = nullptr;
+  if (cudaMalloc(&d_x, hx.size() * 2) != cudaSuccess ||
+      cudaMalloc(&d_q, codes) != cudaSuccess ||
+      cudaMalloc(&d_s, rows * sizeof(float)) != cudaSuccess ||
+      cudaMemcpy(d_x, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice) !=
+          cudaSuccess) {
+    ++g_failures;
+    if (d_x) cudaFree(d_x);
+    if (d_q) cudaFree(d_q);
+    if (d_s) cudaFree(d_s);
+    return;
+  }
+  kv4_row_quant_kernel<<<(rows + 255) / 256, 256>>>(d_x, d_q, d_s, rows, d);
+  std::vector<std::uint8_t> hq(codes);
+  std::vector<float> hs(rows);
+  CUDA_CHECK(cudaMemcpy(hq.data(), d_q, codes, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hs.data(), d_s, rows * sizeof(float), cudaMemcpyDeviceToHost));
+  cudaFree(d_x);
+  cudaFree(d_q);
+  cudaFree(d_s);
+
+  int bad_code = 0, bad_scale = 0, bad_dequant = 0, bad_bound = 0;
+  float worst_step_frac = 0.0f;
+  for (int r = 0; r < rows; ++r) {
+    float amax = 0.0f;
+    for (int i = 0; i < d; ++i)
+      amax = std::max(amax, std::fabs(bf16_to_f32_host(hx[static_cast<std::size_t>(r) * d + i])));
+    const float s_ref = q4_scale_host(amax);
+    if (hs[r] != s_ref && bad_scale < 4) {
+      std::printf("  kv4 scale mismatch row=%d dev=%a ref=%a\n", r, hs[r], s_ref);
+      ++bad_scale;
+    }
+    for (int w = 0; w < d / 2; ++w) {
+      const std::size_t i0 = static_cast<std::size_t>(r) * d + 2 * w;
+      const float x0 = bf16_to_f32_host(hx[i0]);
+      const float x1 = bf16_to_f32_host(hx[i0 + 1]);
+      const unsigned char byte_ref =
+          static_cast<unsigned char>((q4_quant_host(x0, s_ref) & 0x0fu) |
+                                     (q4_quant_host(x1, s_ref) << 4));
+      const unsigned char byte_dev = hq[static_cast<std::size_t>(r) * (d / 2) + w];
+      if (byte_dev != byte_ref && bad_code < 8) {
+        std::printf("  kv4 code mismatch row=%d w=%d byte dev=%02x ref=%02x\n", r, w,
+                    byte_dev, byte_ref);
+        ++bad_code;
+      }
+      // dequant bit-exact + round-trip error bound (even + odd dim in the byte).
+      float lo_dev, hi_dev, lo_ref, hi_ref;
+      q4_dequant_pair_host(byte_dev, hs[r], lo_dev, hi_dev);
+      q4_dequant_pair_host(byte_ref, s_ref, lo_ref, hi_ref);
+      std::uint32_t bl, bh, brl, brh;
+      std::memcpy(&bl, &lo_dev, 4);
+      std::memcpy(&bh, &hi_dev, 4);
+      std::memcpy(&brl, &lo_ref, 4);
+      std::memcpy(&brh, &hi_ref, 4);
+      if (bl != brl || bh != brh) {
+        if (bad_dequant < 8)
+          std::printf("  kv4 dequant mismatch row=%d w=%d\n", r, w);
+        ++bad_dequant;
+      }
+      const float half_step = hs[r] * 0.5f;
+      if (hs[r] != 0.0f) {
+        const float tol = half_step + hs[r] * 7.0f * 1.19e-7f;  // 2^-23
+        const float e0 = std::fabs(x0 - lo_dev);
+        const float e1 = std::fabs(x1 - hi_dev);
+        if (e0 > tol || e1 > tol) ++bad_bound;
+        worst_step_frac = std::max(worst_step_frac,
+                                   std::max(e0, e1) / half_step);
+      }
+    }
+  }
+  expect(bad_code == 0, "kv4 int4 quantize codes bit-exact device vs host");
+  expect(bad_scale == 0, "kv4 row scale bit-exact device vs host");
+  expect(bad_dequant == 0, "kv4 dequant bit-exact device vs host");
+  expect(bad_bound == 0, "kv4 round-trip within half a step (abs error)");
+  if (g_failures == 0)
+    std::printf("  kv4 worst abs error = %.4f of a half step (bound 1.0)\n",
+                worst_step_frac);
+}
+
+// KV4 attention on the persistent int4 cache: quantize a bf16 K/V cache to the
+// int4 layout (two codes/byte + a per-row scale, dev::q4_*/q4_*_host), run the
+// split-KV attention with int4 dequant-on-load, and check it stays within the
+// int4 dequantization noise of the bf16 fused-GQA reference. (The int8 path
+// has no attention-level test; this is the KV4 analogue of test_attn_split
+// exercised on the quantized cache.)
+static void test_kv4_attn_split_device() {
+  const int Hq = 8, Hk = 2, d = 128, stride = 512, base = 200, rows = 8;
+  Xorshift64 rng(0x4a11);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+
+  // Build the int4 cache from the bf16 K/V on the host (the host twin of the
+  // device append), keeping the per-row scales so the attention test reads
+  // exactly what the device wrote.
+  std::vector<std::uint8_t> c4k(Hk * stride * (d / 2)), c4v(Hk * stride * (d / 2));
+  std::vector<float> sk(Hk * stride), sv(Hk * stride);
+  for (int h = 0; h < Hk; ++h)
+    for (int p = 0; p < stride; ++p) {
+      const std::size_t row = static_cast<std::size_t>(h) * stride + p;
+      const std::size_t src = row * d;
+      float ak = 0.0f, av = 0.0f;
+      for (int i = 0; i < d; ++i) {
+        ak = std::max(ak, std::fabs(bf16_to_f32_host(ck[src + i])));
+        av = std::max(av, std::fabs(bf16_to_f32_host(cv[src + i])));
+      }
+      const float sks = q4_scale_host(ak), svs = q4_scale_host(av);
+      sk[row] = sks;
+      sv[row] = svs;
+      for (int w = 0; w < d / 2; ++w) {
+        c4k[row * (d / 2) + w] =
+            static_cast<std::uint8_t>((q4_quant_host(bf16_to_f32_host(ck[src + 2 * w]),
+                                                    sks) &
+                                       0x0fu) |
+                                      (q4_quant_host(bf16_to_f32_host(ck[src + 2 * w + 1]),
+                                                     sks) <<
+                                       4));
+        c4v[row * (d / 2) + w] =
+            static_cast<std::uint8_t>((q4_quant_host(bf16_to_f32_host(cv[src + 2 * w]),
+                                                    svs) &
+                                       0x0fu) |
+                                      (q4_quant_host(bf16_to_f32_host(cv[src + 2 * w + 1]),
+                                                     svs) <<
+                                       4));
+      }
+    }
+
+  std::uint16_t *dq, *dk, *dv, *dref, *dgot;
+  std::uint8_t *dc4k, *dc4v;
+  float *dsk, *dsv;
+  void* scratch;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dk, cn * 2) || cudaMalloc(&dv, cn * 2) ||
+      cudaMalloc(&dref, qn * 2) || cudaMalloc(&dgot, qn * 2) ||
+      cudaMalloc(&dc4k, c4k.size()) || cudaMalloc(&dc4v, c4v.size()) ||
+      cudaMalloc(&dsk, sk.size() * sizeof(float)) ||
+      cudaMalloc(&dsv, sv.size() * sizeof(float)) ||
+      cudaMalloc(&scratch, granite4::attn_split_scratch_bytes(Hq, rows, stride))) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dc4k, c4k.data(), c4k.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dc4v, c4v.data(), c4v.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsk, sk.data(), sk.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsv, sv.data(), sv.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+  const float scale = 0.0078125f;  // model's attention scale (smoother softmax)
+  expect(granite4_kernel_gqa_fused_rows(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride,
+                                        dref) == 0,
+         "kv4 attention: reference launch");
+  expect(granite4::attn_split(dq, nullptr, nullptr, scale, Hq, Hk, d, base, nullptr, rows,
+                             stride, scratch, dgot, nullptr, nullptr, dsk, dsv, false, dc4k,
+                             dc4v, true) == 0,
+         "kv4 attention: launch");
+  std::vector<std::uint16_t> ref(qn), got(qn);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got.data(), dgot, qn * 2, cudaMemcpyDeviceToHost));
+  double max_err = 0.0;
+  for (std::size_t i = 0; i < qn; ++i)
+    max_err = std::max(
+        max_err,
+        static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) - bf16_to_f32_host(ref[i]))));
+  std::printf("  kv4 split-KV attention: max |delta| = %.5f\n", max_err);
+  expect(max_err < 0.5, "kv4 attention: int4 dequant noise within bound");
+  cudaFree(dq);
+  cudaFree(dk);
+  cudaFree(dv);
+  cudaFree(dref);
+  cudaFree(dgot);
+  cudaFree(dc4k);
+  cudaFree(dc4v);
+  cudaFree(dsk);
+  cudaFree(dsv);
+  cudaFree(scratch);
 }
 
 static void test_rmsnorm_device() {
@@ -1822,6 +2056,8 @@ int main() {
   test_fp8_decode_all();
   test_fp8_hw_decode();
   test_kv8_device();
+  test_kv4_device();
+  test_kv4_attn_split_device();
   test_rmsnorm_device();
   test_rope_device();
   test_softmax_device();

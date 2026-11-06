@@ -312,6 +312,7 @@ class GpuSession {
   // gpu_ctx_create) and active attention path - so callers can report ground
   // truth instead of trusting G4_KV8.
   bool kv8() const { return gpu_ctx_is_kv8(ctx_); }
+  bool kv4() const { return gpu_ctx_is_kv4(ctx_); }
   bool split_attn() const { return gpu_ctx_is_split_attn(ctx_); }
 
 
@@ -897,10 +898,17 @@ int gpu_kv_bench_cmd(const Args& a) {
 
   const char* kv8_env = std::getenv("G4_KV8");
   const bool kv8_requested = kv8_env != nullptr && kv8_env[0] == '1';
+  const bool kv4_requested = kv8_env != nullptr && kv8_env[0] == '4';
   const bool kv8 = s.kv8();  // resolved (after the split-attention check)
+  const bool kv4 = s.kv4();
   if (kv8_requested && !kv8)
     std::fprintf(stderr,
                  "kv-bench: WARNING G4_KV8=1 requested but the session fell "
+                 "back to bf16 (config not split-attention capable: needs "
+                 "d==128 and Hq==4*Hk)\n");
+  if (kv4_requested && !kv4)
+    std::fprintf(stderr,
+                 "kv-bench: WARNING G4_KV8=4 requested but the session fell "
                  "back to bf16 (config not split-attention capable: needs "
                  "d==128 and Hq==4*Hk)\n");
 
@@ -940,13 +948,14 @@ int gpu_kv_bench_cmd(const Args& a) {
   const double tps = D > 0 ? 1000.0 * static_cast<double>(D) / decode_ms : 0.0;
 
   // Report the persistent KV-pool footprint as the free-memory difference
-  // between this run (bf16 or int8 pool) measured right after load. The
+  // between this run (bf16 / int8 / int4 pool) measured right after load. The
   // cross-run delta is the KV cache size difference at the same max_pos.
   std::fprintf(stdout,
-      "{\"kv8\":%s,\"split_attn\":%s,\"prefill_ms\":%.3f,\"decode_ms\":%.3f,"
+      "{\"kv8\":%s,\"kv4\":%s,\"split_attn\":%s,\"prefill_ms\":%.3f,\"decode_ms\":%.3f,"
       "\"decode_tps\":%.3f,\"free_after_load\":%lld,\"max_pos\":%d,"
       "\"ctx\":%d,\"decode\":%d}\n",
       kv8 ? "true" : "false",
+      kv4 ? "true" : "false",
       s.split_attn() ? "true" : "false",
       prefill_ms, decode_ms, tps, free_after_load, max_pos, N, D);
   std::fflush(stdout);
@@ -1326,7 +1335,7 @@ int main(int argc, char** argv) {
         "       granite4-infer dump-hidden --checkpoint DIR --gpu 1 --in TOKENS.bin "
         "--out HIDDEN.bin [--max-context N]\n"
         "       granite4-infer kv-bench --checkpoint DIR --gpu 1 --bench-ctx N "
-        "--bench-decode D [--seed S]   (G4_KV8=1 switches the KV cache to int8)\n");
+        "--bench-decode D [--seed S]   (G4_KV8=1 int8 KV, G4_KV8=4 int4 KV)\n");
     return 2;
   }
   if (a.sub == "generate" && a.max_tokens <= 0) {

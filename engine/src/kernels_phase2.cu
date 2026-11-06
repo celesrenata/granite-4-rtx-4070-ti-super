@@ -438,6 +438,67 @@ __global__ void kv_append_int8_batched_kernel(
   cache_v[cache] = dev::kv8_quant(y, smax[1]);
 }
 
+// KV4 (Q4_0): int4 form of the batched verify append - `rows` consecutive KV
+// positions, one block per (KV head, row). Each thread owns a dim-pair (two
+// adjacent dims packed into one byte); the row amax is a block reduce over
+// blockDim.x threads, matching the int8 layout. d must be even (128).
+__global__ void kv_append_int4_batched_kernel(
+    const std::uint16_t* __restrict__ src_k, const std::uint16_t* __restrict__ src_v,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    float* __restrict__ cache_k_scale, float* __restrict__ cache_v_scale,
+    int base_pos, int rows, int stride, int Hk, int d) {
+  const int hkv = blockIdx.x;
+  const int r = blockIdx.y;
+  const int w = threadIdx.x;  // blockDim.x == d/2
+  const int pos = base_pos + r;
+  const int d0 = 2 * w;       // even dim (lower nibble)
+  const int d1 = d0 + 1;      // odd dim (upper nibble)
+  const std::size_t src0 = (static_cast<std::size_t>(r) * Hk + hkv) * d + d0;
+  const std::size_t src1 = (static_cast<std::size_t>(r) * Hk + hkv) * d + d1;
+  const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + pos) * (d / 2) + w;
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + pos;
+  const float x0 = bf16_to_f32(src_k[src0]);
+  const float x1 = bf16_to_f32(src_k[src1]);
+  const float y0 = bf16_to_f32(src_v[src0]);
+  const float y1 = bf16_to_f32(src_v[src1]);
+  __shared__ float smax[2];
+  const int lane = w & 31;
+  float ax = fmaxf(fabsf(x0), fabsf(x1));
+  float ay = fmaxf(fabsf(y0), fabsf(y1));
+  for (int off = 16; off > 0; off >>= 1) {
+    ax = fmaxf(ax, __shfl_down_sync(0xffffffffu, ax, off));
+    ay = fmaxf(ay, __shfl_down_sync(0xffffffffu, ay, off));
+  }
+  __shared__ float wmax[2][32];
+  if (lane == 0) {
+    wmax[0][w >> 5] = ax;
+    wmax[1][w >> 5] = ay;
+  }
+  __syncthreads();
+  float mk = 0.0f, mv = 0.0f;
+  for (int wp = 0; wp < ((d / 2) + 31) >> 5; ++wp) {
+    mk = fmaxf(mk, wmax[0][wp]);
+    mv = fmaxf(mv, wmax[1][wp]);
+  }
+  if (w == 0) {
+    const float sk = dev::q4_scale(mk);
+    const float sv = dev::q4_scale(mv);
+    smax[0] = sk;
+    smax[1] = sv;
+    cache_k_scale[sc] = sk;
+    cache_v_scale[sc] = sv;
+  }
+  __syncthreads();
+  const unsigned char ck =
+      static_cast<unsigned char>((dev::q4_quant(x0, smax[0]) & 0x0fu) |
+                                 (dev::q4_quant(x1, smax[0]) << 4));
+  const unsigned char cv =
+      static_cast<unsigned char>((dev::q4_quant(y0, smax[1]) & 0x0fu) |
+                                 (dev::q4_quant(y1, smax[1]) << 4));
+  cache_k[cache] = ck;
+  cache_v[cache] = cv;
+}
+
 // Row blockIdx.y attends to its causal prefix [0, base_kv + row + 1).
 __global__ void gqa_fused_batched_kernel(const std::uint16_t* q,
                                          const std::uint16_t* k,
@@ -981,6 +1042,31 @@ int granite4_kernel_kv_append_int8_batched(const std::uint16_t* d_src_k,
   granite4::kv_append_int8_batched_kernel<<<dim3(static_cast<unsigned int>(Hk),
                                                  static_cast<unsigned int>(rows)),
                                              static_cast<unsigned int>(d)>>>
+      (d_src_k, d_src_v, d_cache_k, d_cache_v, d_cache_k_scale, d_cache_v_scale,
+       base_pos, rows, stride, Hk, d);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
+int granite4_kernel_kv_append_int4_batched(const std::uint16_t* d_src_k,
+                                           const std::uint16_t* d_src_v,
+                                           std::uint8_t* d_cache_k,
+                                           std::uint8_t* d_cache_v,
+                                           float* d_cache_k_scale,
+                                           float* d_cache_v_scale, int base_pos,
+                                           int rows, int stride, int Hk, int d) {
+  if (d_src_k == nullptr || d_src_v == nullptr || d_cache_k == nullptr ||
+      d_cache_v == nullptr || d_cache_k_scale == nullptr ||
+      d_cache_v_scale == nullptr || base_pos < 0 || rows <= 0 ||
+      rows > granite4::kMaxVerifyRows || Hk <= 0 || d <= 0 || d % 2 != 0 || d > 1024 ||
+      base_pos > INT_MAX - rows || stride < base_pos + rows ||
+      static_cast<long long>(Hk) * d > INT_MAX || stride > INT_MAX / std::max(Hk, 1))
+    return -1;
+  // One block per (KV head, row); blockDim.x == d/2 (one thread per code
+  // byte / dim-pair), so the row amax is a block reduce.
+  granite4::kv_append_int4_batched_kernel<<<dim3(static_cast<unsigned int>(Hk),
+                                                static_cast<unsigned int>(rows)),
+                                            static_cast<unsigned int>(d / 2)>>>
       (d_src_k, d_src_v, d_cache_k, d_cache_v, d_cache_k_scale, d_cache_v_scale,
        base_pos, rows, stride, Hk, d);
   G4_CUDA_CHECK(cudaGetLastError());

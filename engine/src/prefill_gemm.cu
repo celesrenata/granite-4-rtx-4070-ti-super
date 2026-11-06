@@ -413,6 +413,98 @@ __global__ void __launch_bounds__(kPrefillInt8D)
     cache_v[cbase] = code;
 }
 
+// KV4 (Q4_0): the int4 mirror of rope_split_append_int8_kernel. One block per
+// (chunk row, head) over the q|k|v heads, but blockDim.x == d/2: each thread
+// owns a dim-pair (even dim = lower nibble, odd dim = upper nibble) of one
+// K/V row. Q is rotated to bf16 exactly as in the bf16 path; K (rotated) and
+// V are quantized per (head, position) row to two-per-byte int4 codes + a row
+// scale with dev::q4_*. Requires d == 128 (== the prefill attention head dim).
+constexpr int kPrefillInt4D = 64;
+__global__ void __launch_bounds__(kPrefillInt4D)
+    rope_split_append_int4_kernel(const std::uint16_t* qkv, const float* cos_tbl,
+                                  const float* sin_tbl, int base_pos, int Hq, int Hk,
+                                  int d, int stride, std::uint16_t* q_rot,
+                                  std::uint8_t* cache_k, std::uint8_t* cache_v,
+                                  float* cache_k_scale, float* cache_v_scale) {
+  const int r = blockIdx.y;
+  const int head = blockIdx.x;  // 0..Hq-1: q, Hq..Hq+Hk-1: k, else v
+  const int pos = base_pos + r;
+  const int nq = Hq * d, nk = Hk * d;
+  const int w = threadIdx.x;
+  const int half = d / 2;
+
+  if (head < Hq) {  // Q: rotate to bf16 (byte-identical to the bf16 path)
+    const int h = head, col = 2 * w;
+    const int h1 = col + 1;
+    const std::uint16_t* const x = qkv + static_cast<std::size_t>(r) * (nq + 2 * nk) + h * d;
+    // Each dim uses its own RoPE frequency: j = col < half ? col : col - half.
+    const int j0 = col < half ? col : col - half;
+    const int j1 = h1 < half ? h1 : h1 - half;
+    const std::size_t p0 = static_cast<std::size_t>(pos) * half + j0;
+    const std::size_t p1 = static_cast<std::size_t>(pos) * half + j1;
+    const std::size_t qo = static_cast<std::size_t>(r) * nq + h * d;
+    q_rot[qo + col] = col < half
+        ? f32_to_bf16(bf16_to_f32(x[col]) * cos_tbl[p0] - bf16_to_f32(x[col + half]) * sin_tbl[p0])
+        : f32_to_bf16(bf16_to_f32(x[col]) * cos_tbl[p0] + bf16_to_f32(x[col - half]) * sin_tbl[p0]);
+    q_rot[qo + h1] = h1 < half
+        ? f32_to_bf16(bf16_to_f32(x[h1]) * cos_tbl[p1] - bf16_to_f32(x[h1 + half]) * sin_tbl[p1])
+        : f32_to_bf16(bf16_to_f32(x[h1]) * cos_tbl[p1] + bf16_to_f32(x[h1 - half]) * sin_tbl[p1]);
+    return;
+  }
+
+  const bool is_k = head < Hq + Hk;
+  const int h = is_k ? head - Hq : head - Hq - Hk;
+  const int col = 2 * w;
+  const int h1 = col + 1;
+  __shared__ float s_val[kPrefillInt4D][2];  // [thread][dim-pair]
+  if (is_k) {  // K: rotate the dim-pair (per-dim frequency), then quantize
+    const std::uint16_t* const x =
+        qkv + static_cast<std::size_t>(r) * (nq + 2 * nk) + nq + h * d;
+    const int j0 = col < half ? col : col - half;
+    const int j1 = h1 < half ? h1 : h1 - half;
+    const std::size_t p0 = static_cast<std::size_t>(pos) * half + j0;
+    const std::size_t p1 = static_cast<std::size_t>(pos) * half + j1;
+    s_val[w][0] = col < half
+        ? bf16_to_f32(x[col]) * cos_tbl[p0] - bf16_to_f32(x[col + half]) * sin_tbl[p0]
+        : bf16_to_f32(x[col]) * cos_tbl[p0] + bf16_to_f32(x[col - half]) * sin_tbl[p0];
+    s_val[w][1] = h1 < half
+        ? bf16_to_f32(x[h1]) * cos_tbl[p1] - bf16_to_f32(x[h1 + half]) * sin_tbl[p1]
+        : bf16_to_f32(x[h1]) * cos_tbl[p1] + bf16_to_f32(x[h1 - half]) * sin_tbl[p1];
+  } else {  // V: raw dim-pair
+    const std::uint16_t* const x =
+        qkv + static_cast<std::size_t>(r) * (nq + 2 * nk) + nq + nk + h * d;
+    s_val[w][0] = bf16_to_f32(x[col]);
+    s_val[w][1] = bf16_to_f32(x[h1]);
+  }
+  __shared__ float s_scale;
+  __syncthreads();  // all threads' s_val writes are visible before the amax
+  if (w == 0) {
+    float a = 0.0f;
+    for (int j = 0; j < d / 2; ++j) {
+      a = fmaxf(a, fabsf(s_val[j][0]));
+      a = fmaxf(a, fabsf(s_val[j][1]));
+    }
+    s_scale = dev::q4_scale(a);
+  }
+  __syncthreads();  // s_scale is published before any thread quantizes
+  const float sc = s_scale;
+  if (w == 0) {
+    if (is_k)
+      cache_k_scale[static_cast<std::size_t>(h) * stride + pos] = sc;
+    else
+      cache_v_scale[static_cast<std::size_t>(h) * stride + pos] = sc;
+  }
+  __syncthreads();
+  const unsigned char code =
+      static_cast<unsigned char>((dev::q4_quant(s_val[w][0], sc) & 0x0fu) |
+                                 (dev::q4_quant(s_val[w][1], sc) << 4));
+  const std::size_t cbase = (static_cast<std::size_t>(h) * stride + pos) * (d / 2) + w;
+  if (is_k)
+    cache_k[cbase] = code;
+  else
+    cache_v[cbase] = code;
+}
+
 // ---------------------------------------------------------------------------
 // Causal prefill attention on the tensor cores (flash-attention style).
 //
@@ -438,11 +530,12 @@ __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
          (static_cast<std::uint32_t>(f32_to_bf16(hi)) << 16);
 }
 
-// Int8 (Q8_0): when Int8 the persistent cache is int8 codes + a per-row
-// float scale; the tile fill dequantizes each row into the same bf16 Ks/Vt
-// tiles the bf16 path writes, so everything after the tile fill (QK, online
-// softmax, PV) is byte-identical between the two instantiations.
-template <int D, int G, bool Int8>
+// Quantized KV: when Int8 or Int4 the persistent cache is int8/int4 codes +
+// a per-row float scale; the tile fill dequantizes each row into the same
+// bf16 Ks/Vt tiles the bf16 path writes, so everything after the tile fill
+// (QK, online softmax, PV) is byte-identical between the three
+// instantiations.
+template <int D, int G, bool Int8, bool Int4>
 __global__ void __launch_bounds__(kAttnWarps * 32)
     prefill_attention_kernel(const std::uint16_t* __restrict__ q_rot,
                              const std::uint16_t* __restrict__ cache_k,
@@ -452,7 +545,9 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
                              const std::int8_t* __restrict__ cache_k8,
                              const std::int8_t* __restrict__ cache_v8,
                              const float* __restrict__ k_scale,
-                             const float* __restrict__ v_scale) {
+                             const float* __restrict__ v_scale,
+                             const std::uint8_t* __restrict__ cache_k4,
+                             const std::uint8_t* __restrict__ cache_v4) {
   constexpr int kPosPerWarp = 16 / G;
   constexpr int kPosPerBlock = kAttnWarps * kPosPerWarp;
   constexpr int KT = kAttnKvTile;
@@ -501,23 +596,28 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
 
   const int last = min(p0 + kPosPerBlock, rows) - 1;
   const int kv_end = base_pos + last + 1;
+  const bool quantized = Int8 || Int4;
   const std::uint16_t* const kb =
-      Int8 ? nullptr : cache_k + static_cast<std::size_t>(hkv) * stride * D;
+      quantized ? nullptr : cache_k + static_cast<std::size_t>(hkv) * stride * D;
   const std::uint16_t* const vb =
-      Int8 ? nullptr : cache_v + static_cast<std::size_t>(hkv) * stride * D;
+      quantized ? nullptr : cache_v + static_cast<std::size_t>(hkv) * stride * D;
   const std::int8_t* const k8 =
       Int8 ? cache_k8 + static_cast<std::size_t>(hkv) * stride * D : nullptr;
   const std::int8_t* const v8 =
       Int8 ? cache_v8 + static_cast<std::size_t>(hkv) * stride * D : nullptr;
-  const float* const ksc = Int8 ? k_scale + static_cast<std::size_t>(hkv) * stride : nullptr;
-  const float* const vsc = Int8 ? v_scale + static_cast<std::size_t>(hkv) * stride : nullptr;
+  const std::uint8_t* const k4 =
+      Int4 ? cache_k4 + static_cast<std::size_t>(hkv) * stride * (D / 2) : nullptr;
+  const std::uint8_t* const v4 =
+      Int4 ? cache_v4 + static_cast<std::size_t>(hkv) * stride * (D / 2) : nullptr;
+  const float* const ksc = quantized ? k_scale + static_cast<std::size_t>(hkv) * stride : nullptr;
+  const float* const vsc = quantized ? v_scale + static_cast<std::size_t>(hkv) * stride : nullptr;
   const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
 
   for (int j0 = 0; j0 < kv_end; j0 += KT) {
     __syncthreads();  // the previous tile's readers are done
     // K tile row-major (coalesced); V tile transposed, consecutive threads on
     // consecutive positions so the scalar transposed stores do not conflict.
-    if (!Int8) {
+    if (!quantized) {
       for (int idx = threadIdx.x; idx < KT * D / 8; idx += kAttnWarps * 32) {
         const int kr = idx / (D / 8), kc = (idx % (D / 8)) * 8;
         const int kj = j0 + kr;
@@ -535,6 +635,32 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
         for (int e = 0; e < 4; ++e) {
           Vt[vc + 2 * e][vr] = static_cast<std::uint16_t>(vw[e] & 0xffffu);
           Vt[vc + 2 * e + 1][vr] = static_cast<std::uint16_t>(vw[e] >> 16);
+        }
+      }
+    } else if (Int4) {
+      // KV4: one thread per (tile-row, code-byte) - read the two packed int4
+      // codes, dequantize with the row's scale, and store the packed bf16
+      // values into the same Ks (row-major) / Vt (transposed) tiles the
+      // bf16 path writes; out-of-tile rows store 0 (the bf16 path's zero
+      // fill) so masked logits and PV stay 0.
+      for (int idx = threadIdx.x; idx < KT * (D / 2); idx += kAttnWarps * 32) {
+        const int kr = idx / (D / 2), cw = idx % (D / 2);
+        const int kj = j0 + kr;
+        if (kj < kv_end) {
+          const std::size_t cbase = static_cast<std::size_t>(kj) * (D / 2) + cw;
+          float k0, k1;
+          dev::q4_dequant_pair(k4[cbase], ksc[kj], k0, k1);
+          Ks[kr][2 * cw] = f32_to_bf16(k0);
+          Ks[kr][2 * cw + 1] = f32_to_bf16(k1);
+          float v0, v1;
+          dev::q4_dequant_pair(v4[cbase], vsc[kj], v0, v1);
+          Vt[2 * cw][kr] = f32_to_bf16(v0);
+          Vt[2 * cw + 1][kr] = f32_to_bf16(v1);
+        } else {
+          Ks[kr][2 * cw] = std::uint16_t{0};
+          Ks[kr][2 * cw + 1] = std::uint16_t{0};
+          Vt[2 * cw][kr] = std::uint16_t{0};
+          Vt[2 * cw + 1][kr] = std::uint16_t{0};
         }
       }
     } else {
@@ -816,31 +942,63 @@ int prefill_rope_split_append_int8(const std::uint16_t* qkv, const float* cos_tb
   return 0;
 }
 
+// KV4: append the prefill chunk's K/V to the int4 persistent cache (rotating
+// K, quantizing K and V per row as two-per-byte int4 codes). Q is rotated to
+// bf16 as in the bf16 path. Requires d == 128 (the prefill attention head
+// dim).
+int prefill_rope_split_append_int4(const std::uint16_t* qkv, const float* cos_tbl,
+                                   const float* sin_tbl, int base_pos, int rows,
+                                   int Hq, int Hk, int d, int stride,
+                                   std::uint16_t* q_rot, std::uint8_t* cache_k,
+                                   std::uint8_t* cache_v, float* cache_k_scale,
+                                   float* cache_v_scale) {
+  if (rows <= 0 || rows > 65535 || base_pos < 0 || stride < base_pos + rows ||
+      d != kPrefillInt4D * 2 || (d % 2) != 0 || Hq <= 0 || Hk <= 0 ||
+      q_rot == nullptr || cache_k == nullptr || cache_v == nullptr ||
+      cache_k_scale == nullptr || cache_v_scale == nullptr)
+    return -1;
+  const int heads = Hq + 2 * Hk;
+  rope_split_append_int4_kernel<<<dim3(heads, rows), kPrefillInt4D>>>(
+      qkv, cos_tbl, sin_tbl, base_pos, Hq, Hk, d, stride, q_rot, cache_k, cache_v,
+      cache_k_scale, cache_v_scale);
+  G4_PF_CHECK();
+  return 0;
+}
+
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                       int base_pos, int rows, int stride, std::uint16_t* out,
                       const std::int8_t* cache_k8, const std::int8_t* cache_v8,
-                      const float* k_scale, const float* v_scale, bool int8) {
+                      const float* k_scale, const float* v_scale, bool int8,
+                      const std::uint8_t* cache_k4, const std::uint8_t* cache_v4,
+                      bool int4) {
   if (q_rot == nullptr || out == nullptr || !std::isfinite(scale) || Hk <= 0 ||
       Hq % Hk != 0 || rows <= 0 || base_pos < 0 || stride < base_pos + rows ||
       d != 128 || Hq / Hk != 4 ||
+      (int8 && int4) ||
       (int8 ? (cache_k8 == nullptr || cache_v8 == nullptr || k_scale == nullptr ||
                v_scale == nullptr)
-            : (cache_k == nullptr || cache_v == nullptr ||
-               (reinterpret_cast<std::uintptr_t>(cache_k) & 15u) != 0 ||
-               (reinterpret_cast<std::uintptr_t>(cache_v) & 15u) != 0)))
+            : int4 ? (cache_k4 == nullptr || cache_v4 == nullptr ||
+                      k_scale == nullptr || v_scale == nullptr)
+                  : (cache_k == nullptr || cache_v == nullptr ||
+                     (reinterpret_cast<std::uintptr_t>(cache_k) & 15u) != 0 ||
+                     (reinterpret_cast<std::uintptr_t>(cache_v) & 15u) != 0)))
     return -1;
   constexpr int kPosPerBlock = kAttnWarps * (16 / 4);
   const dim3 grid(static_cast<unsigned>((rows + kPosPerBlock - 1) / kPosPerBlock),
                   static_cast<unsigned>(Hk));
   if (int8)
-    prefill_attention_kernel<128, 4, true><<<grid, kAttnWarps * 32>>>(
+    prefill_attention_kernel<128, 4, true, false><<<grid, kAttnWarps * 32>>>(
         q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, cache_k8,
-        cache_v8, k_scale, v_scale);
-  else
-    prefill_attention_kernel<128, 4, false><<<grid, kAttnWarps * 32>>>(
+        cache_v8, k_scale, v_scale, nullptr, nullptr);
+  else if (int4)
+    prefill_attention_kernel<128, 4, false, true><<<grid, kAttnWarps * 32>>>(
         q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, nullptr,
-        nullptr, nullptr, nullptr);
+        nullptr, k_scale, v_scale, cache_k4, cache_v4);
+  else
+    prefill_attention_kernel<128, 4, false, false><<<grid, kAttnWarps * 32>>>(
+        q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr);
   G4_PF_CHECK();
   return 0;
 }

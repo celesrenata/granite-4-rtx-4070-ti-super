@@ -150,6 +150,59 @@ __global__ void __launch_bounds__(kKvAppendInt8Threads)
   cache_v[cache + i] = dev::kv8_quant(bf16_to_f32(src_v[src]), sv);
 }
 
+// KV4 (Q4_0): one block per KV head appends this position's K/V as int4 codes
+// (two per byte: lower nibble = the even dim, upper = the odd dim) + a per-row
+// scale, quantized with dev::q4_* (the committed device math). With d == 128
+// that is 64 threads, one byte each; thread 0 computes the row amax/scale and
+// publishes it before the quantized bytes are written.
+constexpr int kKvAppendInt4Threads = 64;
+__global__ void __launch_bounds__(kKvAppendInt4Threads)
+    kv_append_int4_kernel(const std::uint16_t* __restrict__ src_k,
+                          const std::uint16_t* __restrict__ src_v,
+                          std::uint8_t* __restrict__ cache_k,
+                          std::uint8_t* __restrict__ cache_v,
+                          float* __restrict__ cache_k_scale,
+                          float* __restrict__ cache_v_scale,
+                          const int* __restrict__ d_pos, int stride, int Hk, int d) {
+  const int hkv = blockIdx.x;
+  const int t = *d_pos;
+  const int w = threadIdx.x;
+  const int d0 = 2 * w;      // even dim (lower nibble)
+  const int d1 = d0 + 1;     // odd dim (upper nibble)
+  const std::size_t src0 = static_cast<std::size_t>(hkv) * d + d0;
+  const std::size_t src1 = static_cast<std::size_t>(hkv) * d + d1;
+  const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + t) * (d / 2) + w;
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + t;
+  __shared__ float s_amax[2];
+  if (w == 0) {
+    float a = 0.0f, b = 0.0f;
+    for (int j = 0; j < d; ++j) {
+      const float x = bf16_to_f32(src_k[static_cast<std::size_t>(hkv) * d + j]);
+      const float y = bf16_to_f32(src_v[static_cast<std::size_t>(hkv) * d + j]);
+      a = fmaxf(a, fabsf(x));
+      b = fmaxf(b, fabsf(y));
+    }
+    s_amax[0] = a;
+    s_amax[1] = b;
+  }
+  __syncthreads();
+  const float sk = dev::q4_scale(s_amax[0]);
+  const float sv = dev::q4_scale(s_amax[1]);
+  if (w == 0) {
+    cache_k_scale[sc] = sk;
+    cache_v_scale[sc] = sv;
+  }
+  __syncthreads();
+  const unsigned char ck =
+      static_cast<unsigned char>((dev::q4_quant(bf16_to_f32(src_k[src0]), sk) & 0x0fu) |
+                                 (dev::q4_quant(bf16_to_f32(src_k[src1]), sk) << 4));
+  const unsigned char cv =
+      static_cast<unsigned char>((dev::q4_quant(bf16_to_f32(src_v[src0]), sv) & 0x0fu) |
+                                 (dev::q4_quant(bf16_to_f32(src_v[src1]), sv) << 4));
+  cache_k[cache] = ck;
+  cache_v[cache] = cv;
+}
+
 // Greedy pick per logits row: the first index of the row maximum (the host
 // sample_greedy_f32 / argmax_f32 tie rule). One block per row. With d_pos
 // (single-row decode) the token goes to out[*d_pos + 1] and *d_pos advances,
@@ -564,6 +617,13 @@ int granite4_kernel_kv_append_int8_batched(const std::uint16_t* d_src_k,
                                            float* d_cache_k_scale,
                                            float* d_cache_v_scale, int base_pos,
                                            int rows, int stride, int Hk, int d);
+int granite4_kernel_kv_append_int4_batched(const std::uint16_t* d_src_k,
+                                           const std::uint16_t* d_src_v,
+                                           std::uint8_t* d_cache_k,
+                                           std::uint8_t* d_cache_v,
+                                           float* d_cache_k_scale,
+                                           float* d_cache_v_scale, int base_pos,
+                                           int rows, int stride, int Hk, int d);
 int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
                                       const std::uint16_t* d_k,
                                       const std::uint16_t* d_v, float att_scale,
@@ -708,6 +768,15 @@ struct GpuCtx {
   float* kv8_k_scale = nullptr;    // [L][Hk][max_pos]
   float* kv8_v_scale = nullptr;    // [L][Hk][max_pos]
   bool kv8 = false;                // store the persistent cache as int8
+  // KV4 (Q4_0): the persistent cache stored as two-per-byte int4 codes
+  // (lower nibble = even dim, upper nibble = odd dim) + a per-row scale.
+  // d/2 code bytes per (head,position) row, so half the footprint of KV8.
+  // Same quantize-on-append / dequantize-on-load contract as KV8.
+  std::uint8_t* kv4_k = nullptr;   // [L][Hk][max_pos][d/2]
+  std::uint8_t* kv4_v = nullptr;   // [L][Hk][max_pos][d/2]
+  float* kv4_k_scale = nullptr;    // [L][Hk][max_pos]
+  float* kv4_v_scale = nullptr;    // [L][Hk][max_pos]
+  bool kv4 = false;                // store the persistent cache as int4
   std::uint16_t* compact_k = nullptr;  // [Hk][max_pos][d] working prefix
   std::uint16_t* compact_v = nullptr;  // [Hk][max_pos][d]
   std::uint16_t* logits_scratch = nullptr;  // [Hq][max_pos] (fallback path)
@@ -845,8 +914,12 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
   // KV8 (Q8_0): store the persistent cache as int8 codes + a per-row float
   // scale (quantized on append, dequantized on load in attention). Off by
   // default so the bf16 path is untouched.
-  const char* const kv8 = std::getenv("G4_KV8");
-  g->kv8 = kv8 != nullptr && kv8[0] == '1';
+  // G4_KV8 selects the persistent-KV format: "1" = int8 (KV8/Q8_0), "4" =
+  // int4 (KV4/Q4_0), anything else (unset / "0") = bf16. Both quantized
+  // formats store codes + a per-row float scale.
+  const char* const kvfmt = std::getenv("G4_KV8");
+  g->kv8 = kvfmt != nullptr && kvfmt[0] == '1';
+  g->kv4 = kvfmt != nullptr && kvfmt[0] == '4';
   // Split-KV attention is the only int8 dequant-on-load path wired (decode,
   // verify and prefill); the fused-GQA variants read the bf16 cache, which is
   // not allocated under KV8. Resolve split_attn before allocating so a kv8
@@ -859,15 +932,24 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
   if (g->kv8 && !g->split_attn)
     std::fprintf(stderr, "granite4: G4_KV8=1 needs split-KV attention "
                          "(d==128, Hq==4*Hk); falling back to bf16 cache\n");
+  if (g->kv4 && !g->split_attn)
+    std::fprintf(stderr, "granite4: G4_KV8=4 needs split-KV attention "
+                         "(d==128, Hq==4*Hk); falling back to bf16 cache\n");
   g->kv8 = g->kv8 && g->split_attn;
+  g->kv4 = g->kv4 && g->split_attn;
   std::size_t kv_bytes = 0;
   std::size_t kv8_scale_bytes = 0;
   std::size_t compact_bytes = 0;
   std::size_t token_scratch_elems = 0;
   std::size_t token_scratch_bytes = 0;
   std::size_t scratch_batched_bytes = 0;
-  if (!checked_mul(kv_elems, g->kv8 ? sizeof(std::int8_t) : sizeof(std::uint16_t),
-                   &kv_bytes) ||
+  // Persistent-cache bytes per (head,position) row: bf16 = d*2, int8 (KV8) =
+  // d, int4 (KV4) = d/2 (two 4-bit codes pack into one byte).
+  const std::size_t kv_row_bytes =
+      g->kv4 ? static_cast<std::size_t>(g->d) / 2
+             : (g->kv8 ? static_cast<std::size_t>(g->d)
+                       : static_cast<std::size_t>(g->d) * sizeof(std::uint16_t));
+  if (!checked_mul(kv_elems, kv_row_bytes, &kv_bytes) ||
       !checked_mul(kv8_scale_elems, sizeof(float), &kv8_scale_bytes) ||
       !checked_mul(compact_elems, sizeof(std::uint16_t), &compact_bytes) ||
       !checked_mul(static_cast<std::size_t>(g->Hq),
@@ -887,6 +969,13 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
     if (e == cudaSuccess) e = cudaMalloc(&g->kv8_v, kv_bytes);
     if (e == cudaSuccess) e = cudaMalloc(&g->kv8_k_scale, kv8_scale_bytes);
     if (e == cudaSuccess) e = cudaMalloc(&g->kv8_v_scale, kv8_scale_bytes);
+  } else if (g->kv4) {
+    // KV4: int4 codes (d/2 bytes/row) + a per-row float scale; no bf16
+    // persistent cache and no compact-prefix scratch (both left null).
+    e = cudaMalloc(&g->kv4_k, kv_bytes);
+    if (e == cudaSuccess) e = cudaMalloc(&g->kv4_v, kv_bytes);
+    if (e == cudaSuccess) e = cudaMalloc(&g->kv4_k_scale, kv8_scale_bytes);
+    if (e == cudaSuccess) e = cudaMalloc(&g->kv4_v_scale, kv8_scale_bytes);
   } else {
     e = cudaMalloc(&g->kv_k, kv_bytes);
     if (e == cudaSuccess) e = cudaMalloc(&g->kv_v, kv_bytes);
@@ -938,6 +1027,10 @@ void gpu_ctx_free(GpuCtx* ctx) {
   cudaFree(ctx->kv8_v);
   cudaFree(ctx->kv8_k_scale);
   cudaFree(ctx->kv8_v_scale);
+  cudaFree(ctx->kv4_k);
+  cudaFree(ctx->kv4_v);
+  cudaFree(ctx->kv4_k_scale);
+  cudaFree(ctx->kv4_v_scale);
   cudaFree(ctx->compact_k);
   cudaFree(ctx->compact_v);
   cudaFree(ctx->logits_scratch);
@@ -1013,6 +1106,13 @@ struct LayerView {
   float* kv8_k_scale;
   float* kv8_v_scale;
   bool kv8;
+  // KV4 (Q4_0): int4 persistent cache (d/2 code bytes/row) + per-row scales
+  // (null unless g->kv4). Same write-on-append / read-on-load contract as KV8.
+  std::uint8_t* kv4_k;
+  std::uint8_t* kv4_v;
+  float* kv4_k_scale;
+  float* kv4_v_scale;
+  bool kv4;
 };
 
 LayerView layer_view(const GpuCtx* g, int layer) {
@@ -1023,6 +1123,7 @@ LayerView layer_view(const GpuCtx* g, int layer) {
   const std::uint8_t* const b =
       g->weights + lay.embed_bytes() + static_cast<std::size_t>(layer) * lay.layer_bytes();
   const std::size_t kv = static_cast<std::size_t>(layer) * g->Hk * g->max_pos * g->d;
+  const std::size_t kv4 = static_cast<std::size_t>(layer) * g->Hk * g->max_pos * (g->d / 2);
   const std::size_t kv8 = static_cast<std::size_t>(layer) * g->Hk * g->max_pos;
   LayerView v;
   v.attn_norm = reinterpret_cast<const std::uint16_t*>(b + lay.off_attn_norm());
@@ -1042,6 +1143,11 @@ LayerView layer_view(const GpuCtx* g, int layer) {
   v.kv8_v = g->kv8 ? g->kv8_v + kv : nullptr;
   v.kv8_k_scale = g->kv8 ? g->kv8_k_scale + kv8 : nullptr;
   v.kv8_v_scale = g->kv8 ? g->kv8_v_scale + kv8 : nullptr;
+  v.kv4 = g->kv4;
+  v.kv4_k = g->kv4 ? g->kv4_k + kv4 : nullptr;
+  v.kv4_v = g->kv4 ? g->kv4_v + kv4 : nullptr;
+  v.kv4_k_scale = g->kv4 ? g->kv4_k_scale + kv8 : nullptr;
+  v.kv4_v_scale = g->kv4 ? g->kv4_v_scale + kv8 : nullptr;
   return v;
 }
 
@@ -1269,7 +1375,11 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
         d_k_new_rot);
     G4_CUDA_CHECK(cudaGetLastError());
     const int kv_len = t_host + 1;
-    if (g->kv8) {
+    if (g->kv4) {
+      kv_append_int4_kernel<<<Hk, kKvAppendInt4Threads>>>(
+          d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale,
+          g->d_pos, max_pos, Hk, d);
+    } else if (g->kv8) {
       kv_append_int8_kernel<<<Hk, kKvAppendInt8Threads>>>(
           d_k_new_rot, d_v_new, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale,
           g->d_pos, max_pos, Hk, d);
@@ -1285,19 +1395,30 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
     bucket(StepProbe::kAttnAttn, layer, 1);
 
     bucket(StepProbe::kAttnOut, layer, 0);
-    if (g->kv8) {
+    if (g->kv4) {
+      // KV4: the persistent cache is int4, so only the split-KV attention
+      // (int4 dequant-on-load) is valid here - the fused-GQA variants read
+      // the (unallocated) bf16 cache.
+      if (!g->split_attn) return -1;
+      if (attn_split(d_qf_rot, nullptr, nullptr, att_scale, Hq, Hk, d, 0, g->d_pos, 1,
+                     max_pos, g->attn_scratch, d_attn_out, nullptr, nullptr,
+                     lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
+                     true) != 0)
+        return -1;
+    } else if (g->kv8) {
       // KV8: the persistent cache is int8, so only the split-KV attention
       // (int8 dequant-on-load) is valid here - the fused-GQA variants read
-      // the (unallocated) bf16 cache. gpu_ctx_create rejects kv8 configs
-      // without split_attn, so this is the only kv8 attention branch.
+      // the (unallocated) bf16 cache.
       if (!g->split_attn) return -1;
       if (attn_split(d_qf_rot, nullptr, nullptr, att_scale, Hq, Hk, d, 0, g->d_pos, 1,
                      max_pos, g->attn_scratch, d_attn_out, lw.kv8_k, lw.kv8_v,
-                     lw.kv8_k_scale, lw.kv8_v_scale, true) != 0)
+                     lw.kv8_k_scale, lw.kv8_v_scale, true, nullptr, nullptr,
+                     false) != 0)
         return -1;
     } else if (direct && g->split_attn) {
       if (attn_split(d_qf_rot, lw.kv_k, lw.kv_v, att_scale, Hq, Hk, d, 0, g->d_pos, 1,
-                     max_pos, g->attn_scratch, d_attn_out) != 0)
+                     max_pos, g->attn_scratch, d_attn_out, nullptr, nullptr,
+                     nullptr, nullptr, false, nullptr, nullptr, false) != 0)
         return -1;
     } else if (direct) {
       // kv_len = *d_pos + 1 on the device; max_pos bounds the shared memory.
@@ -1436,7 +1557,28 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
         granite4_verify_qkv(d_normed, lw.wq, lw.wk, lw.wv, lw.sc[0], lw.sc[1], lw.sc[2],
                             rows, Hq * d, Hk * d, Hk * d, H, d_qf, d_k_new, d_v_new) != 0)
       return -1;
-    if (g->kv8) {
+    if (g->kv4) {
+      // KV4: rotate Q/K, append the verify rows to the int4 persistent cache,
+      // and run the int4 split-KV attention. Only the split-KV path is valid
+      // under KV4 (fused-GQA reads the unallocated bf16 cache), so guard it.
+      if (!g->split_attn ||
+          granite4_kernel_rope_at_pos_batched(
+              d_qf, g->cos_tbl + static_cast<std::size_t>(start) * half,
+              g->sin_tbl + static_cast<std::size_t>(start) * half, rows, Hq, d,
+              d_qf_rot) != 0 ||
+          granite4_kernel_rope_at_pos_batched(
+              d_k_new, g->cos_tbl + static_cast<std::size_t>(start) * half,
+              g->sin_tbl + static_cast<std::size_t>(start) * half, rows, Hk, d,
+              d_k_new_rot) != 0 ||
+          granite4_kernel_kv_append_int4_batched(
+              d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale,
+              start, rows, g->max_pos, Hk, d) != 0 ||
+          attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d,
+                     start, nullptr, rows, g->max_pos, g->attn_scratch, d_attn_out,
+                     nullptr, nullptr, lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k,
+                     lw.kv4_v, true) != 0)
+        return -1;
+    } else if (g->kv8) {
       // KV8: rotate Q/K (the bf16 stage's RoPE), append the verify rows to the
       // int8 persistent cache, and run the int8 split-KV attention. Only the
       // split-KV path is valid under KV8 (fused-GQA reads the unallocated
@@ -1455,7 +1597,8 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
               start, rows, g->max_pos, Hk, d) != 0 ||
           attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d,
                      start, nullptr, rows, g->max_pos, g->attn_scratch, d_attn_out, lw.kv8_k,
-                     lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, true) != 0)
+                     lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, true, nullptr, nullptr,
+                     false) != 0)
         return -1;
     } else if (granite4_kernel_verify_qkv_stage(
                    d_qf, d_k_new, d_v_new,
@@ -1465,7 +1608,8 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
                (g->split_attn
                     ? attn_split(d_qf_rot, lw.kv_k, lw.kv_v, g->spec.attention_multiplier, Hq,
                                  Hk, d, start, nullptr, rows, g->max_pos, g->attn_scratch,
-                                 d_attn_out)
+                                 d_attn_out, nullptr, nullptr, nullptr, nullptr, false,
+                                  nullptr, nullptr, false)
                     : granite4_kernel_gqa_fused_batched(d_qf_rot, lw.kv_k, lw.kv_v,
                                                         g->spec.attention_multiplier, Hq, Hk, d,
                                                         start, rows, g->max_pos,
@@ -1642,7 +1786,21 @@ int forward_prefill(GpuCtx* g, const std::int32_t* d_tokens, int start, int end,
       if (granite4_kernel_rmsnorm(s.hidden, lw.attn_norm, rms_eps, M, H, s.normed) != 0 ||
           prefill_gemm(GemmOut::kBf16, s.normed, H, lw.wq, M, nqkv, H, qkv, s.ws, s.ws_bytes) != 0)
         return -1;
-      if (g->kv8) {
+      if (g->kv4) {
+        // KV4: append the chunk's K/V to the int4 persistent cache (rotating
+        // K, quantizing K and V per row as two-per-byte int4 codes), then run
+        // the int4 tensor-core causal attention. The fused-GQA rows fallback
+        // reads the unallocated bf16 cache, so it is unavailable under KV4.
+        if (prefill_rope_split_append_int4(
+                s.qkv, g->cos_tbl, g->sin_tbl, c0, M, Hq, Hk, d, g->max_pos,
+                s.q_rot, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale) != 0 ||
+            prefill_attention(s.q_rot, nullptr, nullptr,
+                              g->spec.attention_multiplier, Hq, Hk, d, c0, M,
+                              g->max_pos, s.attn, nullptr, nullptr, lw.kv4_k_scale,
+                              lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
+                              true) != 0)
+          return -1;
+      } else if (g->kv8) {
         // KV8: append the chunk's K/V to the int8 persistent cache (rotating
         // K, quantizing K and V per row), then run the int8 tensor-core causal
         // attention. The fused-GQA rows fallback reads the unallocated bf16
@@ -1653,7 +1811,7 @@ int forward_prefill(GpuCtx* g, const std::int32_t* d_tokens, int start, int end,
             prefill_attention(s.q_rot, nullptr, nullptr,
                               g->spec.attention_multiplier, Hq, Hk, d, c0, M,
                               g->max_pos, s.attn, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale,
-                              lw.kv8_v_scale, true) != 0)
+                              lw.kv8_v_scale, true, nullptr, nullptr, false) != 0)
           return -1;
       } else if (prefill_rope_split_append(
                      s.qkv, g->cos_tbl, g->sin_tbl, c0, M, Hq, Hk, d, g->max_pos,
@@ -1661,7 +1819,7 @@ int forward_prefill(GpuCtx* g, const std::int32_t* d_tokens, int start, int end,
                  (prefill_attention(s.q_rot, lw.kv_k, lw.kv_v,
                                     g->spec.attention_multiplier, Hq, Hk, d, c0, M,
                                     g->max_pos, s.attn, nullptr, nullptr, nullptr,
-                                    nullptr, false) != 0 &&
+                                    nullptr, false, nullptr, nullptr, false) != 0 &&
                   granite4_kernel_gqa_fused_rows(s.q_rot, lw.kv_k, lw.kv_v,
                                                  g->spec.attention_multiplier, Hq,
                                                  Hk, d, c0, M, g->max_pos,
@@ -2044,6 +2202,10 @@ void gpu_ctx_reset(GpuCtx* ctx) {
 
 bool gpu_ctx_is_kv8(const GpuCtx* ctx) {
   return ctx != nullptr && ctx->kv8;
+}
+
+bool gpu_ctx_is_kv4(const GpuCtx* ctx) {
+  return ctx != nullptr && ctx->kv4;
 }
 
 bool gpu_ctx_is_split_attn(const GpuCtx* ctx) {

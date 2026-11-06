@@ -98,6 +98,13 @@ int gpu_ctx_truncate(GpuCtx* ctx, int written);
 // fell back to bf16 reports false.
 bool gpu_ctx_is_kv8(const GpuCtx* ctx);
 
+// True when the persistent KV cache is stored as int4 (Q4_0: two 4-bit codes
+// per byte + per-row float scale). Same ground-truth semantics as
+// gpu_ctx_is_kv8() - reports the resolved mode after the split-attention
+// capability check, so a config that requested int4 KV but fell back to bf16
+// reports false.
+bool gpu_ctx_is_kv4(const GpuCtx* ctx);
+
 // True when the split-KV attention (decode / verify / prefill) is the active
 // path. Implied by gpu_ctx_is_kv8() in the current implementation (KV8 can
 // only use split-KV), but exposed separately because the bf16 mode may use

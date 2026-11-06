@@ -60,7 +60,7 @@ int tiles_per_split(int stride) {
 // float scale. The tile fill dequantizes each row into the same bf16 Ks/Vs
 // tiles the bf16 path writes, so everything after the tile fill (logits,
 // online softmax, PV) is byte-identical between the two instantiations.
-template <bool Int8>
+template <bool Int8, bool Int4>
 __global__ void __launch_bounds__(kThreads)
     attn_split_kernel(const std::uint16_t* __restrict__ q,
                       const std::uint16_t* __restrict__ k,
@@ -71,7 +71,9 @@ __global__ void __launch_bounds__(kThreads)
                       const std::int8_t* __restrict__ cache_k8,
                       const std::int8_t* __restrict__ cache_v8,
                       const float* __restrict__ k_scale,
-                      const float* __restrict__ v_scale) {
+                      const float* __restrict__ v_scale,
+                      const std::uint8_t* __restrict__ cache_k4,
+                      const std::uint8_t* __restrict__ cache_v4) {
   const int hkv = blockIdx.x;
   const int split = blockIdx.y;
   const int row = blockIdx.z;
@@ -91,25 +93,30 @@ __global__ void __launch_bounds__(kThreads)
   const std::uint16_t* const qrow = q + (static_cast<std::size_t>(row) * Hq + h) * kD;
   for (int i = lane; i < kD; i += 32) qs[warp][i] = bf16_to_f32(qrow[i]);
 
+  const bool quantized = Int8 || Int4;
   const std::uint16_t* const kb =
-      Int8 ? nullptr : k + static_cast<std::size_t>(hkv) * stride * kD;
+      quantized ? nullptr : k + static_cast<std::size_t>(hkv) * stride * kD;
   const std::uint16_t* const vb =
-      Int8 ? nullptr : v + static_cast<std::size_t>(hkv) * stride * kD;
+      quantized ? nullptr : v + static_cast<std::size_t>(hkv) * stride * kD;
   const std::int8_t* const k8 =
       Int8 ? cache_k8 + static_cast<std::size_t>(hkv) * stride * kD : nullptr;
   const std::int8_t* const v8 =
       Int8 ? cache_v8 + static_cast<std::size_t>(hkv) * stride * kD : nullptr;
+  const std::uint8_t* const k4 =
+      Int4 ? cache_k4 + static_cast<std::size_t>(hkv) * stride * (kD / 2) : nullptr;
+  const std::uint8_t* const v4 =
+      Int4 ? cache_v4 + static_cast<std::size_t>(hkv) * stride * (kD / 2) : nullptr;
   const float* const ksc =
-      Int8 ? k_scale + static_cast<std::size_t>(hkv) * stride : nullptr;
+      quantized ? k_scale + static_cast<std::size_t>(hkv) * stride : nullptr;
   const float* const vsc =
-      Int8 ? v_scale + static_cast<std::size_t>(hkv) * stride : nullptr;
+      quantized ? v_scale + static_cast<std::size_t>(hkv) * stride : nullptr;
   float m = -INFINITY, l = 0.0f;
   float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // dims 4 * lane ... 4 * lane + 3
 
   for (int t0 = t_begin; t0 < t_end; t0 += kTile) {
     const int n = min(kTile, t_end - t0);
     __syncthreads();  // previous tile's readers (and the q preload) are done
-    if (!Int8) {
+    if (!quantized) {
       for (int idx = threadIdx.x; idx < n * (kD / 8); idx += kThreads) {
         const int r = idx / (kD / 8), c = (idx % (kD / 8)) * 8;
         const std::size_t off = static_cast<std::size_t>(t0 + r) * kD + c;
@@ -120,6 +127,23 @@ __global__ void __launch_bounds__(kThreads)
         kd[2] = k4.z;
         kd[3] = k4.w;
         *reinterpret_cast<uint4*>(&Vs[r][c]) = *reinterpret_cast<const uint4*>(vb + off);
+      }
+    } else if (Int4) {
+      // KV4: one thread per (row, code-byte) - read the two packed int4 codes,
+      // dequantize with the row's scale, and store the packed bf16 word (Ks)
+      // and the two bf16 values (Vs) into the same tiles.
+      for (int idx = threadIdx.x; idx < n * (kD / 2); idx += kThreads) {
+        const int r = idx / (kD / 2), w = idx % (kD / 2);
+        const int pos = t0 + r;
+        const std::size_t cbase = static_cast<std::size_t>(pos) * (kD / 2) + w;
+        const float sk = ksc[pos], sv = vsc[pos];
+        float klo, khi, vlo, vhi;
+        dev::q4_dequant_pair(k4[cbase], sk, klo, khi);
+        dev::q4_dequant_pair(v4[cbase], sv, vlo, vhi);
+        Ks[r][w] = static_cast<std::uint32_t>(f32_to_bf16(klo)) |
+                   (static_cast<std::uint32_t>(f32_to_bf16(khi)) << 16);
+        Vs[r][2 * w] = f32_to_bf16(vlo);
+        Vs[r][2 * w + 1] = f32_to_bf16(vhi);
       }
     } else {
       // KV8: one thread per (row, dim-pair) - read the two int8 codes,
@@ -227,27 +251,35 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                int kv_base, const int* d_pos, int rows, int stride, void* scratch,
                std::uint16_t* out, const std::int8_t* cache_k8,
                const std::int8_t* cache_v8, const float* cache_k_scale,
-               const float* cache_v_scale, bool int8) {
+               const float* cache_v_scale, bool int8, const std::uint8_t* cache_k4,
+               const std::uint8_t* cache_v4, bool int4) {
   if (q == nullptr || scratch == nullptr || out == nullptr ||
       !std::isfinite(scale) || d != kD || Hk <= 0 || Hq != kG * Hk ||
       rows <= 0 || rows > kMaxVerifyRows || stride <= 0 ||
       (d_pos == nullptr && kv_base + rows > stride) ||
+      (int8 && int4) ||
       (int8 && (cache_k8 == nullptr || cache_v8 == nullptr ||
                 cache_k_scale == nullptr || cache_v_scale == nullptr)) ||
-      (!int8 && (cache_k == nullptr || cache_v == nullptr)))
+      (int4 && (cache_k4 == nullptr || cache_v4 == nullptr ||
+                cache_k_scale == nullptr || cache_v_scale == nullptr)) ||
+      (!int8 && !int4 && (cache_k == nullptr || cache_v == nullptr)))
     return -1;
   const int tps = tiles_per_split(stride);
   const int splits = ((stride + kTile - 1) / kTile + tps - 1) / tps;
   float2* const ml = static_cast<float2*>(scratch);
   float* const po = reinterpret_cast<float*>(ml + static_cast<std::size_t>(rows) * Hq * splits);
   if (int8)
-    attn_split_kernel<true><<<dim3(Hk, splits, rows), kThreads>>>(
+    attn_split_kernel<true, false><<<dim3(Hk, splits, rows), kThreads>>>(
         q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, ml, po,
-        cache_k8, cache_v8, cache_k_scale, cache_v_scale);
+        cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr);
+  else if (int4)
+    attn_split_kernel<false, true><<<dim3(Hk, splits, rows), kThreads>>>(
+        q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, ml, po,
+        nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4);
   else
-    attn_split_kernel<false><<<dim3(Hk, splits, rows), kThreads>>>(
+    attn_split_kernel<false, false><<<dim3(Hk, splits, rows), kThreads>>>(
         q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, ml, po,
-        nullptr, nullptr, nullptr, nullptr);
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
   attn_combine_kernel<<<dim3(Hq, rows), kD>>>(ml, po, Hq, kv_base, d_pos, tps, splits, out);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) {

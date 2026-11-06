@@ -170,16 +170,108 @@ usable, pool = sessions × context):
 | Engine KV format | Bytes/pos | Capacity at FP8 weights |
 | --- | ---: | --- |
 | BF16 (live path, measured) | 160 KiB | 32768 positions (the ceiling above) |
-| int8 Q8_0-style (KV8; `engine/src/kernel_math.h`, device + host tests) | ~82.5 KiB | ~78K ⇒ **64K × 1 / 32K × 2** |
-| Q4_0-style (follow-up) | ~41 KiB | ~156K ⇒ **64K × 2 / 128K × 1 / 32K × 4** |
+| int8 Q8_0-style (KV8; `engine/src/kernel_math.h`, device + host tests) | ~82.5 KiB (measured **78.2 KiB/pos** pool, "Measured KV8 A/B") | ~78K ⇒ **64K × 1 / 32K × 2** (measured: slightly better) |
+| Q4_0-style (KV4; `G4_KV8=4`, `engine/src/kernel_math.h`, device + host tests) | 42.5 KiB (exact arithmetic: 40 KiB codes + 2.5 KiB scales) | ~156K ⇒ **64K × 2 / 128K × 1 / 32K × 4** |
 
-So in-engine: int8 KV8 unlocks `reader/standard` (64K) today; Q4_0 KV is the
-follow-up that unlocks the full 2-slot baseline. A Q4_K_M *weight* path is
+So in-engine: int8 KV8 unlocks `reader/standard` (64K) today, and the
+int4 KV4 path (`G4_KV8=4`, flake option `kv4 = true`) is the one that
+unlocks the full 131072-position reader pool on a 16 GiB card — the
+capacity arithmetic is exact ("Q4_0-KV (int4) footprint" below) and the
+serve-level A/B is pending a free GPU. A Q4_K_M *weight* path is
 not yet supported by this engine (FP8/BF16 only), so the llama.cpp server
 remains the reference deployment until it lands. The FP8 paged pool
 (`kv_pool.h`, `kernels_phase3.cu`) stays test-only until the live path
 switches to it; the EAGLE draft head keeps its 1-layer BF16 KV (per-session
 footprint is negligible; conversion is deferred with the quality evidence).
+
+## Measured KV8 A/B (gremlin-1, 2026-11-05)
+
+`scripts/kv8-ab-bench.sh` runs `kv-bench` per mode (G4_KV8=0 bf16 vs G4_KV8=1
+int8 Q8_0; deterministic pseudo-tokens, identical workload, 3 repeats, best
+kept; binary at worktree HEAD `bd14c2e`, checkpoint `/home/celes/kv8-bench`):
+
+| max_pos | KV pool delta (int8 smaller) | prefill ms bf16→int8 | decode t/s bf16→int8 |
+| ---: | ---: | --- | --- |
+| 2305 (2048 ctx + 256 decode) | 184.0 MiB (192,937,984 B) | 523.2 → 542.7 (+3.7%) | 68.4 → 67.1 (−1.9%) |
+| 4353 (4096 ctx + 256 decode) | 347.9 MiB (364,904,448 B) | 1064.2 → 1150.2 (+8.1%) | 65.6 → 64.1 (−2.3%) |
+| 8321 (8192 ctx + 128 decode) | 664.2 MiB (696,254,464 B) | 2302.9 → 2622.9 (+13.9%) | 60.7 → 58.5 (−3.5%) |
+
+Read:
+
+- **Capacity: int8 pool is ~52% smaller** — the measured bf16−int8 delta is
+  ~81.8 KiB per position, i.e. the int8 pool is **~78.2 KiB/pos** vs 160 KiB
+  bf16. That is ~4.3 KiB/pos better than the 82.5 KiB planning estimate
+  (the Q8_0 per-row scale packs tighter than the estimate assumed), so the
+  capacity ceiling is slightly above the ~78K-position figure in the table
+  above. This is what unlocks `reader/standard` (64K × 2 slots).
+- **Latency: int8 is slightly slower, not faster** — prefill pays
+  quantize-on-append (+3.7…13.9%), decode pays dequant-on-load (−1.9…3.5%
+  tok/s). At these contexts the KV traffic is small next to the weights, so
+  the halved KV bandwidth does not pay back the quantize/dequant cost. KV8 is
+  a *capacity* optimization; do not expect it to speed up serving. The
+  prefill gap grows with context (the int8 tile-fill path is the longer
+  critical section at 8K ctx).
+- The bf16 numbers above are a clean run on the same card and agree with the
+  ~60–70 t/s decode band; int8 sits at −2…4% of that.
+
+Quality (teacher-forced, same checkpoint, 24 reference positions): run the
+gate prompt as `forward --tokens <prompt+ref[:-1]> --last 24` under
+`G4_KV8=0` and `G4_KV8=1` and compare the two logit sets directly (the
+confound-free measurement — a reference comparison would mix in the FP8
+checkpoint's own drift, ~3 ULP at pos 3 on this export). Result: **argmax
+identical at 23/24 positions; every position within 2 ULP** of the bf16 logit
+(max 2 ULP, at pos 4). The one argmax flip (pos 13) is a 1-ULP near-tie
+(11190 vs 3544), i.e. the int8 round-trip moves the top-1 only when the top
+two logits are within rounding of each other. So on this prompt the int8 KV
+storage cost is invisible at the token level; the kernel unit tests bound the
+per-element round-trip error, and the gate keeps validating the bf16
+arithmetic path (it pins G4_KV8=0 — see `docs/deployment.md`).
+
+Caveat: this is one short prompt. The free-running 512-token A/B on the same
+prompt does diverge (168/512 tokens from position 340), but that prompt
+degenerates into a repetition loop in *both* modes, so it measures chaotic
+loop sensitivity, not int8 error — the teacher-forced comparison above is the
+honest quality number.
+## Q4_0-KV (int4) footprint (exact arithmetic + unit-test bounds, 2026-11-04)
+
+`G4_KV8=4` stores the persistent K/V cache as Q4_0-style int4: two 4-bit
+codes per byte + one per-row float scale, dequantized on load (the int4
+analogue of the KV8 int8 path; `engine/src/kernel_math.h`, host + device
+tests; the int4 split-KV attention test in `engine/tests/test_kernels.cu`).
+
+Per-position cost (GreedyAttention shape: 40 layers, Hk=8 KV heads, d=64):
+
+    codes:  2 (K+V) * 8 heads * (64/2) code-bytes * 40 layers = 40,000 B
+    scales: 2 (K+V) * 8 heads * 4 B            * 40 layers =   2,560 B
+    total: 42,560 B = 42.5 KiB/pos
+
+vs bf16 160 KiB/pos (10x smaller) and int8 KV8 82.5 KiB/pos (1.94x smaller).
+A full 131072-position reader pool is 131072 * 42560 B = 5,576,763,392 B
+= **5436 MiB** — exact, no measurement required. Against the card budget
+(~14.3–14.9 GiB measured floor + weights/scratch, "Measured KV ceiling"):
+5436 MiB KV fits the 16376 MiB card for the *greedy* path with roughly
+~4–5 GiB left for weights + scratch + headroom. (The live serve also
+carries the EAGLE r8 head + its bf16 draft KV, which scales with the pool
+and is a separate budget — int4 unlocks 131K for the reader path only.)
+
+Quality bounds (unit tests, gremlin-1 CUDA build, binary at worktree HEAD):
+
+- int4 round-trip: worst device dequant error = **1.0 half-step** (bound
+  1.0) on the random 4-bit codes; device dequant is bit-exact against the
+  host twin on every code value 0..15.
+- int4 vs int8 per-row error: int4 is ~16x the int8 quantization step
+  (half-step = scale/8 vs scale/256); the per-row scale makes the absolute
+  error proportional to the row magnitude, same contract as KV8.
+- int4 split-KV attention: max |delta| vs the bf16 fused-GQA reference on
+  the quantized cache = **0.02283** (test_kv4_attn_split_device, Hq=8
+  Hk=2 d=128 rows=8). This is within the int4 dequantization noise floor;
+  it is the attention-level analogue of the KV8 test_attn_split bound.
+
+Pending: the serve-level A/B (prefill/decode latency, full-card margin with
+the EAGLE head co-resident) needs a free GPU — gremlin-1's card was held by
+the live serve during this work. `scripts/kv8-ab-bench.sh 4` runs it
+(int4 vs bf16, 3 repeats, same harness as the int8 table above).
+
 
 ## Budget (FP8 weights + FP8 KV), ~14.9 GiB usable
 

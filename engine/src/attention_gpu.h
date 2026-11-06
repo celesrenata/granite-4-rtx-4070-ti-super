@@ -19,17 +19,20 @@ std::size_t attn_split_scratch_bytes(int Hq, int rows, int stride);
 // Hq == 4 * Hk only; returns -1 otherwise (callers fall back to fused GQA).
 //
 // KV8 (Q8_0): when int8 is true the persistent cache is read as int8 codes
-// (cache_k8/cache_v8, [Hk][stride][d]) plus a per-row scale
+// int4, the KV cache is read as int4 codes (cache_k4/cache_v4,
+// [Hk][stride][d/2], two per byte) plus a per-row scale
 // (cache_k_scale/cache_v_scale, [Hk][stride]) and dequantized into the same
 // bf16 tiles; cache_k/cache_v are then ignored (pass nullptr). The bf16
-// path is bit-identical when int8 is false (the default).
+// path is bit-identical when int8 and int4 are both false (the default).
 int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                int kv_base, const int* d_pos, int rows, int stride, void* scratch,
                std::uint16_t* out, const std::int8_t* cache_k8 = nullptr,
                const std::int8_t* cache_v8 = nullptr,
                const float* cache_k_scale = nullptr,
-               const float* cache_v_scale = nullptr, bool int8 = false);
+               const float* cache_v_scale = nullptr, bool int8 = false,
+               const std::uint8_t* cache_k4 = nullptr,
+               const std::uint8_t* cache_v4 = nullptr, bool int4 = false);
 
 }  // namespace granite4
 

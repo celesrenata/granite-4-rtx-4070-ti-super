@@ -359,9 +359,52 @@
               example = "/opt/granite4-rtx-4070-ti-super/ckpt";
             };
             maxContext = lib.mkOption {
-              description = "Positions (prompt + completion) per request for the GPU engine; its KV cache costs 160 KiB of VRAM per position.";
+              description = "Positions (prompt + completion) per request for the GPU engine; its KV cache costs 160 KiB of VRAM per position (bf16 KV) or ~78.2 KiB (int8 KV, kv8 = true; measured, docs/memory.md).";
               type = lib.types.ints.positive;
               default = 8192;
+            };
+            kv8 = lib.mkOption {
+              description = ''
+                Store the engine's persistent KV cache as int8 (Q8_0: per-row
+                scale + int8 codes) instead of bf16, roughly halving KV VRAM
+                per position (160 KiB -> ~78.2 KiB, measured) so a larger
+                context pool fits the card. Off by default.
+
+                Quality: the KV *storage* is quantized; compute stays bf16.
+                The kernel unit tests bound the round-trip error and the
+                teacher-forced A/B (docs/memory.md, "Measured KV8 A/B") shows
+                the argmax flips only on 1-ULP near-ties. This is why the
+                parity gate is unaffected by this flag: it validates the bf16
+                *arithmetic* path and pins G4_KV8=0 on its engine subprocesses
+                (scripts/parity_gate.py _gate_env), so a KV8 serve config never
+                changes what the gate checks. Enabling this flag only switches
+                the serve engine to int8 KV.
+              '';
+              type = lib.types.bool;
+              default = false;
+            };
+            kv4 = lib.mkOption {
+              description = ''
+                Store the engine's persistent KV cache as int4 (Q4_0: per-row
+                scale + two int4 codes packed per byte) instead of bf16,
+                shrinking KV VRAM to 42.5 KiB per position (40 KiB codes +
+                2.5 KiB scales, ~74% smaller than bf16) so a much larger
+                context pool fits the card (131K positions for the reader
+                path). Off by default; mutually exclusive with kv8 - the
+                deploy must pick exactly one of the quantized formats.
+
+                Quality: the KV *storage* is quantized; compute stays bf16.
+                The int4 round-trip error is ~16x the per-row int8 error, so
+                the unit tests bound it (device codes/scales dequant bit-exact
+                against the host twin, round-trip within half a step) and the
+                split-KV int4 attention stays within the dequantization noise
+                of the bf16 reference (test_kernels.cu). As with kv8 the
+                parity gate is unaffected: it pins G4_KV8=0 in its engine
+                subprocesses, so this flag only switches the *serve* engine's
+                KV storage.
+              '';
+              type = lib.types.bool;
+              default = false;
             };
             eagle.head = lib.mkOption {
               description = "Trained EAGLE draft head (safetensors, scripts/eagle/export_head.py) for speculative decoding on the GPU engine. The engine's exact greedy verify keeps output identical to plain greedy decoding; null decodes without drafting.";
@@ -400,6 +443,10 @@
                 assertion = !serving || cfg.enginePackage != null;
                 message = "services.granite4-rtx.checkpoint needs services.granite4-rtx.enginePackage (packages.<system>.engine-cuda)";
               }
+              {
+                assertion = !(cfg.kv8 && cfg.kv4);
+                message = "services.granite4-rtx.kv8 and services.granite4-rtx.kv4 are mutually exclusive - pick one quantized KV format";
+              }
             ];
             users = {
               groups."granite4-rtx" = { };
@@ -419,6 +466,14 @@
               environment = lib.optionalAttrs serving ({
                 GRANITE4_GATE = gateFile;
                 GRANITE4_MAX_CONTEXT = toString cfg.maxContext;
+                # Serve engine KV storage: G4_KV8 in {"0" bf16, "1" int8,
+                # "4" int4} (engine first-char dispatch: "4" selects the
+                # int4 KV path). The parity gate runs as ExecStartPre in
+                # this same environment, but it pins G4_KV8=0 in its own
+                # engine subprocesses (scripts/parity_gate.py _gate_env), so
+                # this value only changes the *serve* engine's KV format,
+                # never what the gate validates.
+                G4_KV8 = if cfg.kv4 then "4" else (if cfg.kv8 then "1" else "0");
               } // lib.optionalAttrs (cfg.eagle.head != null) {
                 GRANITE4_EAGLE_HEAD = cfg.eagle.head;
                 GRANITE4_EAGLE_K = toString cfg.eagle.k;

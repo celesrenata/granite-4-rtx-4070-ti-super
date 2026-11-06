@@ -133,6 +133,40 @@ __device__ __forceinline__ float kv8_dequant(std::int8_t q, float scale) {
   return scale * static_cast<float>(q);
 }
 
+// ---------------------------------------------------------------------------
+// int4 KV (per-row scale, 2 codes/byte).
+//
+// Q4_0-style: s = amax / 7 (IEEE RNE); code = clamp(round_away(x / s), -7, 7)
+// + 8, so it lives in 0..15 and packs two per byte (lower nibble = the even
+// dim, upper nibble = the odd dim). Dequant = s * (code - 8). A (head,position)
+// row is d/2 code bytes + one float scale: for d == 128 that is 64 B + 4 B,
+// 4x the density of the int8 cache. Rounding reuses kv8_round_away so the
+// device/host twins stay bit-identical (the same guarantee as int8).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float q4_scale(float amax) {
+  // s = amax / 7 (IEEE RNE division). amax is a max of absolute values.
+  return amax / 7.0f;
+}
+
+// Quantize one value to a 0..15 code (caller places it in a byte nibble).
+// Rounding follows the int8 math (half away from zero) so the device/host
+// twins stay bit-identical; scale == 0 -> 8 (zero).
+__device__ __forceinline__ unsigned char q4_quant(float x, float scale) {
+  if (scale == 0.0f) return 8;
+  const long r = kv8_round_away(x / scale);
+  const long clamped = r > 7 ? 7 : (r < -7 ? -7 : r);
+  return static_cast<unsigned char>(clamped + 8);
+}
+
+// Unpack one byte into the two dequantized values (even dim, odd dim).
+__device__ __forceinline__ void q4_dequant_pair(unsigned char byte, float scale, float& lo,
+                                               float& hi) {
+  const float l = static_cast<float>(static_cast<int>(byte & 0x0fu) - 8);
+  const float h = static_cast<float>(static_cast<int>((byte >> 4) & 0x0fu) - 8);
+  lo = scale * l;
+  hi = scale * h;
+}
+
 }  // namespace dev
 }  // namespace granite4
 
