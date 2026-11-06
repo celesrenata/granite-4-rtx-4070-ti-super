@@ -487,8 +487,8 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
                                                   h->kv4_v_scale, p, R, h->max_pos, h->Hk,
                                                   h->d) != 0 ||
             attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
-                       h->max_pos, h->attn_scratch, att, nullptr, nullptr, nullptr, nullptr,
-                       false, h->kv4_k, h->kv4_v, true) != 0)
+                       h->max_pos, h->attn_scratch, att, nullptr, nullptr, h->kv4_k_scale,
+                       h->kv4_v_scale, false, h->kv4_k, h->kv4_v, true) != 0)
           return -1;
       }
     } else if (granite4_kernel_verify_qkv_stage(

@@ -175,14 +175,27 @@ the same budget) but is **slower, not faster** — prefill +6.7…24.8%
 (worse than int8's +3.7…13.9%, the penalty grows with context) and decode
 −1.8…3.1% t/s (tracking int8). Pick int8 when latency matters and 64K × 2
 fits; pick int4 only when the context pool must exceed what int8 can hold.
-The speculative EAGLE drafter keeps its own bf16 KV, which
-scales with the pool and is a separate budget — int4 unlocks 131K for the
-reader path, and the drafter would need the same treatment (or a reduced
-pool) to run at 131K. The
-int4 quantization error is ~16× the per-row int8 error, so the int8
-quality result (argmax identical except on 1-ULP near-ties) is a *bound*,
-not a promise, for int4: the kernel tests bound the int4 round-trip and
-split-KV attention ("Q4_0-KV (int4) footprint" in `docs/memory.md`).
+The speculative EAGLE drafter keeps its own persistent KV, which scales
+with the pool and is a separate budget — at 131072 positions the draft
+head's bf16 KV alone is ~537 MiB, which OOMs the 131K int4-reader config
+(the head dies on its last allocation, "eagle head: rope tables").
+`G4_DRAFT_KV` quantizes that draft KV (16 = bf16, the default; 8 = Q8_0;
+4 = Q4_0), reusing the reader's int8/int4 append + split-KV attention
+kernels; both quantized widths require the split-attention shape
+(d==128, Hq==4*Hk) and fall back to bf16 otherwise. Measured fit on
+gremlin-1 (int4 reader pool @ 131072, r8 head, 1 session):
+
+| draft KV | mem used | free |
+| --- | ---: | ---: |
+| 16 (bf16) | **OOM** | — |
+| 8 (int8) | 15795 MiB | 233 MiB |
+| 4 (int4) | 15667 MiB | 361 MiB |
+
+with the default path unchanged (bf16 draft @ 32768: 15359 MiB, the live
+footprint). Drafts are still target-verified in full precision, so a
+quantized draft KV can only lower the acceptance rate, never change the
+output; the int4 per-row error is ~16× the int8 one, so int8 draft KV is
+the recommended 131K setting and int4 the headroom option.
 
 Deploy a pushed commit:
 
