@@ -261,6 +261,21 @@ std::array<std::size_t, 2> PagedKV::locate(int seq, std::size_t token) const {
   return {s.block_table[token / B], token % B};
 }
 
+bool PagedKV::row_table(int seq, std::size_t n, int* out) const {
+  if (seq < 0 || seq >= static_cast<int>(seqs_.size()) || !seqs_[seq].live ||
+      out == nullptr)
+    return false;
+  const Sequence& s = seqs_[seq];
+  if (n > s.filled) return false;
+  const std::size_t B = config_.tokens_per_page;
+  for (std::size_t p = 0; p < n; ++p) {
+    const std::size_t page_id = s.block_table[p / B];
+    const std::size_t token_local = p % B;
+    out[p] = static_cast<int>(page_id * B + token_local);
+  }
+  return true;
+}
+
 void PagedKV::release(int seq) {
   if (seq < 0 || seq >= static_cast<int>(seqs_.size()) || !seqs_[seq].live) {
     return;

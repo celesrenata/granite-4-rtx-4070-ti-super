@@ -134,6 +134,22 @@ class PagedKV {
   // Physical location of token `token`'s KV: {page_id, token_local}.
   std::array<std::size_t, 2> locate(int seq, std::size_t token) const;
 
+  // --- Device-arena row mapping (live forward, Phase 4) -------------------
+  // The live GPU arena is laid out layer-major [L][Hk][rows][elem] where a
+  // page occupies tokens_per_page contiguous *rows*. A sequence's logical KV
+  // position p lives in physical row (page_row_offset * tokens_per_page +
+  // p % tokens_per_page). These are layout-independent: only the in-row byte
+  // layout (bf16 / int8 / int4) differs, which the attention/append kernels
+  // handle. row_table(seq) is the device `position -> row` table the paged
+  // kernels index through (d_pt).
+  std::size_t page_rows() const { return config_.tokens_per_page; }
+  std::size_t row_offset(std::size_t page_id) const {
+    return page_id * config_.tokens_per_page;
+  }
+  // Fill `out` with the physical row for each logical position [0, n) of
+  // `seq`. n must be <= sequence_tokens(seq). Returns false otherwise.
+  bool row_table(int seq, std::size_t n, int* out) const;
+
   // Decrement every page the sequence references; free the pages that reach
   // ref count 0. The sequence becomes unusable.
   void release(int seq);
