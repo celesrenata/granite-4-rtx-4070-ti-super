@@ -18,8 +18,6 @@ set(GRANITE_ENGINE_SOURCES
   src/checkpoint_main.cc
   src/kv_pool.h
   src/kv_pool.cc
-  src/kv_pool_device.h
-  src/kv_pool_device.cc
   src/draft_lookup.h
   src/draft_lookup.cc
   src/speculative_verify.h
@@ -107,12 +105,6 @@ add_test(NAME kernel_math COMMAND granite4-kernel-math-test)
 add_executable(granite4-kv-pool-test tests/test_kv_pool.cc)
 target_link_libraries(granite4-kv-pool-test PRIVATE granite4_static)
 add_test(NAME kv_pool COMMAND granite4-kv-pool-test)
-
-# Phase 4 (Integration): device KV pool bookkeeping (allocator, LRU prefix
-# cache, refcount, FNV-chained page keys, arena layout). Host-only, no CUDA.
-add_executable(granite4-kv-pool-device-test tests/test_kv_pool_device.cc)
-target_link_libraries(granite4-kv-pool-device-test PRIVATE granite4_static)
-add_test(NAME kv_pool_device COMMAND granite4-kv-pool-device-test)
 
 # Speculative drafters (host-only): prompt-lookup proposals are verified by
 # the target model, so they carry no weights and no GPU dependency.

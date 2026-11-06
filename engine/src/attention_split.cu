@@ -60,12 +60,7 @@ int tiles_per_split(int stride) {
 // float scale. The tile fill dequantizes each row into the same bf16 Ks/Vs
 // tiles the bf16 path writes, so everything after the tile fill (logits,
 // online softmax, PV) is byte-identical between the two instantiations.
-// Paged: the position index read from the KV cache is remapped through the
-// per-sequence row table `d_pt` (device array, one int per logical position,
-// value = physical arena row). The arena keeps the static [L][Hk][rows][d]
-// layout with rows == pool_rows, so only the position -> row identity
-// changes; the split layout, tile staging and numerics are untouched.
-template <bool Int8, bool Int4, bool Paged>
+template <bool Int8, bool Int4>
 __global__ void __launch_bounds__(kThreads)
     attn_split_kernel(const std::uint16_t* __restrict__ q,
                       const std::uint16_t* __restrict__ k,
@@ -78,8 +73,7 @@ __global__ void __launch_bounds__(kThreads)
                       const float* __restrict__ k_scale,
                       const float* __restrict__ v_scale,
                       const std::uint8_t* __restrict__ cache_k4,
-                      const std::uint8_t* __restrict__ cache_v4,
-                      const int* __restrict__ d_pt) {
+                      const std::uint8_t* __restrict__ cache_v4) {
   const int hkv = blockIdx.x;
   const int split = blockIdx.y;
   const int row = blockIdx.z;
@@ -125,8 +119,7 @@ __global__ void __launch_bounds__(kThreads)
     if (!quantized) {
       for (int idx = threadIdx.x; idx < n * (kD / 8); idx += kThreads) {
         const int r = idx / (kD / 8), c = (idx % (kD / 8)) * 8;
-        const std::size_t off =
-            static_cast<std::size_t>(Paged ? d_pt[t0 + r] : (t0 + r)) * kD + c;
+        const std::size_t off = static_cast<std::size_t>(t0 + r) * kD + c;
         const uint4 k4 = *reinterpret_cast<const uint4*>(kb + off);
         std::uint32_t* const kd = &Ks[r][c / 2];
         kd[0] = k4.x;
@@ -142,9 +135,8 @@ __global__ void __launch_bounds__(kThreads)
       for (int idx = threadIdx.x; idx < n * (kD / 2); idx += kThreads) {
         const int r = idx / (kD / 2), w = idx % (kD / 2);
         const int pos = t0 + r;
-        const int pr = Paged ? d_pt[pos] : pos;  // arena row
-        const std::size_t cbase = static_cast<std::size_t>(pr) * (kD / 2) + w;
-        const float sk = ksc[pr], sv = vsc[pr];
+        const std::size_t cbase = static_cast<std::size_t>(pos) * (kD / 2) + w;
+        const float sk = ksc[pos], sv = vsc[pos];
         float klo, khi, vlo, vhi;
         dev::q4_dequant_pair(k4[cbase], sk, klo, khi);
         dev::q4_dequant_pair(v4[cbase], sv, vlo, vhi);
@@ -160,9 +152,8 @@ __global__ void __launch_bounds__(kThreads)
       for (int idx = threadIdx.x; idx < n * (kD / 2); idx += kThreads) {
         const int r = idx / (kD / 2), w = idx % (kD / 2);
         const int pos = t0 + r;
-        const int pr = Paged ? d_pt[pos] : pos;  // arena row
-        const std::size_t base = static_cast<std::size_t>(pr) * kD + 2 * w;
-        const float sk = ksc[pr], sv = vsc[pr];
+        const std::size_t base = static_cast<std::size_t>(pos) * kD + 2 * w;
+        const float sk = ksc[pos], sv = vsc[pos];
         const std::uint16_t klo =
             f32_to_bf16(dev::kv8_dequant(k8[base], sk));
         const std::uint16_t khi =
@@ -261,8 +252,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                std::uint16_t* out, const std::int8_t* cache_k8,
                const std::int8_t* cache_v8, const float* cache_k_scale,
                const float* cache_v_scale, bool int8, const std::uint8_t* cache_k4,
-               const std::uint8_t* cache_v4, bool int4,
-               const int* d_pt = nullptr) {
+               const std::uint8_t* cache_v4, bool int4) {
   if (q == nullptr || scratch == nullptr || out == nullptr ||
       !std::isfinite(scale) || d != kD || Hk <= 0 || Hq != kG * Hk ||
       rows <= 0 || rows > kMaxVerifyRows || stride <= 0 ||
@@ -279,17 +269,17 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
   float2* const ml = static_cast<float2*>(scratch);
   float* const po = reinterpret_cast<float*>(ml + static_cast<std::size_t>(rows) * Hq * splits);
   if (int8)
-    attn_split_kernel<true, false, d_pt != nullptr><<<dim3(Hk, splits, rows), kThreads>>>(
+    attn_split_kernel<true, false><<<dim3(Hk, splits, rows), kThreads>>>(
         q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, ml, po,
-        cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr, d_pt);
+        cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr);
   else if (int4)
-    attn_split_kernel<false, true, d_pt != nullptr><<<dim3(Hk, splits, rows), kThreads>>>(
+    attn_split_kernel<false, true><<<dim3(Hk, splits, rows), kThreads>>>(
         q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, ml, po,
-        nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt);
+        nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4);
   else
-    attn_split_kernel<false, false, d_pt != nullptr><<<dim3(Hk, splits, rows), kThreads>>>(
+    attn_split_kernel<false, false><<<dim3(Hk, splits, rows), kThreads>>>(
         q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, ml, po,
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, d_pt);
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
   attn_combine_kernel<<<dim3(Hq, rows), kD>>>(ml, po, Hq, kv_base, d_pos, tps, splits, out);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) {
