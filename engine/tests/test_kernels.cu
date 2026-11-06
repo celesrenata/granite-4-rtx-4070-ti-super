@@ -1437,6 +1437,105 @@ static void test_attn_split_device() {
   cudaFree(dpos); cudaFree(scratch);
 }
 
+// Phase 4: paged decode attention. The KV arena need not be contiguous per
+// sequence - shared-prefix pages can sit anywhere in the arena, so the row
+// holding a logical position is gathered from a device position->row table
+// (d_pt). With d_pt null the kernel is the contiguous identity layout; with
+// a permutation d_pt the SAME logical cache is read out of a physically
+// permuted arena and the output must be bit-identical to the contiguous
+// result (the table is applied identically to bf16, int8 and int4 caches).
+static void test_paged_attn_split_device() {
+  const int Hq = 8, Hk = 2, d = 128, stride = 1500, base = 1203, rows = 4;
+  Xorshift64 rng(0x9e57);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  const float scale = 0.0078125f * 8.0f;
+
+  // A fixed permutation of the arena rows: perm[pos] is the physical row that
+  // holds logical position pos. Fisher-Yates makes it a real (non-identity)
+  // bijection, so the permuted arena is not trivially re-sorted.
+  std::vector<int> perm(stride);
+  for (int p = 0; p < stride; ++p) perm[p] = p;
+  for (int i = stride - 1; i > 0; --i) {
+    const int j = static_cast<int>(rng.next() % (i + 1));
+    std::swap(perm[i], perm[j]);
+  }
+
+  std::uint16_t *dq, *dref, *dgot, *dgotp;
+  int *dpos, *dpt;
+  void* scratch;
+  if (cudaMalloc(&dq, qn * 2) ||
+      cudaMalloc(&dref, qn * 2) || cudaMalloc(&dgot, qn * 2) ||
+      cudaMalloc(&dgotp, qn * 2) || cudaMalloc(&dpos, sizeof(int)) ||
+      cudaMalloc(&dpt, sizeof(int) * stride) ||
+      cudaMalloc(&scratch, granite4::attn_split_scratch_bytes(Hq, rows, stride))) {
+    ++g_failures;
+    return;
+  }
+
+  // Contiguous reference: the original arena, no row table.
+  std::uint16_t *dk, *dv;
+  if (cudaMalloc(&dk, cn * 2) || cudaMalloc(&dv, cn * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  expect(granite4_kernel_gqa_fused_rows(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride,
+                                         dref) == 0,
+         "paged attention: reference launch");
+  expect(granite4::attn_split(dq, dk, dv, scale, Hq, Hk, d, base, nullptr, rows, stride,
+                               scratch, dgot) == 0,
+         "paged attention: contiguous launch");
+
+  // Build the permuted arena: physical row perm[pos] holds logical position pos.
+  std::vector<std::uint16_t> ckp(cn), cvp(cn);
+  for (int hkv = 0; hkv < Hk; ++hkv)
+    for (int pos = 0; pos < stride; ++pos) {
+      const std::size_t src = static_cast<std::size_t>(hkv) * stride * d + static_cast<std::size_t>(pos) * d;
+      const std::size_t dst = static_cast<std::size_t>(hkv) * stride * d +
+                              static_cast<std::size_t>(perm[pos]) * d;
+      std::copy(ck.begin() + src, ck.begin() + src + d, ckp.begin() + dst);
+      std::copy(cv.begin() + src, cv.begin() + src + d, cvp.begin() + dst);
+    }
+  std::uint16_t *dkp, *dvp;
+  if (cudaMalloc(&dkp, cn * 2) || cudaMalloc(&dvp, cn * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dkp, ckp.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dvp, cvp.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dpt, perm.data(), sizeof(int) * stride, cudaMemcpyHostToDevice));
+
+  // Paged: the permuted arena read through the row table must match the
+  // contiguous reference bit-for-bit.
+  expect(granite4::attn_split(dq, dkp, dvp, scale, Hq, Hk, d, base, nullptr, rows, stride,
+                               scratch, dgotp, nullptr, nullptr, nullptr, nullptr, false,
+                               nullptr, nullptr, false, dpt) == 0,
+         "paged attention: paged launch");
+
+  std::vector<std::uint16_t> ref(qn), got(qn), gotp(qn);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got.data(), dgot, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(gotp.data(), dgotp, qn * 2, cudaMemcpyDeviceToHost));
+  bool contiguous_ok = true, paged_ok = true;
+  for (std::size_t i = 0; i < qn; ++i) {
+    if (got[i] != ref[i]) contiguous_ok = false;
+    if (gotp[i] != ref[i]) paged_ok = false;
+  }
+  expect(contiguous_ok, "paged attention: contiguous == fused GQA (bit-identical)");
+  expect(paged_ok, "paged attention: permuted arena via d_pt == contiguous (bit-identical)");
+
+  cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dkp); cudaFree(dvp);
+  cudaFree(dref); cudaFree(dgot); cudaFree(dgotp); cudaFree(dpos); cudaFree(dpt);
+  cudaFree(scratch);
+}
+
 static void test_batched_verify_attention_device() {
   // P4: the batched verify kernels must be bit-identical, row by row, to the
   // single-row path. Row r appends its KV at position base+r and attends the
@@ -2077,6 +2176,7 @@ int main() {
   test_prefill_gemm_device();
   test_prefill_attention_device();
   test_attn_split_device();
+  test_paged_attn_split_device();
   test_batched_silu_gate_up_device();
   test_batched_rmsnorm_device();
   test_batched_rope_device();

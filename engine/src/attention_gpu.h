@@ -18,6 +18,15 @@ std::size_t attn_split_scratch_bytes(int Hq, int rows, int stride);
 // caches are [Hk][stride][d]; out is [rows][Hq*d]. Head dim 128 and
 // Hq == 4 * Hk only; returns -1 otherwise (callers fall back to fused GQA).
 //
+// d_pt (default nullptr): a device `position -> physical KV row` table
+// covering cache positions [0, stride]. When null the layout is contiguous
+// (row == position). When set, each cache position is gathered through the
+// table, so a paged arena (shared-prefix pages that are not physically
+// contiguous) reads the same bytes as the contiguous layout. The split-KV
+// path honors d_pt for both bf16 and quantized (int8/int4) caches; the
+// fused-GQA rows fallback (rows > kMaxVerifyRows) does not, so a caller that
+// needs a paged layout must keep rows <= kMaxVerifyRows.
+//
 // KV8 (Q8_0): when int8 is true the persistent cache is read as int8 codes
 // int4, the KV cache is read as int4 codes (cache_k4/cache_v4,
 // [Hk][stride][d/2], two per byte) plus a per-row scale
@@ -32,7 +41,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const float* cache_k_scale = nullptr,
                const float* cache_v_scale = nullptr, bool int8 = false,
                const std::uint8_t* cache_k4 = nullptr,
-               const std::uint8_t* cache_v4 = nullptr, bool int4 = false);
+               const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
+               const int* d_pt = nullptr);
 
 }  // namespace granite4
 
