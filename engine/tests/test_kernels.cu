@@ -1670,7 +1670,7 @@ static void test_paged_kv_append_batched_device() {
    for (auto& t : sk) t = f32_to_bf16_host(rng.next_float_range(2.0));
    for (auto& t : sv) t = f32_to_bf16_host(rng.next_float_range(2.0));
 
-   const int max_pos = 32;
+   const int max_pos = 64;
    std::vector<int> perm(max_pos);
    for (int r = 0; r < max_pos; ++r) perm[r] = r;
    std::swap(perm[base], perm[base + rows - 1]);
