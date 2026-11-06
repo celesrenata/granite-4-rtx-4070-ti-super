@@ -862,14 +862,14 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
     *out = a + b;
     return true;
   };
-  std::size_t kv_elems = 0;
+  std::size_t kv_rows = 0;
   std::size_t compact_elems = 0;
   std::size_t kv8_scale_elems = 0;
   std::size_t scratch_elems = 0;
   std::size_t term = 0;
   if (!checked_mul(static_cast<std::size_t>(g->L), g->Hk, &term) ||
-      !checked_mul(term, static_cast<std::size_t>(max_positions), &term) ||
-      !checked_mul(term, static_cast<std::size_t>(g->d), &kv_elems) ||
+      !checked_mul(term, static_cast<std::size_t>(max_positions), &kv_rows) ||
+      !checked_mul(kv_rows, static_cast<std::size_t>(g->d), &term) ||
       !checked_mul(static_cast<std::size_t>(g->Hk), static_cast<std::size_t>(max_positions), &term) ||
       !checked_mul(term, static_cast<std::size_t>(g->d), &compact_elems) ||
       !checked_mul(static_cast<std::size_t>(g->L), g->Hk, &term) ||
@@ -944,12 +944,13 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
   std::size_t token_scratch_bytes = 0;
   std::size_t scratch_batched_bytes = 0;
   // Persistent-cache bytes per (head,position) row: bf16 = d*2, int8 (KV8) =
-  // d, int4 (KV4) = d/2 (two 4-bit codes pack into one byte).
+  // d, int4 (KV4) = d/2 (two 4-bit codes pack into one byte). kv_rows is
+  // L*Hk*max_pos (the [L][Hk][max_pos] row count of the pool).
   const std::size_t kv_row_bytes =
       g->kv4 ? static_cast<std::size_t>(g->d) / 2
              : (g->kv8 ? static_cast<std::size_t>(g->d)
                        : static_cast<std::size_t>(g->d) * sizeof(std::uint16_t));
-  if (!checked_mul(kv_elems, kv_row_bytes, &kv_bytes) ||
+  if (!checked_mul(kv_rows, kv_row_bytes, &kv_bytes) ||
       !checked_mul(kv8_scale_elems, sizeof(float), &kv8_scale_bytes) ||
       !checked_mul(compact_elems, sizeof(std::uint16_t), &compact_bytes) ||
       !checked_mul(static_cast<std::size_t>(g->Hq),
