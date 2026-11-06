@@ -46,7 +46,14 @@ extern "C" int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::ui
 extern "C" int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k,
                                          const std::uint16_t* d_v, float att_scale, int Hq,
                                          int Hk, int d, int kv_len, int k_stride,
-                                         std::uint16_t* d_out);
+                                         std::uint16_t* d_out, const int* d_pt = nullptr);
+extern "C" int granite4_kernel_gqa_fused_pos(const std::uint16_t* d_q,
+                                             const std::uint16_t* d_k,
+                                             const std::uint16_t* d_v, float att_scale,
+                                             int Hq, int Hk, int d, int kv_len,
+                                             int k_stride, const int* d_pos,
+                                             std::uint16_t* d_out,
+                                             const int* d_pt = nullptr);
 extern "C" int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                            const std::uint16_t* d_x, float scale_g, float scale_u,
                                            int N, int K, std::uint16_t* d_out);
@@ -140,12 +147,12 @@ int gpu_verify_attention_layer_batched(
 extern "C" int granite4_kernel_gqa_fused_batched(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
     float att_scale, int Hq, int Hk, int d, int base_kv, int rows, int k_stride,
-    std::uint16_t* d_out);
+    std::uint16_t* d_out, const int* d_pt = nullptr);
 
 extern "C" int granite4_kernel_gqa_fused_rows(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
     float att_scale, int Hq, int Hk, int d, int base_kv, int rows, int k_stride,
-    std::uint16_t* d_out);
+    std::uint16_t* d_out, const int* d_pt = nullptr);
 extern "C" int granite4_prefill_gemm_bf16(const std::uint16_t* d_a, const std::uint8_t* d_w,
                                           float scale, int M, int N, int K,
                                           std::uint16_t* d_c);
@@ -1549,6 +1556,114 @@ static void test_paged_attn_split_device() {
   cudaFree(scratch);
 }
 
+static void test_paged_gqa_fused_device() {
+  // Phase 4: the fused-GQA kernels read KV rows through the same row table
+  // (d_pt) the split attention and the batched append use, so a paged KV pool
+  // can be read by EITHER attention path. The arena is physically permuted
+  // (physical row perm[pos] holds logical position pos) and the row table maps
+  // logical position -> physical row. The kernel then gathers the same logical
+  // K/V rows in the same order as the contiguous launch, so paged vs
+  // contiguous must be bit-identical (same kernel, same arithmetic; the only
+  // difference is an extra load from the table). If d_pt were ignored the
+  // permuted arena would read different rows and this would fail.
+  const int Hq = 8, Hk = 2, d = 128, stride = 1500, base = 1203, rows = 4;
+  Xorshift64 rng(0xf1a2);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  const float scale = 0.0078125f * 8.0f;
+
+  std::vector<int> perm(stride);
+  for (int p = 0; p < stride; ++p) perm[p] = p;
+  for (int i = stride - 1; i > 0; --i) {
+    const int j = static_cast<int>(rng.next() % (i + 1));
+    std::swap(perm[i], perm[j]);
+  }
+
+  std::uint16_t *dq, *dref, *dgotp;
+  std::uint16_t *dk, *dv, *dkp, *dvp;
+  int *dpt, *dpos;
+  int pos_h = base;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dref, qn * 2) ||
+      cudaMalloc(&dgotp, qn * 2) || cudaMalloc(&dk, cn * 2) ||
+      cudaMalloc(&dv, cn * 2) || cudaMalloc(&dkp, cn * 2) ||
+      cudaMalloc(&dvp, cn * 2) || cudaMalloc(&dpt, sizeof(int) * stride) ||
+      cudaMalloc(&dpos, sizeof(int))) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dpt, perm.data(), sizeof(int) * stride, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dpos, &pos_h, sizeof(int), cudaMemcpyHostToDevice));
+  expect(granite4_kernel_gqa_fused_rows(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride,
+                                        dref) == 0,
+         "paged fused: contiguous reference launch");
+
+  // Build the permuted arena, same construction as the paged split test.
+  std::vector<std::uint16_t> ckp(cn), cvp(cn);
+  for (int hkv = 0; hkv < Hk; ++hkv)
+    for (int pos = 0; pos < stride; ++pos) {
+      const std::size_t src = static_cast<std::size_t>(hkv) * stride * d +
+                              static_cast<std::size_t>(pos) * d;
+      const std::size_t dst = static_cast<std::size_t>(hkv) * stride * d +
+                              static_cast<std::size_t>(perm[pos]) * d;
+      std::copy(ck.begin() + src, ck.begin() + src + d, ckp.begin() + dst);
+      std::copy(cv.begin() + src, cv.begin() + src + d, cvp.begin() + dst);
+    }
+  CUDA_CHECK(cudaMemcpy(dkp, ckp.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dvp, cvp.data(), cn * 2, cudaMemcpyHostToDevice));
+  expect(granite4_kernel_gqa_fused_rows(dq, dkp, dvp, scale, Hq, Hk, d, base, rows, stride,
+                                        dgotp, dpt) == 0,
+         "paged fused: paged launch (rows)");
+
+  std::vector<std::uint16_t> ref(qn), gotp(qn);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(gotp.data(), dgotp, qn * 2, cudaMemcpyDeviceToHost));
+  bool paged_ok = true;
+  for (std::size_t i = 0; i < qn; ++i)
+    if (gotp[i] != ref[i]) paged_ok = false;
+  expect(paged_ok,
+         "paged fused: permuted arena via d_pt == contiguous (bit-identical, rows)");
+
+  // Single-row decode form (d_pos + d_pt): the captured-graph replay path.
+  // One query row at position base; kv_len bounds the shared memory.
+  std::uint16_t *dref1, *dgot1;
+  if (cudaMalloc(&dref1, static_cast<std::size_t>(Hq) * d * 2) ||
+      cudaMalloc(&dgot1, static_cast<std::size_t>(Hq) * d * 2)) {
+    cudaFree(dq); cudaFree(dref); cudaFree(dgotp);
+    cudaFree(dk); cudaFree(dv); cudaFree(dkp); cudaFree(dvp);
+    cudaFree(dpt); cudaFree(dpos);
+    ++g_failures;
+    return;
+  }
+  const int kv1 = base + 1;
+  expect(granite4_kernel_gqa_fused(dq, dk, dv, scale, Hq, Hk, d, kv1, stride,
+                                   dref1) == 0,
+         "paged fused: single-row contiguous launch");
+  expect(granite4_kernel_gqa_fused_pos(dq, dkp, dvp, scale, Hq, Hk, d, kv1, stride,
+                                       dpos, dgot1, dpt) == 0,
+         "paged fused: single-row paged launch (d_pos + d_pt)");
+  const std::size_t n1 = static_cast<std::size_t>(Hq) * d;
+  std::vector<std::uint16_t> ref1(n1), got1(n1);
+  CUDA_CHECK(cudaMemcpy(ref1.data(), dref1, n1 * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got1.data(), dgot1, n1 * 2, cudaMemcpyDeviceToHost));
+  bool paged1_ok = true;
+  for (std::size_t i = 0; i < n1; ++i)
+    if (got1[i] != ref1[i]) paged1_ok = false;
+  expect(paged1_ok,
+         "paged fused: permuted arena via d_pt == contiguous (bit-identical, d_pos)");
+
+  cudaFree(dq); cudaFree(dref); cudaFree(dgotp);
+  cudaFree(dref1); cudaFree(dgot1);
+  cudaFree(dk); cudaFree(dv); cudaFree(dkp); cudaFree(dvp);
+  cudaFree(dpt); cudaFree(dpos);
+}
+
 static void test_batched_verify_attention_device() {
   // P4: the batched verify kernels must be bit-identical, row by row, to the
   // single-row path. Row r appends its KV at position base+r and attends the
@@ -2272,6 +2387,7 @@ int main() {
   test_prefill_attention_device();
   test_attn_split_device();
   test_paged_attn_split_device();
+  test_paged_gqa_fused_device();
   test_paged_kv_append_batched_device();
   test_batched_silu_gate_up_device();
   test_batched_rmsnorm_device();

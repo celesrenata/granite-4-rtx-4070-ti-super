@@ -267,7 +267,7 @@ __device__ __forceinline__ void gqa_fused_row(const std::uint16_t* q_row,
                                               const std::uint16_t* k,
                                               const std::uint16_t* v, float att_scale,
                                               int hq, int hkv, int d, int kv_len,
-                                              int k_stride, std::uint16_t* out_row) {
+                                              int k_stride, const int* d_pt, std::uint16_t* out_row) {
   const int t = threadIdx.x;
   const int nt = blockDim.x;  // blockDim.x == d
 
@@ -291,9 +291,12 @@ __device__ __forceinline__ void gqa_fused_row(const std::uint16_t* q_row,
 
   // Phase A: bf16 logits[kv] = att_scale * dot(q, k[hkv, kv]), plus the
   // per-thread running max of what this thread wrote.
+  // Logical position kv lives in arena row d_pt[kv] (identity when d_pt is
+  // null, the contiguous layout); k_stride is the arena row stride.
   float m = -std::numeric_limits<float>::infinity();
   for (int kv = t; kv < kv_len; kv += nt) {
-    const int kbase = (hkv * k_stride + kv) * d;
+    const int row = (d_pt != nullptr) ? d_pt[kv] : kv;
+    const int kbase = (hkv * k_stride + row) * d;
     float acc = 0.0f;
     for (int i = 0; i < d; ++i)
       acc += bf16_to_f32(k[kbase + i]) * bf16_to_f32(sq[i]);
@@ -348,8 +351,10 @@ __device__ __forceinline__ void gqa_fused_row(const std::uint16_t* q_row,
   // Phase C: out[hq, i] = sum_kv p[kv] * v[hkv, kv, i] (ascending kv).
   const int i = t;
   float acc = 0.0f;
-  for (int kv = 0; kv < kv_len; ++kv)
-    acc += bf16_to_f32(sp[kv]) * bf16_to_f32(v[(hkv * k_stride + kv) * d + i]);
+  for (int kv = 0; kv < kv_len; ++kv) {
+    const int row = (d_pt != nullptr) ? d_pt[kv] : kv;
+    acc += bf16_to_f32(sp[kv]) * bf16_to_f32(v[(hkv * k_stride + row) * d + i]);
+  }
   out_row[hq * d + i] = f32_to_bf16(acc);
 }
 
@@ -359,10 +364,12 @@ __device__ __forceinline__ void gqa_fused_row(const std::uint16_t* q_row,
 __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
                                  const std::uint16_t* v, float att_scale, int Hq,
                                  int Hk, int d, int kv_len, int k_stride,
-                                 const int* d_pos, std::uint16_t* out) {
+                                 const int* d_pos, const int* d_pt,
+                                 std::uint16_t* out) {
   if (d_pos != nullptr) kv_len = *d_pos + 1;
   const int hq = blockIdx.x;
-  gqa_fused_row(q, k, v, att_scale, hq, hq / (Hq / Hk), d, kv_len, k_stride, out);
+  gqa_fused_row(q, k, v, att_scale, hq, hq / (Hq / Hk), d, kv_len, k_stride, d_pt,
+                out);
 }
 
 // ---------------------------------------------------------------------------
@@ -511,12 +518,12 @@ __global__ void gqa_fused_batched_kernel(const std::uint16_t* q,
                                          const std::uint16_t* v,
                                          float att_scale, int Hq, int Hk, int d,
                                          int base_kv, int rows, int k_stride,
-                                         std::uint16_t* out) {
+                                         const int* d_pt, std::uint16_t* out) {
   const int hq = blockIdx.x;
   const int row = blockIdx.y;
   const std::size_t off = static_cast<std::size_t>(row) * Hq * d;
   gqa_fused_row(q + off, k, v, att_scale, hq, hq / (Hq / Hk), d, base_kv + row + 1,
-                k_stride, out + off);
+                k_stride, d_pt, out + off);
 }
 
 // ---------------------------------------------------------------------------
@@ -770,12 +777,14 @@ extern "C" {
 int granite4_kernel_gqa_fused_pos(const std::uint16_t* d_q, const std::uint16_t* d_k,
                                   const std::uint16_t* d_v, float att_scale, int Hq,
                                   int Hk, int d, int kv_len, int k_stride,
-                                  const int* d_pos, std::uint16_t* d_out);
+                                  const int* d_pos, std::uint16_t* d_out,
+                                  const int* d_pt = nullptr);
 int granite4_kernel_gqa_fused_rows(const std::uint16_t* d_q,
                                    const std::uint16_t* d_k,
                                    const std::uint16_t* d_v, float att_scale,
                                    int Hq, int Hk, int d, int base_kv, int rows,
-                                   int k_stride, std::uint16_t* d_out);
+                                   int k_stride, std::uint16_t* d_out,
+                                   const int* d_pt = nullptr);
 
 int granite4_fp8_decode_all(float** d_out) {
   if (d_out == nullptr) return -1;
@@ -936,9 +945,9 @@ int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v
 int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k,
                               const std::uint16_t* d_v, float att_scale, int Hq,
                               int Hk, int d, int kv_len, int k_stride,
-                              std::uint16_t* d_out) {
+                              std::uint16_t* d_out, const int* d_pt = nullptr) {
   return granite4_kernel_gqa_fused_pos(d_q, d_k, d_v, att_scale, Hq, Hk, d, kv_len,
-                                       k_stride, nullptr, d_out);
+                                       k_stride, nullptr, d_out, d_pt);
 }
 
 std::size_t granite4_gqa_fused_smem_bytes(int d, int kv_len_max) {
@@ -992,7 +1001,8 @@ int granite4_gqa_fused_smem_limit() {
 int granite4_kernel_gqa_fused_pos(const std::uint16_t* d_q, const std::uint16_t* d_k,
                                   const std::uint16_t* d_v, float att_scale, int Hq,
                                   int Hk, int d, int kv_len, int k_stride,
-                                  const int* d_pos, std::uint16_t* d_out) {
+                                  const int* d_pos, std::uint16_t* d_out,
+                                  const int* d_pt) {
   // With d_pos, kv_len is the upper bound the shared memory is sized for.
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_out == nullptr ||
       !std::isfinite(att_scale) || Hq <= 0 || Hk <= 0 || d <= 0 || kv_len <= 0 ||
@@ -1005,7 +1015,8 @@ int granite4_kernel_gqa_fused_pos(const std::uint16_t* d_q, const std::uint16_t*
   const std::size_t smem_bytes = granite4_gqa_fused_smem_bytes(d, kv_len);
   if (smem_bytes > static_cast<std::size_t>(granite4_gqa_fused_smem_limit())) return -1;
   granite4::gqa_fused_kernel<<<Hq, d, smem_bytes>>>(d_q, d_k, d_v, att_scale, Hq, Hk,
-                                                     d, kv_len, k_stride, d_pos, d_out);
+                                                     d, kv_len, k_stride, d_pos, d_pt,
+                                                     d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
@@ -1086,18 +1097,19 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
                                       const std::uint16_t* d_k,
                                       const std::uint16_t* d_v, float att_scale,
                                       int Hq, int Hk, int d, int base_kv,
-                                      int rows, int k_stride,
-                                      std::uint16_t* d_out) {
+                                      int rows, int k_stride, std::uint16_t* d_out,
+                                      const int* d_pt = nullptr) {
   if (rows > granite4::kMaxVerifyRows) return -1;
   return granite4_kernel_gqa_fused_rows(d_q, d_k, d_v, att_scale, Hq, Hk, d, base_kv,
-                                        rows, k_stride, d_out);
+                                        rows, k_stride, d_out, d_pt);
 }
 
 int granite4_kernel_gqa_fused_rows(const std::uint16_t* d_q,
                                    const std::uint16_t* d_k,
                                    const std::uint16_t* d_v, float att_scale,
                                    int Hq, int Hk, int d, int base_kv, int rows,
-                                   int k_stride, std::uint16_t* d_out) {
+                                   int k_stride, std::uint16_t* d_out,
+                                   const int* d_pt) {
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_out == nullptr ||
       !std::isfinite(att_scale) || rows <= 0 || rows > 65535 || Hq <= 0 || Hk <= 0 ||
       d <= 0 || base_kv < 0 || Hq < Hk || Hq % Hk != 0 ||
@@ -1111,7 +1123,7 @@ int granite4_kernel_gqa_fused_rows(const std::uint16_t* d_q,
   const std::size_t smem_bytes = granite4_gqa_fused_smem_bytes(d, base_kv + rows);
   if (smem_bytes > static_cast<std::size_t>(granite4_gqa_fused_smem_limit())) return -1;
   granite4::gqa_fused_batched_kernel<<<dim3(Hq, rows), d, smem_bytes>>>(
-      d_q, d_k, d_v, att_scale, Hq, Hk, d, base_kv, rows, k_stride, d_out);
+      d_q, d_k, d_v, att_scale, Hq, Hk, d, base_kv, rows, k_stride, d_pt, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }

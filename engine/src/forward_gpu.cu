@@ -603,15 +603,18 @@ int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v
 int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k,
                               const std::uint16_t* d_v, float att_scale, int Hq,
                               int Hk, int d, int kv_len, int k_stride,
-                              std::uint16_t* d_out);
+                              std::uint16_t* d_out,
+                              const int* d_pt = nullptr);
 int granite4_kernel_gqa_fused_pos(const std::uint16_t* d_q, const std::uint16_t* d_k,
                                   const std::uint16_t* d_v, float att_scale, int Hq,
                                   int Hk, int d, int kv_len, int k_stride,
-                                  const int* d_pos, std::uint16_t* d_out);
+                                  const int* d_pos, std::uint16_t* d_out,
+                                  const int* d_pt = nullptr);
 int granite4_kernel_gqa_fused_rows(const std::uint16_t* d_q, const std::uint16_t* d_k,
                                    const std::uint16_t* d_v, float att_scale, int Hq,
                                    int Hk, int d, int base_kv, int rows, int k_stride,
-                                   std::uint16_t* d_out);
+                                   std::uint16_t* d_out,
+                                   const int* d_pt = nullptr);
 std::size_t granite4_gqa_fused_smem_bytes(int d, int kv_len_max);
 int granite4_gqa_fused_smem_limit();
 int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
@@ -641,7 +644,8 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
                                       const std::uint16_t* d_v, float att_scale,
                                       int Hq, int Hk, int d, int base_kv,
                                       int rows, int k_stride,
-                                      std::uint16_t* d_out);
+                                      std::uint16_t* d_out,
+                                      const int* d_pt = nullptr);
 int granite4_kernel_verify_attention_stage(
     const std::uint16_t* d_q, const std::uint16_t* d_k,
     const std::uint16_t* d_v, const float* d_cos, const float* d_sin,
