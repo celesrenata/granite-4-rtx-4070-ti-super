@@ -1443,8 +1443,10 @@ static void test_attn_split_device() {
 // holding a logical position is gathered from a device position->row table
 // (d_pt). With d_pt null the kernel is the contiguous identity layout; with
 // a permutation d_pt the SAME logical cache is read out of a physically
-// permuted arena and the output must be bit-identical to the contiguous
-// result (the table is applied identically to bf16, int8 and int4 caches).
+// permuted arena. The paged and contiguous results are bit-identical (same
+// split-KV kernel, same logical K/V in the same order), and both match the
+// fused-GQA reference within bf16 tolerance (the split path has a per-split
+// combine pass, so it is not bit-identical to the fused one).
 static void test_paged_attn_split_device() {
   const int Hq = 8, Hk = 2, d = 128, stride = 1500, base = 1203, rows = 4;
   Xorshift64 rng(0x9e57);
@@ -1520,16 +1522,26 @@ static void test_paged_attn_split_device() {
                                nullptr, nullptr, false, dpt) == 0,
          "paged attention: paged launch");
 
+  // The split-KV path and the fused-GQA reference are different algorithms
+  // (the split path has a per-split max/sum combine), so they are only
+  // bf16-close, not bit-identical - same tolerance as test_attn_split_device.
+  // The paged-vs-contiguous comparison, however, is between two calls of the
+  // SAME split kernel (one with a null row table, one with a permutation), so
+  // it must be bit-identical: permuting the arena through d_pt gathers the
+  // same logical K/V rows in the same order, with the same arithmetic.
   std::vector<std::uint16_t> ref(qn), got(qn), gotp(qn);
   CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(got.data(), dgot, qn * 2, cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(gotp.data(), dgotp, qn * 2, cudaMemcpyDeviceToHost));
-  bool contiguous_ok = true, paged_ok = true;
+  double max_err = 0.0;
+  bool paged_ok = true;
   for (std::size_t i = 0; i < qn; ++i) {
-    if (got[i] != ref[i]) contiguous_ok = false;
-    if (gotp[i] != ref[i]) paged_ok = false;
+    max_err = std::max(max_err, static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) -
+                                                              bf16_to_f32_host(ref[i]))));
+    if (gotp[i] != got[i]) paged_ok = false;
   }
-  expect(contiguous_ok, "paged attention: contiguous == fused GQA (bit-identical)");
+  std::printf("  paged attention: contiguous vs fused max |delta| = %.5f\n", max_err);
+  expect(max_err < 0.03, "paged attention: contiguous split matches fused GQA (bf16 tolerance)");
   expect(paged_ok, "paged attention: permuted arena via d_pt == contiguous (bit-identical)");
 
   cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dkp); cudaFree(dvp);
