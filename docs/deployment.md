@@ -194,8 +194,22 @@ gremlin-1 (int4 reader pool @ 131072, r8 head, 1 session):
 with the default path unchanged (bf16 draft @ 32768: 15359 MiB, the live
 footprint). Drafts are still target-verified in full precision, so a
 quantized draft KV can only lower the acceptance rate, never change the
-output; the int4 per-row error is ~16× the int8 one, so int8 draft KV is
-the recommended 131K setting and int4 the headroom option.
+output. Measured quality (int4 reader @ 32768, r8 head, eagle_k=4, 3
+prompts × 120 tokens):
+
+| draft KV | accept rate | speedup | output |
+| --- | ---: | ---: | --- |
+| 16 (bf16) | 0.161 | 1.594× | ref |
+| 8 (int8) | 0.161 | 1.592× | byte-identical |
+| 4 (int4) | 0.159 | 1.581× | byte-identical |
+
+So int8 draft KV is lossless (same accept rate as bf16) and int4 costs
+~1% acceptance — negligible. The per-row int4 error is ~16× the int8
+one, yet the draft KV cache only ever holds the current request's
+*generated* tokens (a 1-layer head, not the long reader context), so
+the quantization error stays small and barely moves the accept rate.
+`G4_DRAFT_KV=8` is the lossless 131K default; `4` is the headroom
+option if you need the last ~128 MiB.
 
 Deploy a pushed commit:
 
