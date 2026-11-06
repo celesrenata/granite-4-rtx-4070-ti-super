@@ -60,12 +60,14 @@ int granite4_kernel_kv_append_int8_batched(const std::uint16_t* d_src_k,
                                            const std::uint16_t* d_src_v,
                                            std::int8_t* d_cache_k, std::int8_t* d_cache_v,
                                            float* d_cache_k_scale, float* d_cache_v_scale,
-                                           int base_pos, int rows, int stride, int Hk, int d);
+                                           int base_pos, int rows, int stride, int Hk, int d,
+                                           const int* d_pt);
 int granite4_kernel_kv_append_int4_batched(const std::uint16_t* d_src_k,
                                            const std::uint16_t* d_src_v,
                                            std::uint8_t* d_cache_k, std::uint8_t* d_cache_v,
                                            float* d_cache_k_scale, float* d_cache_v_scale,
-                                           int base_pos, int rows, int stride, int Hk, int d);
+                                           int base_pos, int rows, int stride, int Hk, int d,
+                                           const int* d_pt);
 int granite4_kernel_rope_at_pos_batched(const std::uint16_t* d_x,
                                         const float* d_cos, const float* d_sin, int rows,
                                         int heads, int d, std::uint16_t* d_out);
@@ -477,7 +479,7 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
       if (h->kv_bits == 8) {
         if (granite4_kernel_kv_append_int8_batched(kr, v, h->kv8_k, h->kv8_v, h->kv8_k_scale,
                                                   h->kv8_v_scale, p, R, h->max_pos, h->Hk,
-                                                  h->d) != 0 ||
+                                                  h->d, nullptr) != 0 ||
             attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
                        h->max_pos, h->attn_scratch, att, h->kv8_k, h->kv8_v, h->kv8_k_scale,
                        h->kv8_v_scale, true, nullptr, nullptr, false) != 0)
@@ -485,7 +487,7 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
       } else {
         if (granite4_kernel_kv_append_int4_batched(kr, v, h->kv4_k, h->kv4_v, h->kv4_k_scale,
                                                   h->kv4_v_scale, p, R, h->max_pos, h->Hk,
-                                                  h->d) != 0 ||
+                                                  h->d, nullptr) != 0 ||
             attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
                        h->max_pos, h->attn_scratch, att, nullptr, nullptr, h->kv4_k_scale,
                        h->kv4_v_scale, false, h->kv4_k, h->kv4_v, true) != 0)

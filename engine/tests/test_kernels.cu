@@ -124,7 +124,7 @@ extern "C" int granite4_kernel_verify_attention_stage(
 extern "C" int granite4_kernel_kv_append_batched(
     const std::uint16_t* d_src_k, const std::uint16_t* d_src_v,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, int base_pos, int rows,
-    int stride, int Hk, int d);
+    int stride, int Hk, int d, const int* d_pt);
 namespace granite4 {
 int gpu_verify_attention_layer(
     const std::uint16_t*, const std::uint8_t*, const std::uint8_t*, const std::uint8_t*,
@@ -1599,13 +1599,13 @@ static void test_batched_verify_attention_device() {
   CUDA_CHECK(cudaMemcpy(drv, ev.data(), ev.size() * 2, cudaMemcpyHostToDevice));
 
   expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, rows,
-                                           stride, Hk, d) == 0,
+                                           stride, Hk, d, nullptr) == 0,
          "batched kv append: launch");
   expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, 17, stride + 64,
-                                           Hk, d) == -1,
+                                           Hk, d, nullptr) == -1,
          "batched kv append: rejects rows > 16");
   expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, rows,
-                                           base + rows - 1, Hk, d) == -1,
+                                           base + rows - 1, Hk, d, nullptr) == -1,
          "batched kv append: rejects stride < base+rows");
 
   std::vector<std::uint16_t> gak(ck.size()), gav(cv.size());
@@ -1647,6 +1647,88 @@ static void test_batched_verify_attention_device() {
   cudaFree(dout);
   cudaFree(dref);
 }
+
+static void test_paged_kv_append_batched_device() {
+   // Phase 4: batched append must write into arena rows d_pt[pos] (not the
+   // contiguous pos), so that a paged KV pool can share a physical arena
+   // across sequences while the logical cache remains a contiguous view
+   // through the row table. The row table is the same one attention reads
+   // through, so the append lands where a later read looks.
+   //
+   // We compare two launches of the SAME batched kernel on the SAME source
+   // KV:
+   //   (a) d_pt == nullptr (contiguous identity layout)
+   //   (b) d_pt == perm (a physical permutation)
+   // The kernel writes logical position pos to arena row d_pt[pos] == perm[pos],
+   // so the paged cache's physical row perm[pos] must equal the contiguous
+   // cache's physical row pos. Un-permuting the paged result via the same
+   // table yields a bit-identical result.
+   const int Hk = 8, d = 128, base = 5, rows = 4, stride = 64;
+   Xorshift64 rng(0x5050);
+   const std::size_t src_elems = static_cast<std::size_t>(rows) * Hk * d;
+   std::vector<std::uint16_t> sk(src_elems), sv(src_elems);
+   for (auto& t : sk) t = f32_to_bf16_host(rng.next_float_range(2.0));
+   for (auto& t : sv) t = f32_to_bf16_host(rng.next_float_range(2.0));
+
+   const int max_pos = 32;
+   std::vector<int> perm(max_pos);
+   for (int r = 0; r < max_pos; ++r) perm[r] = r;
+   std::swap(perm[base], perm[base + rows - 1]);
+   std::swap(perm[base + 1], perm[base + rows - 2]);
+
+   const std::size_t cache_elems = static_cast<std::size_t>(Hk) * max_pos * d;
+   std::vector<std::uint16_t> host_c_contig(cache_elems, 0), host_c_paged(cache_elems, 0);
+   std::vector<std::uint16_t> host_c_contig_v(cache_elems, 0), host_c_paged_v(cache_elems, 0);
+   std::uint16_t *dsk, *dsv, *dak, *dav, *dcp, *dcp_v;
+   int* dperm;
+   const std::size_t bytes = cache_elems * sizeof(std::uint16_t);
+   CUDA_CHECK(cudaMalloc(&dsk, src_elems * sizeof(std::uint16_t)));
+   CUDA_CHECK(cudaMalloc(&dsv, src_elems * sizeof(std::uint16_t)));
+   CUDA_CHECK(cudaMalloc(&dak, bytes));
+   CUDA_CHECK(cudaMalloc(&dav, bytes));
+   CUDA_CHECK(cudaMalloc(&dcp, bytes));
+   CUDA_CHECK(cudaMalloc(&dcp_v, bytes));
+   CUDA_CHECK(cudaMalloc(&dperm, max_pos * sizeof(int)));
+   CUDA_CHECK(cudaMemset(dak, 0, bytes));
+   CUDA_CHECK(cudaMemset(dav, 0, bytes));
+   CUDA_CHECK(cudaMemset(dcp, 0, bytes));
+   CUDA_CHECK(cudaMemset(dcp_v, 0, bytes));
+   CUDA_CHECK(cudaMemcpy(dsk, sk.data(), src_elems * 2, cudaMemcpyHostToDevice));
+   CUDA_CHECK(cudaMemcpy(dsv, sv.data(), src_elems * 2, cudaMemcpyHostToDevice));
+   CUDA_CHECK(cudaMemcpy(dperm, perm.data(), max_pos * sizeof(int),
+                         cudaMemcpyHostToDevice));
+
+   expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, rows, stride,
+                                            Hk, d, nullptr) == 0,
+          "paged append: contiguous launch");
+   expect(granite4_kernel_kv_append_batched(dsk, dsv, dcp, dcp_v, base, rows, stride,
+                                            Hk, d, dperm) == 0,
+          "paged append: paged launch");
+
+   CUDA_CHECK(cudaMemcpy(host_c_contig.data(), dak, bytes, cudaMemcpyDeviceToHost));
+   CUDA_CHECK(cudaMemcpy(host_c_contig_v.data(), dav, bytes, cudaMemcpyDeviceToHost));
+   CUDA_CHECK(cudaMemcpy(host_c_paged.data(), dcp, bytes, cudaMemcpyDeviceToHost));
+   CUDA_CHECK(cudaMemcpy(host_c_paged_v.data(), dcp_v, bytes, cudaMemcpyDeviceToHost));
+   bool ok = true;
+   for (int hkv = 0; hkv < Hk; ++hkv) {
+     for (int pos = 0; pos < stride; ++pos) {
+       const int phys = perm[pos];
+       const std::size_t ci = static_cast<std::size_t>(hkv) * stride * d +
+                              static_cast<std::size_t>(pos) * d;
+       const std::size_t pi = static_cast<std::size_t>(hkv) * stride * d +
+                              static_cast<std::size_t>(phys) * d;
+       for (int i = 0; i < d; ++i) {
+         if (host_c_paged[pi + i] != host_c_contig[ci + i]) ok = false;
+         if (host_c_paged_v[pi + i] != host_c_contig_v[ci + i]) ok = false;
+       }
+     }
+   }
+   expect(ok,
+          "paged append: permuted arena via d_pt == contiguous (bit-identical)");
+
+   cudaFree(dsk); cudaFree(dsv); cudaFree(dak); cudaFree(dav);
+   cudaFree(dcp); cudaFree(dcp_v); cudaFree(dperm);
+ }
 
 static void test_batched_silu_gate_up_device() {
   const int N = 257, K = 4096, rows = 4;
@@ -2190,6 +2272,7 @@ int main() {
   test_prefill_attention_device();
   test_attn_split_device();
   test_paged_attn_split_device();
+  test_paged_kv_append_batched_device();
   test_batched_silu_gate_up_device();
   test_batched_rmsnorm_device();
   test_batched_rope_device();

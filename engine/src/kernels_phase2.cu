@@ -376,18 +376,20 @@ __global__ void kv_append_batched_kernel(const std::uint16_t* src_k,
                                          std::uint16_t* cache_k,
                                          std::uint16_t* cache_v,
                                          int base_pos, int rows, int stride,
-                                         int Hk, int d) {
+                                         int Hk, int d,
+                                         const int* __restrict__ d_pt) {
   const int r = blockIdx.y;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= rows || idx >= Hk * d) return;
   const int hkv = idx / d;
   const int i = idx % d;
   const int pos = base_pos + r;
+  const int row = (d_pt != nullptr) ? d_pt[pos] : pos;
   const std::size_t cache_row = static_cast<std::size_t>(hkv) * stride * d;
   const std::size_t src_off =
       static_cast<std::size_t>(r) * Hk * d + static_cast<std::size_t>(idx);
-  cache_k[cache_row + static_cast<std::size_t>(pos) * d + i] = src_k[src_off];
-  cache_v[cache_row + static_cast<std::size_t>(pos) * d + i] = src_v[src_off];
+  cache_k[cache_row + static_cast<std::size_t>(row) * d + i] = src_k[src_off];
+  cache_v[cache_row + static_cast<std::size_t>(row) * d + i] = src_v[src_off];
 }
 
 // KV8 (Q8_0): int8 form of the batched verify append - `rows` consecutive KV
@@ -397,14 +399,16 @@ __global__ void kv_append_int8_batched_kernel(
     const std::uint16_t* __restrict__ src_k, const std::uint16_t* __restrict__ src_v,
     std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
     float* __restrict__ cache_k_scale, float* __restrict__ cache_v_scale,
-    int base_pos, int rows, int stride, int Hk, int d) {
+    int base_pos, int rows, int stride, int Hk, int d,
+    const int* __restrict__ d_pt) {
   const int hkv = blockIdx.x;
   const int r = blockIdx.y;
   const int i = threadIdx.x;  // blockDim.x == d
   const int pos = base_pos + r;
+  const int row = (d_pt != nullptr) ? d_pt[pos] : pos;
   const std::size_t src = (static_cast<std::size_t>(r) * Hk + hkv) * d + i;
-  const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + pos) * d + i;
-  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + pos;
+  const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + row) * d + i;
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + row;
   const float x = bf16_to_f32(src_k[src]);
   const float y = bf16_to_f32(src_v[src]);
   __shared__ float smax[2];
@@ -446,17 +450,19 @@ __global__ void kv_append_int4_batched_kernel(
     const std::uint16_t* __restrict__ src_k, const std::uint16_t* __restrict__ src_v,
     std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
     float* __restrict__ cache_k_scale, float* __restrict__ cache_v_scale,
-    int base_pos, int rows, int stride, int Hk, int d) {
+    int base_pos, int rows, int stride, int Hk, int d,
+    const int* __restrict__ d_pt) {
   const int hkv = blockIdx.x;
   const int r = blockIdx.y;
   const int w = threadIdx.x;  // blockDim.x == d/2
   const int pos = base_pos + r;
+  const int row = (d_pt != nullptr) ? d_pt[pos] : pos;
   const int d0 = 2 * w;       // even dim (lower nibble)
   const int d1 = d0 + 1;      // odd dim (upper nibble)
   const std::size_t src0 = (static_cast<std::size_t>(r) * Hk + hkv) * d + d0;
   const std::size_t src1 = (static_cast<std::size_t>(r) * Hk + hkv) * d + d1;
-  const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + pos) * (d / 2) + w;
-  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + pos;
+  const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + row) * (d / 2) + w;
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + row;
   const float x0 = bf16_to_f32(src_k[src0]);
   const float x1 = bf16_to_f32(src_k[src1]);
   const float y0 = bf16_to_f32(src_v[src0]);
@@ -1008,7 +1014,8 @@ int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
                                       const std::uint16_t* d_src_v,
                                       std::uint16_t* d_cache_k,
                                       std::uint16_t* d_cache_v, int base_pos,
-                                      int rows, int stride, int Hk, int d) {
+                                      int rows, int stride, int Hk, int d,
+                                      const int* d_pt) {
   if (d_src_k == nullptr || d_src_v == nullptr || d_cache_k == nullptr ||
       d_cache_v == nullptr || base_pos < 0 || rows <= 0 || rows > granite4::kMaxVerifyRows ||
       Hk <= 0 || d <= 0 || base_pos > INT_MAX - rows ||
@@ -1018,7 +1025,7 @@ int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
   granite4::kv_append_batched_kernel<<<
       dim3(static_cast<unsigned int>((static_cast<std::size_t>(Hk) * d + 255u) / 256u),
            static_cast<unsigned int>(rows)),
-      256>>>(d_src_k, d_src_v, d_cache_k, d_cache_v, base_pos, rows, stride, Hk, d);
+      256>>>(d_src_k, d_src_v, d_cache_k, d_cache_v, base_pos, rows, stride, Hk, d, d_pt);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
@@ -1029,7 +1036,8 @@ int granite4_kernel_kv_append_int8_batched(const std::uint16_t* d_src_k,
                                            std::int8_t* d_cache_v,
                                            float* d_cache_k_scale,
                                            float* d_cache_v_scale, int base_pos,
-                                           int rows, int stride, int Hk, int d) {
+                                           int rows, int stride, int Hk, int d,
+                                           const int* d_pt) {
   if (d_src_k == nullptr || d_src_v == nullptr || d_cache_k == nullptr ||
       d_cache_v == nullptr || d_cache_k_scale == nullptr ||
       d_cache_v_scale == nullptr || base_pos < 0 || rows <= 0 ||
@@ -1043,7 +1051,7 @@ int granite4_kernel_kv_append_int8_batched(const std::uint16_t* d_src_k,
                                                  static_cast<unsigned int>(rows)),
                                              static_cast<unsigned int>(d)>>>
       (d_src_k, d_src_v, d_cache_k, d_cache_v, d_cache_k_scale, d_cache_v_scale,
-       base_pos, rows, stride, Hk, d);
+       base_pos, rows, stride, Hk, d, d_pt);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
@@ -1054,7 +1062,8 @@ int granite4_kernel_kv_append_int4_batched(const std::uint16_t* d_src_k,
                                            std::uint8_t* d_cache_v,
                                            float* d_cache_k_scale,
                                            float* d_cache_v_scale, int base_pos,
-                                           int rows, int stride, int Hk, int d) {
+                                           int rows, int stride, int Hk, int d,
+                                           const int* d_pt) {
   if (d_src_k == nullptr || d_src_v == nullptr || d_cache_k == nullptr ||
       d_cache_v == nullptr || d_cache_k_scale == nullptr ||
       d_cache_v_scale == nullptr || base_pos < 0 || rows <= 0 ||
@@ -1068,7 +1077,7 @@ int granite4_kernel_kv_append_int4_batched(const std::uint16_t* d_src_k,
                                                 static_cast<unsigned int>(rows)),
                                             static_cast<unsigned int>(d / 2)>>>
       (d_src_k, d_src_v, d_cache_k, d_cache_v, d_cache_k_scale, d_cache_v_scale,
-       base_pos, rows, stride, Hk, d);
+       base_pos, rows, stride, Hk, d, d_pt);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
