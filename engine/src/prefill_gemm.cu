@@ -295,17 +295,18 @@ __global__ void rope_split_append_kernel(const std::uint16_t* qkv, const float* 
                                          const float* sin_tbl, int base_pos, int Hq,
                                          int Hk, int d, int stride,
                                          std::uint16_t* q_rot, std::uint16_t* cache_k,
-                                         std::uint16_t* cache_v) {
+                                         std::uint16_t* cache_v, const int* d_pt) {
   const int r = blockIdx.y;
   const int nq = Hq * d, nk = Hk * d;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= nq + 2 * nk) return;
   const int pos = base_pos + r;
+  const int row_pos = (d_pt != nullptr) ? d_pt[pos] : pos;  // P4 arena row
   const std::uint16_t* const row = qkv + static_cast<std::size_t>(r) * (nq + 2 * nk);
   if (idx >= nq + nk) {  // v: plain copy into the cache
     const int local = idx - nq - nk;
     const int hkv = local / d, i = local % d;
-    cache_v[(static_cast<std::size_t>(hkv) * stride + pos) * d + i] = row[idx];
+    cache_v[(static_cast<std::size_t>(hkv) * stride + row_pos) * d + i] = row[idx];
     return;
   }
   const bool is_q = idx < nq;
@@ -329,7 +330,7 @@ __global__ void rope_split_append_kernel(const std::uint16_t* qkv, const float* 
   if (is_q) {
     q_rot[static_cast<std::size_t>(r) * nq + local] = f32_to_bf16(y);
   } else {
-    cache_k[(static_cast<std::size_t>(h) * stride + pos) * d + col] = f32_to_bf16(y);
+    cache_k[(static_cast<std::size_t>(h) * stride + row_pos) * d + col] = f32_to_bf16(y);
   }
 }
 
@@ -345,10 +346,11 @@ __global__ void __launch_bounds__(kPrefillInt8D)
                                   const float* sin_tbl, int base_pos, int Hq, int Hk,
                                   int d, int stride, std::uint16_t* q_rot,
                                   std::int8_t* cache_k, std::int8_t* cache_v,
-                                  float* cache_k_scale, float* cache_v_scale) {
+                                  float* cache_k_scale, float* cache_v_scale, const int* d_pt) {
   const int r = blockIdx.y;
   const int head = blockIdx.x;  // 0..Hq-1: q, Hq..Hq+Hk-1: k, else v
   const int pos = base_pos + r;
+  const int row_pos = (d_pt != nullptr) ? d_pt[pos] : pos;  // P4 arena row
   const int nq = Hq * d, nk = Hk * d;
   const int i = threadIdx.x;
   const int half = d / 2;
@@ -401,12 +403,12 @@ __global__ void __launch_bounds__(kPrefillInt8D)
   const float sc = s_scale;
   if (i == 0) {
     if (is_k)
-      cache_k_scale[static_cast<std::size_t>(h) * stride + pos] = sc;
+      cache_k_scale[static_cast<std::size_t>(h) * stride + row_pos] = sc;
     else
-      cache_v_scale[static_cast<std::size_t>(h) * stride + pos] = sc;
+      cache_v_scale[static_cast<std::size_t>(h) * stride + row_pos] = sc;
   }
   const std::int8_t code = dev::kv8_quant(s_val[i], sc);
-  const std::size_t cbase = (static_cast<std::size_t>(h) * stride + pos) * d + col;
+  const std::size_t cbase = (static_cast<std::size_t>(h) * stride + row_pos) * d + col;
   if (is_k)
     cache_k[cbase] = code;
   else
@@ -425,10 +427,11 @@ __global__ void __launch_bounds__(kPrefillInt4D)
                                   const float* sin_tbl, int base_pos, int Hq, int Hk,
                                   int d, int stride, std::uint16_t* q_rot,
                                   std::uint8_t* cache_k, std::uint8_t* cache_v,
-                                  float* cache_k_scale, float* cache_v_scale) {
+                                  float* cache_k_scale, float* cache_v_scale, const int* d_pt) {
   const int r = blockIdx.y;
   const int head = blockIdx.x;  // 0..Hq-1: q, Hq..Hq+Hk-1: k, else v
   const int pos = base_pos + r;
+  const int row_pos = (d_pt != nullptr) ? d_pt[pos] : pos;  // P4 arena row
   const int nq = Hq * d, nk = Hk * d;
   const int w = threadIdx.x;
   const int half = d / 2;
@@ -490,15 +493,15 @@ __global__ void __launch_bounds__(kPrefillInt4D)
   const float sc = s_scale;
   if (w == 0) {
     if (is_k)
-      cache_k_scale[static_cast<std::size_t>(h) * stride + pos] = sc;
+      cache_k_scale[static_cast<std::size_t>(h) * stride + row_pos] = sc;
     else
-      cache_v_scale[static_cast<std::size_t>(h) * stride + pos] = sc;
+      cache_v_scale[static_cast<std::size_t>(h) * stride + row_pos] = sc;
   }
   __syncthreads();
   const unsigned char code =
       static_cast<unsigned char>((dev::q4_quant(s_val[w][0], sc) & 0x0fu) |
                                  (dev::q4_quant(s_val[w][1], sc) << 4));
-  const std::size_t cbase = (static_cast<std::size_t>(h) * stride + pos) * (d / 2) + w;
+  const std::size_t cbase = (static_cast<std::size_t>(h) * stride + row_pos) * (d / 2) + w;
   if (is_k)
     cache_k[cbase] = code;
   else
@@ -918,13 +921,14 @@ int prefill_embed_rows(const std::int32_t* d_tokens, int start, int rows,
 int prefill_rope_split_append(const std::uint16_t* qkv, const float* cos_tbl,
                               const float* sin_tbl, int base_pos, int rows, int Hq,
                               int Hk, int d, int stride, std::uint16_t* q_rot,
-                              std::uint16_t* cache_k, std::uint16_t* cache_v) {
+                              std::uint16_t* cache_k, std::uint16_t* cache_v, const int* d_pt) {
   if (rows <= 0 || rows > 65535 || (d & 1) != 0 || base_pos < 0 ||
       stride < base_pos + rows)
     return -1;
   const int n = (Hq + 2 * Hk) * d;
   rope_split_append_kernel<<<dim3((n + 255) / 256, rows), 256>>>(
-      qkv, cos_tbl, sin_tbl, base_pos, Hq, Hk, d, stride, q_rot, cache_k, cache_v);
+      qkv, cos_tbl, sin_tbl, base_pos, Hq, Hk, d, stride, q_rot, cache_k, cache_v,
+      d_pt);
   G4_PF_CHECK();
   return 0;
 }
@@ -936,7 +940,7 @@ int prefill_rope_split_append_int8(const std::uint16_t* qkv, const float* cos_tb
                                    int Hq, int Hk, int d, int stride,
                                    std::uint16_t* q_rot, std::int8_t* cache_k,
                                    std::int8_t* cache_v, float* cache_k_scale,
-                                   float* cache_v_scale) {
+                                   float* cache_v_scale, const int* d_pt) {
   if (rows <= 0 || rows > 65535 || base_pos < 0 || stride < base_pos + rows ||
       d != kPrefillInt8D || Hq <= 0 || Hk <= 0 || q_rot == nullptr ||
       cache_k == nullptr || cache_v == nullptr || cache_k_scale == nullptr ||
@@ -945,7 +949,8 @@ int prefill_rope_split_append_int8(const std::uint16_t* qkv, const float* cos_tb
   const int heads = Hq + 2 * Hk;
   rope_split_append_int8_kernel<<<dim3(heads, rows), kPrefillInt8D>>>(
       qkv, cos_tbl, sin_tbl, base_pos, Hq, Hk, d, stride, q_rot, cache_k, cache_v,
-      cache_k_scale, cache_v_scale);
+      cache_k_scale, cache_v_scale,
+      d_pt);
   G4_PF_CHECK();
   return 0;
 }
@@ -959,7 +964,7 @@ int prefill_rope_split_append_int4(const std::uint16_t* qkv, const float* cos_tb
                                    int Hq, int Hk, int d, int stride,
                                    std::uint16_t* q_rot, std::uint8_t* cache_k,
                                    std::uint8_t* cache_v, float* cache_k_scale,
-                                   float* cache_v_scale) {
+                                   float* cache_v_scale, const int* d_pt) {
   if (rows <= 0 || rows > 65535 || base_pos < 0 || stride < base_pos + rows ||
       d != kPrefillInt4D * 2 || (d % 2) != 0 || Hq <= 0 || Hk <= 0 ||
       q_rot == nullptr || cache_k == nullptr || cache_v == nullptr ||
@@ -968,7 +973,8 @@ int prefill_rope_split_append_int4(const std::uint16_t* qkv, const float* cos_tb
   const int heads = Hq + 2 * Hk;
   rope_split_append_int4_kernel<<<dim3(heads, rows), kPrefillInt4D>>>(
       qkv, cos_tbl, sin_tbl, base_pos, Hq, Hk, d, stride, q_rot, cache_k, cache_v,
-      cache_k_scale, cache_v_scale);
+      cache_k_scale, cache_v_scale,
+      d_pt);
   G4_PF_CHECK();
   return 0;
 }

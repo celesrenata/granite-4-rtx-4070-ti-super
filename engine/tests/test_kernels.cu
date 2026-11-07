@@ -121,13 +121,14 @@ extern "C" int granite4_kernel_verify_qkv_stage(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
     const float* d_cos, const float* d_sin, int base_pos, int rows, int Hq, int Hk,
     int d, int cache_stride, std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
-    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v);
+    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
+     const int* d_pt = nullptr);
 extern "C" int granite4_kernel_verify_attention_stage(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
     const float* d_cos, const float* d_sin, float att_scale, int base_pos, int rows,
     int Hq, int Hk, int d, int cache_stride, std::uint16_t* d_q_rot,
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
-    std::uint16_t* d_out);
+    std::uint16_t* d_out, const int* d_pt = nullptr);
 extern "C" int granite4_kernel_kv_append_batched(
     const std::uint16_t* d_src_k, const std::uint16_t* d_src_v,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, int base_pos, int rows,
@@ -137,12 +138,12 @@ int gpu_verify_attention_layer(
     const std::uint16_t*, const std::uint8_t*, const std::uint8_t*, const std::uint8_t*,
     float, float, float, const float*, const float*, float, int, int, int, int, int,
     int, int, std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*,
-    std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*);
+    std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*, const int*);
 int gpu_verify_attention_layer_batched(
     const std::uint16_t*, const std::uint8_t*, const std::uint8_t*, const std::uint8_t*,
     float, float, float, const float*, const float*, float, int, int, int, int, int,
     int, int, std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*,
-    std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*);
+    std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*, const int*);
 }
 extern "C" int granite4_kernel_gqa_fused_batched(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,

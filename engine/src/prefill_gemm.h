@@ -48,7 +48,8 @@ int prefill_embed_rows(const std::int32_t* d_tokens, int start, int rows,
 int prefill_rope_split_append(const std::uint16_t* qkv, const float* cos_tbl,
                               const float* sin_tbl, int base_pos, int rows, int Hq,
                               int Hk, int d, int stride, std::uint16_t* q_rot,
-                              std::uint16_t* cache_k, std::uint16_t* cache_v);
+                              std::uint16_t* cache_k, std::uint16_t* cache_v,
+                               const int* d_pt = nullptr);
 
 // KV8: append the prefill chunk's K/V to the int8 persistent cache - K is
 // rotated then quantized per (head, position) row, V is quantized as-is - with
@@ -59,7 +60,8 @@ int prefill_rope_split_append_int8(const std::uint16_t* qkv, const float* cos_tb
                                    int Hq, int Hk, int d, int stride,
                                    std::uint16_t* q_rot, std::int8_t* cache_k,
                                    std::int8_t* cache_v, float* cache_k_scale,
-                                   float* cache_v_scale);
+                                   float* cache_v_scale,
+                                   const int* d_pt = nullptr);
 
 // KV4: append the prefill chunk's K/V to the int4 persistent cache - K is
 // rotated then quantized per (head, position) row as two-per-byte int4
@@ -71,7 +73,8 @@ int prefill_rope_split_append_int4(const std::uint16_t* qkv, const float* cos_tb
                                    int Hq, int Hk, int d, int stride,
                                    std::uint16_t* q_rot, std::uint8_t* cache_k,
                                    std::uint8_t* cache_v, float* cache_k_scale,
-                                   float* cache_v_scale);
+                                   float* cache_v_scale,
+                                   const int* d_pt = nullptr);
 
 // Causal attention for query rows at positions [base_pos, base_pos + rows)
 // (q_rot [rows][Hq*d]) over the cache positions [0, position]; out is

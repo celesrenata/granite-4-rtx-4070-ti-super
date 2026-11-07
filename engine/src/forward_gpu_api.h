@@ -185,7 +185,8 @@ int gpu_verify_attention_stage(
     float attention_scale, int base_pos, int rows, int q_heads, int kv_heads,
     int head_dim, int cache_stride, std::uint16_t* d_q_rot,
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k,
-    std::uint16_t* d_cache_v, std::uint16_t* d_out);
+    std::uint16_t* d_cache_v, std::uint16_t* d_out,
+    const int* d_pt = nullptr);
 
 // Project normalized speculative rows and run one transformer's attention block.
 // This compatibility name delegates to the explicitly batched helper below.
@@ -198,7 +199,7 @@ int gpu_verify_attention_layer(
     int head_dim, int hidden_size, int cache_stride, std::uint16_t* d_q,
     std::uint16_t* d_k, std::uint16_t* d_v, std::uint16_t* d_q_rot,
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
-    std::uint16_t* d_attn_out);
+    std::uint16_t* d_attn_out, const int* d_pt = nullptr);
 
 // Batched speculative attention block for already-normalized rows. This is
 // intentionally limited to one transformer attention block; it does not yet
@@ -215,7 +216,7 @@ int gpu_verify_attention_layer_batched(
     int head_dim, int hidden_size, int cache_stride, std::uint16_t* d_q,
     std::uint16_t* d_k, std::uint16_t* d_v, std::uint16_t* d_q_rot,
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
-    std::uint16_t* d_attn_out);
+    std::uint16_t* d_attn_out, const int* d_pt = nullptr);
 
 }  // namespace granite4
 

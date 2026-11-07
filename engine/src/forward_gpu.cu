@@ -274,7 +274,7 @@ __global__ void kv_append_compact_kernel(const std::uint16_t* src_k,
                                          std::uint16_t* cache_v,
                                          std::uint16_t* compact_k,
                                          std::uint16_t* compact_v,
-                                         int kv_len, int t, int pos, int Hk, int d) {
+                                         int kv_len, int t, int pos, int Hk, int d, const int* d_pt) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= Hk * d) return;
   const int hkv = idx / d;
@@ -283,10 +283,12 @@ __global__ void kv_append_compact_kernel(const std::uint16_t* src_k,
   const std::size_t comp_row = static_cast<std::size_t>(hkv) * kv_len * d;
   const std::uint16_t kk = src_k[idx];
   const std::uint16_t vv = src_v[idx];
-  cache_k[cache_row + static_cast<std::size_t>(t) * d + i] = kk;
-  cache_v[cache_row + static_cast<std::size_t>(t) * d + i] = vv;
+  const int t_row = (d_pt != nullptr) ? d_pt[t] : t;
+  cache_k[cache_row + static_cast<std::size_t>(t_row) * d + i] = kk;
+  cache_v[cache_row + static_cast<std::size_t>(t_row) * d + i] = vv;
   for (int kv = 0; kv < kv_len; ++kv) {
-    const std::size_t coff = cache_row + static_cast<std::size_t>(kv) * d + i;
+    const int kv_row = (d_pt != nullptr) ? d_pt[kv] : kv;
+    const std::size_t coff = cache_row + static_cast<std::size_t>(kv_row) * d + i;
     const std::size_t doff = comp_row + static_cast<std::size_t>(kv) * d + i;
     compact_k[doff] = (kv == t) ? kk : cache_k[coff];
     compact_v[doff] = (kv == t) ? vv : cache_v[coff];
@@ -622,7 +624,7 @@ int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
                                       std::uint16_t* d_cache_k,
                                       std::uint16_t* d_cache_v, int base_pos,
                                       int rows, int stride, int Hk, int d,
-                                      const int* d_pt);
+                                      const int* d_pt = nullptr);
 int granite4_kernel_kv_append_int8_batched(const std::uint16_t* d_src_k,
                                            const std::uint16_t* d_src_v,
                                            std::int8_t* d_cache_k,
@@ -630,7 +632,7 @@ int granite4_kernel_kv_append_int8_batched(const std::uint16_t* d_src_k,
                                            float* d_cache_k_scale,
                                            float* d_cache_v_scale, int base_pos,
                                            int rows, int stride, int Hk, int d,
-                                           const int* d_pt);
+                                           const int* d_pt = nullptr);
 int granite4_kernel_kv_append_int4_batched(const std::uint16_t* d_src_k,
                                            const std::uint16_t* d_src_v,
                                            std::uint8_t* d_cache_k,
@@ -638,7 +640,7 @@ int granite4_kernel_kv_append_int4_batched(const std::uint16_t* d_src_k,
                                            float* d_cache_k_scale,
                                            float* d_cache_v_scale, int base_pos,
                                            int rows, int stride, int Hk, int d,
-                                           const int* d_pt);
+                                           const int* d_pt = nullptr);
 int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
                                       const std::uint16_t* d_k,
                                       const std::uint16_t* d_v, float att_scale,
@@ -651,7 +653,8 @@ int granite4_kernel_verify_attention_stage(
     const std::uint16_t* d_v, const float* d_cos, const float* d_sin,
     float att_scale, int base_pos, int rows, int Hq, int Hk, int d,
     int cache_stride, std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
-    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, std::uint16_t* d_out);
+    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, std::uint16_t* d_out,
+    const int* d_pt = nullptr);
 int granite4_kernel_qkv_dequant_batched(
     const std::uint16_t* d_a, const std::uint8_t* d_wq, const std::uint8_t* d_wk,
     const std::uint8_t* d_wv, float sq, float sk, float sv, int tokens,
@@ -661,7 +664,7 @@ int granite4_kernel_verify_qkv_stage(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
     const float* d_cos, const float* d_sin, int base_pos, int rows, int Hq, int Hk,
     int d, int cache_stride, std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
-    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v);
+    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, const int* d_pt = nullptr);
 int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                  const std::uint16_t* d_x, float scale_g, float scale_u,
                                  int N, int K, std::uint16_t* d_out);
@@ -800,6 +803,12 @@ struct GpuCtx {
   std::uint16_t* scratch = nullptr;
   std::uint16_t* scratch_batched = nullptr;  // token-major [kMaxVerifyRows][...], batched verify forward
   int* d_pos = nullptr;     // device position of the single-position step
+  // P4: device position -> physical-arena-row table ([max_pos] ints). null
+  // means the contiguous identity layout (row == position); a non-null table
+  // makes every append/attention kernel gather its row through d_pt so the
+  // persistent cache can be a permuted (paged) arena. Set via
+  // gpu_ctx_set_kv_rows; the live default stays contiguous.
+  int* d_pt = nullptr;
   bool gqa_fusable = true;  // fused GQA fits the per-block shared memory at max_pos
   bool direct_kv = false;   // A/B: attention indexes the persistent cache
   // Split-KV attention (attention_split.cu) for decode and verify rows;
@@ -1004,6 +1013,17 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
   if (e == cudaSuccess) e = cudaMalloc(&g->scratch, term);
   if (e == cudaSuccess) e = cudaMalloc(&g->scratch_batched, scratch_batched_bytes);
   if (e == cudaSuccess) e = cudaMalloc(&g->d_pos, sizeof(int));
+  // P4: arena row table, identity at create time (row == position); the
+  // device address is stable for the lifetime of the context, so a captured
+  // decode graph always sees the current table contents.
+  if (e == cudaSuccess)
+    e = cudaMalloc(&g->d_pt, sizeof(int) * static_cast<std::size_t>(max_positions));
+  if (e == cudaSuccess && g->d_pt != nullptr) {
+    std::vector<int> ident(static_cast<std::size_t>(max_positions));
+    for (std::size_t i = 0; i < ident.size(); ++i) ident[i] = static_cast<int>(i);
+    e = cudaMemcpy(g->d_pt, ident.data(),
+                   sizeof(int) * ident.size(), cudaMemcpyHostToDevice);
+  }
   if (e == cudaSuccess && g->split_attn)
     e = cudaMalloc(&g->attn_scratch, attn_split_scratch_bytes(g->Hq, kMaxVerifyRows, max_positions));
   // Fused GQA keeps [q row + logits + probs (+ exp terms)] in shared memory;
@@ -1055,6 +1075,7 @@ void gpu_ctx_free(GpuCtx* ctx) {
   cudaFree(ctx->scratch);
   cudaFree(ctx->scratch_batched);
   cudaFree(ctx->d_pos);
+  cudaFree(ctx->d_pt);
   cudaFree(ctx->attn_scratch);
   cudaFree(ctx->prefill);
   if (ctx->decode_graph != nullptr) cudaGraphExecDestroy(ctx->decode_graph);
@@ -1395,18 +1416,19 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
     if (g->kv4) {
       kv_append_int4_kernel<<<Hk, kKvAppendInt4Threads>>>(
           d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale,
-          g->d_pos, max_pos, Hk, d, nullptr);
+          g->d_pos, max_pos, Hk, d, g->d_pt);
     } else if (g->kv8) {
       kv_append_int8_kernel<<<Hk, kKvAppendInt8Threads>>>(
           d_k_new_rot, d_v_new, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale,
-          g->d_pos, max_pos, Hk, d, nullptr);
+          g->d_pos, max_pos, Hk, d, g->d_pt);
     } else if (direct) {
       kv_append_kernel<<<(Hk * d + 255) / 256, 256>>>(d_k_new_rot, d_v_new, lw.kv_k,
-                                                      lw.kv_v, g->d_pos, max_pos, Hk, d, nullptr);
+                                                      lw.kv_v, g->d_pos, max_pos, Hk, d,
+                                                      g->d_pt);
     } else {
       kv_append_compact_kernel<<<(Hk * d + 255) / 256, 256>>>(
           d_k_new_rot, d_v_new, lw.kv_k, lw.kv_v, g->compact_k, g->compact_v, kv_len,
-          t_host, max_pos, Hk, d);
+          t_host, max_pos, Hk, d, g->d_pt);
     }
     G4_CUDA_CHECK(cudaGetLastError());
     bucket(StepProbe::kAttnAttn, layer, 1);
@@ -1420,7 +1442,7 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
       if (attn_split(d_qf_rot, nullptr, nullptr, att_scale, Hq, Hk, d, 0, g->d_pos, 1,
                      max_pos, g->attn_scratch, d_attn_out, nullptr, nullptr,
                      lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
-                     true) != 0)
+                     true, g->d_pt) != 0)
         return -1;
     } else if (g->kv8) {
       // KV8: the persistent cache is int8, so only the split-KV attention
@@ -1430,17 +1452,18 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
       if (attn_split(d_qf_rot, nullptr, nullptr, att_scale, Hq, Hk, d, 0, g->d_pos, 1,
                      max_pos, g->attn_scratch, d_attn_out, lw.kv8_k, lw.kv8_v,
                      lw.kv8_k_scale, lw.kv8_v_scale, true, nullptr, nullptr,
-                     false) != 0)
+                     false, g->d_pt) != 0)
         return -1;
     } else if (direct && g->split_attn) {
       if (attn_split(d_qf_rot, lw.kv_k, lw.kv_v, att_scale, Hq, Hk, d, 0, g->d_pos, 1,
                      max_pos, g->attn_scratch, d_attn_out, nullptr, nullptr,
-                     nullptr, nullptr, false, nullptr, nullptr, false) != 0)
+                     nullptr, nullptr, false, nullptr, nullptr, false, g->d_pt) != 0)
         return -1;
     } else if (direct) {
       // kv_len = *d_pos + 1 on the device; max_pos bounds the shared memory.
       if (granite4_kernel_gqa_fused_pos(d_qf_rot, lw.kv_k, lw.kv_v, att_scale, Hq, Hk, d,
-                                        max_pos, max_pos, g->d_pos, d_attn_out) != 0)
+                                        max_pos, max_pos, g->d_pos, d_attn_out,
+                                         g->d_pt) != 0)
         return -1;
     } else if (g->gqa_fusable) {
       if (granite4_kernel_gqa_fused(d_qf_rot, g->compact_k, g->compact_v, att_scale, Hq,
@@ -1589,11 +1612,11 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
               d_k_new_rot) != 0 ||
           granite4_kernel_kv_append_int4_batched(
               d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale,
-              start, rows, g->max_pos, Hk, d, nullptr) != 0 ||
+              start, rows, g->max_pos, Hk, d, g->d_pt) != 0 ||
           attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d,
                      start, nullptr, rows, g->max_pos, g->attn_scratch, d_attn_out,
                      nullptr, nullptr, lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k,
-                     lw.kv4_v, true) != 0)
+                     lw.kv4_v, true, g->d_pt) != 0)
         return -1;
     } else if (g->kv8) {
       // KV8: rotate Q/K (the bf16 stage's RoPE), append the verify rows to the
@@ -1611,26 +1634,26 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
               d_k_new_rot) != 0 ||
           granite4_kernel_kv_append_int8_batched(
               d_k_new_rot, d_v_new, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale,
-              start, rows, g->max_pos, Hk, d, nullptr) != 0 ||
+              start, rows, g->max_pos, Hk, d, g->d_pt) != 0 ||
           attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d,
                      start, nullptr, rows, g->max_pos, g->attn_scratch, d_attn_out, lw.kv8_k,
                      lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, true, nullptr, nullptr,
-                     false) != 0)
+                     false, g->d_pt) != 0)
         return -1;
     } else if (granite4_kernel_verify_qkv_stage(
                    d_qf, d_k_new, d_v_new,
                    g->cos_tbl + static_cast<std::size_t>(start) * half,
                    g->sin_tbl + static_cast<std::size_t>(start) * half, start, rows, Hq, Hk, d,
-                   g->max_pos, d_qf_rot, d_k_new_rot, lw.kv_k, lw.kv_v) != 0 ||
+                   g->max_pos, d_qf_rot, d_k_new_rot, lw.kv_k, lw.kv_v, g->d_pt) != 0 ||
                (g->split_attn
                     ? attn_split(d_qf_rot, lw.kv_k, lw.kv_v, g->spec.attention_multiplier, Hq,
                                  Hk, d, start, nullptr, rows, g->max_pos, g->attn_scratch,
                                  d_attn_out, nullptr, nullptr, nullptr, nullptr, false,
-                                  nullptr, nullptr, false)
+                                  nullptr, nullptr, false, g->d_pt)
                     : granite4_kernel_gqa_fused_batched(d_qf_rot, lw.kv_k, lw.kv_v,
                                                         g->spec.attention_multiplier, Hq, Hk, d,
                                                         start, rows, g->max_pos,
-                                                        d_attn_out)) != 0)
+                                                        d_attn_out, g->d_pt)) != 0)
       return -1;
     if (granite4_verify_gemv_resid(d_attn_out, lw.wo, lw.sc[3], d_hidden, resid_scale, rows,
                                    H, H, d_hidden) != 0 ||
@@ -1810,12 +1833,12 @@ int forward_prefill(GpuCtx* g, const std::int32_t* d_tokens, int start, int end,
         // reads the unallocated bf16 cache, so it is unavailable under KV4.
         if (prefill_rope_split_append_int4(
                 s.qkv, g->cos_tbl, g->sin_tbl, c0, M, Hq, Hk, d, g->max_pos,
-                s.q_rot, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale) != 0 ||
+                s.q_rot, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale, g->d_pt) != 0 ||
             prefill_attention(s.q_rot, nullptr, nullptr,
                               g->spec.attention_multiplier, Hq, Hk, d, c0, M,
                               g->max_pos, s.attn, nullptr, nullptr, lw.kv4_k_scale,
                               lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
-                              true) != 0)
+                              true, g->d_pt) != 0)
           return -1;
       } else if (g->kv8) {
         // KV8: append the chunk's K/V to the int8 persistent cache (rotating
@@ -1824,23 +1847,23 @@ int forward_prefill(GpuCtx* g, const std::int32_t* d_tokens, int start, int end,
         // cache, so it is unavailable under KV8.
         if (prefill_rope_split_append_int8(
                 s.qkv, g->cos_tbl, g->sin_tbl, c0, M, Hq, Hk, d, g->max_pos,
-                s.q_rot, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale) != 0 ||
+                s.q_rot, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, g->d_pt) != 0 ||
             prefill_attention(s.q_rot, nullptr, nullptr,
                               g->spec.attention_multiplier, Hq, Hk, d, c0, M,
                               g->max_pos, s.attn, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale,
-                              lw.kv8_v_scale, true, nullptr, nullptr, false) != 0)
+                              lw.kv8_v_scale, true, nullptr, nullptr, false, g->d_pt) != 0)
           return -1;
       } else if (prefill_rope_split_append(
                      s.qkv, g->cos_tbl, g->sin_tbl, c0, M, Hq, Hk, d, g->max_pos,
-                     s.q_rot, lw.kv_k, lw.kv_v) != 0 ||
+                     s.q_rot, lw.kv_k, lw.kv_v, g->d_pt) != 0 ||
                  (prefill_attention(s.q_rot, lw.kv_k, lw.kv_v,
                                     g->spec.attention_multiplier, Hq, Hk, d, c0, M,
                                     g->max_pos, s.attn, nullptr, nullptr, nullptr,
-                                    nullptr, false, nullptr, nullptr, false) != 0 &&
+                                    nullptr, false, nullptr, nullptr, false, g->d_pt) != 0 &&
                   granite4_kernel_gqa_fused_rows(s.q_rot, lw.kv_k, lw.kv_v,
                                                  g->spec.attention_multiplier, Hq,
                                                  Hk, d, c0, M, g->max_pos,
-                                                 s.attn) != 0))
+                                                 s.attn, g->d_pt) != 0))
         return -1;
       if (prefill_gemm(GemmOut::kResidual, s.attn, nq, lw.wo, M, H, nq, o, s.ws,
                        s.ws_bytes) != 0 ||
@@ -2038,7 +2061,8 @@ int gpu_verify_attention_stage(
     float attention_scale, int base_pos, int rows, int q_heads, int kv_heads,
     int head_dim, int cache_stride, std::uint16_t* d_q_rot,
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k,
-    std::uint16_t* d_cache_v, std::uint16_t* d_out) {
+    std::uint16_t* d_cache_v, std::uint16_t* d_out,
+    const int* d_pt) {
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_cos == nullptr ||
       d_sin == nullptr || d_q_rot == nullptr || d_k_rot == nullptr ||
       d_cache_k == nullptr || d_cache_v == nullptr || d_out == nullptr ||
@@ -2053,7 +2077,7 @@ int gpu_verify_attention_stage(
   return granite4_kernel_verify_attention_stage(
       d_q, d_k, d_v, d_cos, d_sin, attention_scale, base_pos, rows,
       q_heads, kv_heads, head_dim, cache_stride, d_q_rot, d_k_rot,
-      d_cache_k, d_cache_v, d_out);
+      d_cache_k, d_cache_v, d_out, d_pt);
 }
 
 int gpu_verify_attention_layer_batched(
@@ -2064,7 +2088,7 @@ int gpu_verify_attention_layer_batched(
     int head_dim, int hidden_size, int cache_stride, std::uint16_t* d_q,
     std::uint16_t* d_k, std::uint16_t* d_v, std::uint16_t* d_q_rot,
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
-    std::uint16_t* d_attn_out) {
+    std::uint16_t* d_attn_out, const int* d_pt) {
   if (d_normed == nullptr || d_wq == nullptr || d_wk == nullptr || d_wv == nullptr ||
       d_q == nullptr || d_k == nullptr || d_v == nullptr || d_cos == nullptr ||
       d_sin == nullptr || d_q_rot == nullptr || d_k_rot == nullptr ||
@@ -2095,7 +2119,7 @@ int gpu_verify_attention_layer_batched(
   return gpu_verify_attention_stage(
       d_q, d_k, d_v, d_cos, d_sin, attention_scale, base_pos, rows,
       q_heads, kv_heads, head_dim, cache_stride, d_q_rot, d_k_rot,
-      d_cache_k, d_cache_v, d_attn_out);
+      d_cache_k, d_cache_v, d_attn_out, d_pt);
 }
 
 int gpu_verify_attention_layer(
@@ -2106,12 +2130,12 @@ int gpu_verify_attention_layer(
     int head_dim, int hidden_size, int cache_stride, std::uint16_t* d_q,
     std::uint16_t* d_k, std::uint16_t* d_v, std::uint16_t* d_q_rot,
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
-    std::uint16_t* d_attn_out) {
+    std::uint16_t* d_attn_out, const int* d_pt) {
   return gpu_verify_attention_layer_batched(
       d_normed, d_wq, d_wk, d_wv, q_scale, k_scale, v_scale, d_cos, d_sin,
       attention_scale, base_pos, rows, q_heads, kv_heads, head_dim, hidden_size,
       cache_stride, d_q, d_k, d_v, d_q_rot, d_k_rot, d_cache_k, d_cache_v,
-      d_attn_out);
+      d_attn_out, d_pt);
 }
 
 int gpu_forward(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
@@ -2215,6 +2239,46 @@ int gpu_ctx_truncate(GpuCtx* ctx, int written) {
 
 void gpu_ctx_reset(GpuCtx* ctx) {
   if (ctx != nullptr) (void)gpu_ctx_truncate(ctx, 0);
+}
+
+// P4: publish a device position -> physical-arena-row table for the
+// persistent KV cache. h_rows must map every logical position [0, max_pos)
+// to a distinct physical row in [0, max_pos) (the paged pool's arena row
+// table); nullptr restores the contiguous identity layout. The table buffer
+// is allocated once at gpu_ctx_create (a stable device address, so it is
+// safe to bake into the captured decode graph) and only ever overwritten;
+// every append/attention kernel that indexes the persistent cache gathers
+// its row through it. Returns 0 on success, -1 on a bad context/args.
+int gpu_ctx_set_kv_rows(GpuCtx* ctx, const int* h_rows) {
+  if (ctx == nullptr) return -1;
+  if (ctx->d_pt == nullptr) {  // defensive: not allocated (shouldn't happen)
+    if (cudaMalloc(&ctx->d_pt, sizeof(int) * static_cast<std::size_t>(ctx->max_pos)) !=
+        cudaSuccess)
+      return -1;
+  }
+  const std::size_t n = static_cast<std::size_t>(ctx->max_pos);
+  if (h_rows == nullptr) {
+    // Restore the identity layout (row == position) on the host, then upload.
+    int* ident = static_cast<int*>(std::malloc(sizeof(int) * n));
+    if (ident == nullptr) return -1;
+    for (std::size_t i = 0; i < n; ++i) ident[i] = static_cast<int>(i);
+    const bool ok =
+        cudaMemcpy(ctx->d_pt, ident, sizeof(int) * n, cudaMemcpyHostToDevice) == cudaSuccess;
+    std::free(ident);
+    return ok ? 0 : -1;
+  }
+  // Validate: a permutation of [0, max_pos) (distinct rows, in range).
+  {
+    std::vector<bool> seen(n, false);
+    for (std::size_t i = 0; i < n; ++i) {
+      const int r = h_rows[i];
+      if (r < 0 || r >= static_cast<int>(n) || seen[r]) return -1;
+      seen[r] = true;
+    }
+  }
+  if (cudaMemcpy(ctx->d_pt, h_rows, sizeof(int) * n, cudaMemcpyHostToDevice) != cudaSuccess)
+    return -1;
+  return 0;
 }
 
 bool gpu_ctx_is_kv8(const GpuCtx* ctx) {
@@ -2339,7 +2403,7 @@ extern "C" int granite4_kernel_verify_qkv_stage(
     const std::uint16_t* d_v, const float* d_cos, const float* d_sin,
     int base_pos, int rows, int Hq, int Hk, int d, int cache_stride,
     std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
-    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v) {
+    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, const int* d_pt) {
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_cos == nullptr ||
       d_sin == nullptr || d_q_rot == nullptr || d_k_rot == nullptr ||
       d_cache_k == nullptr || d_cache_v == nullptr || base_pos < 0 ||
@@ -2361,7 +2425,7 @@ extern "C" int granite4_kernel_verify_qkv_stage(
   G4_CUDA_CHECK(cudaGetLastError());
   return granite4_kernel_kv_append_batched(
       d_k_rot, d_v, d_cache_k, d_cache_v, base_pos, rows,
-      cache_stride, Hk, d, nullptr);
+      cache_stride, Hk, d, d_pt);
 }
 
 // Complete attention-stage verify primitive. Q/K are already projected; this
@@ -2371,14 +2435,15 @@ extern "C" int granite4_kernel_verify_attention_stage(
     const std::uint16_t* d_v, const float* d_cos, const float* d_sin,
     float att_scale, int base_pos, int rows, int Hq, int Hk, int d,
     int cache_stride, std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
-    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, std::uint16_t* d_out) {
+    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, std::uint16_t* d_out,
+    const int* d_pt) {
   const int staged = granite4_kernel_verify_qkv_stage(
       d_q, d_k, d_v, d_cos, d_sin, base_pos, rows, Hq, Hk, d, cache_stride,
-      d_q_rot, d_k_rot, d_cache_k, d_cache_v);
+      d_q_rot, d_k_rot, d_cache_k, d_cache_v, d_pt);
   if (staged != 0) return staged;
   return granite4_kernel_gqa_fused_batched(
       d_q_rot, d_cache_k, d_cache_v, att_scale, Hq, Hk, d, base_pos,
-      rows, cache_stride, d_out);
+      rows, cache_stride, d_out, d_pt);
 }
 
 }  // namespace granite4

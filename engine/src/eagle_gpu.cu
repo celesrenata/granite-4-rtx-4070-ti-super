@@ -52,7 +52,7 @@ int granite4_kernel_rmsnorm(const std::uint16_t*, const std::uint16_t*, float, i
 int granite4_kernel_verify_qkv_stage(const std::uint16_t*, const std::uint16_t*,
                                      const std::uint16_t*, const float*, const float*, int, int,
                                      int, int, int, int, std::uint16_t*, std::uint16_t*,
-                                     std::uint16_t*, std::uint16_t*);
+                                     std::uint16_t*, std::uint16_t*, const int* d_pt = nullptr);
 // Quantized draft KV: rotate K in place at [pos0..pos0+rows) (Q rotation is
 // done by the caller on the bf16 q), then append the rotated K + raw V to the
 // persistent pool with a per-row scale. int8 (Q8_0) and int4 (Q4_0) forms.
@@ -496,7 +496,7 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
     } else if (granite4_kernel_verify_qkv_stage(
                    q, k, v, h->cos_tbl + static_cast<std::size_t>(p) * half,
                    h->sin_tbl + static_cast<std::size_t>(p) * half, p, R, h->Hq, h->Hk, h->d,
-                   h->max_pos, qr, kr, h->kv_k, h->kv_v) != 0 ||
+                   h->max_pos, qr, kr, h->kv_k, h->kv_v, nullptr) != 0 ||
                attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
                           h->max_pos, h->attn_scratch, att) != 0) {
       return -1;
