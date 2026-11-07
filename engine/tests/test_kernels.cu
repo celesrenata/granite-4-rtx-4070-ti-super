@@ -175,7 +175,8 @@ int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::int8_t* cache_v8 = nullptr,
                       const float* k_scale = nullptr, const float* v_scale = nullptr,
                       bool int8 = false, const std::uint8_t* cache_k4 = nullptr,
-                      const std::uint8_t* cache_v4 = nullptr, bool int4 = false);
+                      const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
+                      const int* d_pt = nullptr);
 }
 
 namespace {
@@ -1389,6 +1390,250 @@ static void test_prefill_attention_device() {
   cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dref); cudaFree(dgot);
 }
 
+// Paged prefill: the tensor-core causal attention gathers each tile row
+// through the same position->row table the split and fused kernels use, so a
+// physically permuted arena must read bit-identically to the contiguous one.
+// All three KV formats are checked because the quantized paths also dequantize
+// with the row's scale - the scale travels with the physical row, not the
+// logical position, so a kernel that reads it at the logical position is
+// bit-correct only under an identity table.
+static void test_paged_prefill_device() {
+  const int Hq = 8, Hk = 2, d = 128, base = 37, rows = 75, stride = 128;
+  Xorshift64 rng(0x51f3);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  const float scale = 0.0078125f * 8.0f;  // sharp, exercises the softmax
+
+  // A fixed permutation of the arena rows: perm[pos] is the physical row
+  // holding logical position pos. Fisher-Yates makes it a real bijection.
+  std::vector<int> perm(stride);
+  for (int p = 0; p < stride; ++p) perm[p] = p;
+  for (int i = stride - 1; i > 0; --i) {
+    const int j = static_cast<int>(rng.next() % (i + 1));
+    std::swap(perm[i], perm[j]);
+  }
+
+  std::uint16_t *dq, *dref, *dgotp;
+  int *dpt;
+  std::uint16_t *dk, *dv, *dkp, *dvp;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dref, qn * 2) ||
+      cudaMalloc(&dgotp, qn * 2) || cudaMalloc(&dpt, sizeof(int) * stride) ||
+      cudaMalloc(&dk, cn * 2) || cudaMalloc(&dv, cn * 2) ||
+      cudaMalloc(&dkp, cn * 2) || cudaMalloc(&dvp, cn * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dpt, perm.data(), sizeof(int) * stride, cudaMemcpyHostToDevice));
+
+  // ---- bf16: permuted arena, d_pt, must equal the contiguous reference ----
+  std::vector<std::uint16_t> ckp(cn), cvp(cn);
+  for (int hkv = 0; hkv < Hk; ++hkv)
+    for (int pos = 0; pos < stride; ++pos) {
+      const std::size_t src = static_cast<std::size_t>(hkv) * stride * d + pos * d;
+      const std::size_t dst =
+          static_cast<std::size_t>(hkv) * stride * d + static_cast<std::size_t>(perm[pos]) * d;
+      std::copy(ck.begin() + src, ck.begin() + src + d, ckp.begin() + dst);
+      std::copy(cv.begin() + src, cv.begin() + src + d, cvp.begin() + dst);
+    }
+  CUDA_CHECK(cudaMemcpy(dkp, ckp.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dvp, cvp.data(), cn * 2, cudaMemcpyHostToDevice));
+  expect(granite4::prefill_attention(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride,
+                                     dref) == 0,
+         "paged prefill: contiguous bf16 reference");
+  expect(granite4::prefill_attention(dq, dkp, dvp, scale, Hq, Hk, d, base, rows, stride,
+                                     dgotp, nullptr, nullptr, nullptr, nullptr, false,
+                                     nullptr, nullptr, false, dpt) == 0,
+         "paged prefill: permuted bf16 launch");
+  std::vector<std::uint16_t> ref(qn), got(qn);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got.data(), dgotp, qn * 2, cudaMemcpyDeviceToHost));
+  double max_err = 0.0;
+  for (std::size_t i = 0; i < qn; ++i)
+    max_err = std::max(max_err,
+                       static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) -
+                                                    bf16_to_f32_host(ref[i]))));
+  expect(max_err == 0.0, "paged prefill (bf16): bit-identical to contiguous");
+
+  // ---- KV8: codes + scales travel with the row; d_pt must pick up both ----
+  {
+    std::vector<std::int8_t> c8k(cn), c8v(cn);
+    std::vector<float> sk(Hk * stride), sv(Hk * stride);
+    for (int h = 0; h < Hk; ++h)
+      for (int p = 0; p < stride; ++p) {
+        const std::size_t row = static_cast<std::size_t>(h) * stride + p;
+        const std::size_t src = row * d;
+        float ak = 0.0f, av = 0.0f;
+        for (int i = 0; i < d; ++i) {
+          ak = std::max(ak, std::fabs(bf16_to_f32_host(ck[src + i])));
+          av = std::max(av, std::fabs(bf16_to_f32_host(cv[src + i])));
+        }
+        const float sks = kv8_scale_host(ak), svs = kv8_scale_host(av);
+        sk[row] = sks;
+        sv[row] = svs;
+        for (int i = 0; i < d; ++i) {
+          c8k[row * d + i] = kv8_quant_host(bf16_to_f32_host(ck[src + i]), sks);
+          c8v[row * d + i] = kv8_quant_host(bf16_to_f32_host(cv[src + i]), svs);
+        }
+      }
+    // permuted: code rows and their scales both move to perm[pos].
+    std::vector<std::int8_t> c8kp(cn), c8vp(cn);
+    std::vector<float> skp(Hk * stride), svp(Hk * stride);
+    for (int hkv = 0; hkv < Hk; ++hkv)
+      for (int pos = 0; pos < stride; ++pos) {
+        const std::size_t src = static_cast<std::size_t>(hkv) * stride + pos;
+        const std::size_t dst =
+            static_cast<std::size_t>(hkv) * stride + static_cast<std::size_t>(perm[pos]);
+        std::copy(c8k.begin() + src * d, c8k.begin() + src * d + d, c8kp.begin() + dst * d);
+        std::copy(c8v.begin() + src * d, c8v.begin() + src * d + d, c8vp.begin() + dst * d);
+        skp[dst] = sk[src];
+        svp[dst] = sv[src];
+      }
+    std::int8_t *dc8k, *dc8v, *dc8kp, *dc8vp;
+    float *dsk, *dsv, *dskp, *dsvp;
+    if (cudaMalloc(&dc8k, cn) || cudaMalloc(&dc8v, cn) ||
+        cudaMalloc(&dc8kp, cn) || cudaMalloc(&dc8vp, cn) ||
+        cudaMalloc(&dsk, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dsv, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dskp, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dsvp, sizeof(float) * Hk * stride)) {
+      ++g_failures;
+      return;
+    }
+    CUDA_CHECK(cudaMemcpy(dc8k, c8k.data(), cn, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc8v, c8v.data(), cn, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc8kp, c8kp.data(), cn, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc8vp, c8vp.data(), cn, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsk, sk.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsv, sv.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dskp, skp.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsvp, svp.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    expect(granite4::prefill_attention(dq, nullptr, nullptr, scale, Hq, Hk, d, base, rows,
+                                       stride, dref, dc8k, dc8v, dsk, dsv, true,
+                                       nullptr, nullptr, false) == 0,
+           "paged prefill: contiguous kv8 reference");
+    expect(granite4::prefill_attention(dq, nullptr, nullptr, scale, Hq, Hk, d, base, rows,
+                                       stride, dgotp, dc8kp, dc8vp, dskp, dsvp, true,
+                                       nullptr, nullptr, false, dpt) == 0,
+           "paged prefill: permuted kv8 launch");
+    CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(got.data(), dgotp, qn * 2, cudaMemcpyDeviceToHost));
+    double max_err8 = 0.0;
+    for (std::size_t i = 0; i < qn; ++i)
+      max_err8 = std::max(max_err8,
+                           static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) -
+                                                       bf16_to_f32_host(ref[i]))));
+    expect(max_err8 == 0.0, "paged prefill (kv8): bit-identical to contiguous");
+    cudaFree(dc8k);
+    cudaFree(dc8v);
+    cudaFree(dc8kp);
+    cudaFree(dc8vp);
+    cudaFree(dsk);
+    cudaFree(dsv);
+    cudaFree(dskp);
+    cudaFree(dsvp);
+  }
+
+  // ---- KV4: same contract, two codes per byte ----
+  {
+    std::vector<std::uint8_t> c4k(Hk * stride * (d / 2)), c4v(Hk * stride * (d / 2));
+    std::vector<float> sk(Hk * stride), sv(Hk * stride);
+    for (int h = 0; h < Hk; ++h)
+      for (int p = 0; p < stride; ++p) {
+        const std::size_t row = static_cast<std::size_t>(h) * stride + p;
+        const std::size_t src = row * d;
+        float ak = 0.0f, av = 0.0f;
+        for (int i = 0; i < d; ++i) {
+          ak = std::max(ak, std::fabs(bf16_to_f32_host(ck[src + i])));
+          av = std::max(av, std::fabs(bf16_to_f32_host(cv[src + i])));
+        }
+        const float sks = q4_scale_host(ak), svs = q4_scale_host(av);
+        sk[row] = sks;
+        sv[row] = svs;
+        for (int w = 0; w < d / 2; ++w) {
+          c4k[row * (d / 2) + w] = static_cast<std::uint8_t>(
+              (q4_quant_host(bf16_to_f32_host(ck[src + 2 * w]), sks) & 0x0fu) |
+              (q4_quant_host(bf16_to_f32_host(ck[src + 2 * w + 1]), sks) << 4));
+          c4v[row * (d / 2) + w] = static_cast<std::uint8_t>(
+              (q4_quant_host(bf16_to_f32_host(cv[src + 2 * w]), svs) & 0x0fu) |
+              (q4_quant_host(bf16_to_f32_host(cv[src + 2 * w + 1]), svs) << 4));
+        }
+      }
+    std::vector<std::uint8_t> c4kp(Hk * stride * (d / 2)), c4vp(Hk * stride * (d / 2));
+    std::vector<float> skp(Hk * stride), svp(Hk * stride);
+    for (int hkv = 0; hkv < Hk; ++hkv)
+      for (int pos = 0; pos < stride; ++pos) {
+        const std::size_t src = static_cast<std::size_t>(hkv) * stride + pos;
+        const std::size_t dst =
+            static_cast<std::size_t>(hkv) * stride + static_cast<std::size_t>(perm[pos]);
+        std::copy(c4k.begin() + src * (d / 2), c4k.begin() + src * (d / 2) + d / 2,
+                  c4kp.begin() + dst * (d / 2));
+        std::copy(c4v.begin() + src * (d / 2), c4v.begin() + src * (d / 2) + d / 2,
+                  c4vp.begin() + dst * (d / 2));
+        skp[dst] = sk[src];
+        svp[dst] = sv[src];
+      }
+    std::uint8_t *dc4k, *dc4v, *dc4kp, *dc4vp;
+    float *dsk, *dsv, *dskp, *dsvp;
+    if (cudaMalloc(&dc4k, c4k.size()) || cudaMalloc(&dc4v, c4v.size()) ||
+        cudaMalloc(&dc4kp, c4kp.size()) || cudaMalloc(&dc4vp, c4vp.size()) ||
+        cudaMalloc(&dsk, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dsv, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dskp, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dsvp, sizeof(float) * Hk * stride)) {
+      ++g_failures;
+      return;
+    }
+    CUDA_CHECK(cudaMemcpy(dc4k, c4k.data(), c4k.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc4v, c4v.data(), c4v.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc4kp, c4kp.data(), c4kp.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc4vp, c4vp.data(), c4vp.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsk, sk.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsv, sv.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dskp, skp.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsvp, svp.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    expect(granite4::prefill_attention(dq, nullptr, nullptr, scale, Hq, Hk, d, base, rows,
+                                       stride, dref, nullptr, nullptr, dsk, dsv, false,
+                                       dc4k, dc4v, true) == 0,
+           "paged prefill: contiguous kv4 reference");
+    expect(granite4::prefill_attention(dq, nullptr, nullptr, scale, Hq, Hk, d, base, rows,
+                                       stride, dgotp, nullptr, nullptr, dskp, dsvp, false,
+                                       dc4kp, dc4vp, true, dpt) == 0,
+           "paged prefill: permuted kv4 launch");
+    CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(got.data(), dgotp, qn * 2, cudaMemcpyDeviceToHost));
+    double max_err4 = 0.0;
+    for (std::size_t i = 0; i < qn; ++i)
+      max_err4 = std::max(max_err4,
+                           static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) -
+                                                       bf16_to_f32_host(ref[i]))));
+    expect(max_err4 == 0.0, "paged prefill (kv4): bit-identical to contiguous");
+    cudaFree(dc4k);
+    cudaFree(dc4v);
+    cudaFree(dc4kp);
+    cudaFree(dc4vp);
+    cudaFree(dsk);
+    cudaFree(dsv);
+    cudaFree(dskp);
+    cudaFree(dsvp);
+  }
+
+  cudaFree(dq);
+  cudaFree(dref);
+  cudaFree(dgotp);
+  cudaFree(dpt);
+  cudaFree(dk);
+  cudaFree(dv);
+  cudaFree(dkp);
+  cudaFree(dvp);
+}
+
 // Split-KV attention vs fused GQA on long prefixes (several splits), both
 // with a host kv_base and with the position read from device memory; the
 // device-position single row must equal the corresponding batched row
@@ -2385,6 +2630,7 @@ int main() {
   test_batched_verify_attention_device();
   test_prefill_gemm_device();
   test_prefill_attention_device();
+  test_paged_prefill_device();
   test_attn_split_device();
   test_paged_attn_split_device();
   test_paged_gqa_fused_device();

@@ -547,7 +547,8 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
                              const float* __restrict__ k_scale,
                              const float* __restrict__ v_scale,
                              const std::uint8_t* __restrict__ cache_k4,
-                             const std::uint8_t* __restrict__ cache_v4) {
+                             const std::uint8_t* __restrict__ cache_v4,
+                             const int* __restrict__ d_pt) {
   constexpr int kPosPerWarp = 16 / G;
   constexpr int kPosPerBlock = kAttnWarps * kPosPerWarp;
   constexpr int KT = kAttnKvTile;
@@ -621,14 +622,18 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
       for (int idx = threadIdx.x; idx < KT * D / 8; idx += kAttnWarps * 32) {
         const int kr = idx / (D / 8), kc = (idx % (D / 8)) * 8;
         const int kj = j0 + kr;
+        // Logical position kj lives in arena row d_pt[kj] (identity when
+        // d_pt is null); out-of-tile positions keep the zero fill below.
+        const int krow = (kj < kv_end) ? ((d_pt != nullptr) ? d_pt[kj] : kj) : kj;
         *reinterpret_cast<uint4*>(&Ks[kr][kc]) =
-            kj < kv_end ? *reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(kj) * D + kc)
+            kj < kv_end ? *reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(krow) * D + kc)
                         : zero;
         const int vr = idx % KT, vc = (idx / KT) * 8;
         const int vj = j0 + vr;
+        const int vrow = (vj < kv_end) ? ((d_pt != nullptr) ? d_pt[vj] : vj) : vj;
         const uint4 v4 =
             vj < kv_end
-                ? *reinterpret_cast<const uint4*>(vb + static_cast<std::size_t>(vj) * D + vc)
+                ? *reinterpret_cast<const uint4*>(vb + static_cast<std::size_t>(vrow) * D + vc)
                 : zero;
         const std::uint32_t vw[4] = {v4.x, v4.y, v4.z, v4.w};
 #pragma unroll
@@ -647,13 +652,14 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
         const int kr = idx / (D / 2), cw = idx % (D / 2);
         const int kj = j0 + kr;
         if (kj < kv_end) {
-          const std::size_t cbase = static_cast<std::size_t>(kj) * (D / 2) + cw;
+          const int row = (d_pt != nullptr) ? d_pt[kj] : kj;
+          const std::size_t cbase = static_cast<std::size_t>(row) * (D / 2) + cw;
           float k0, k1;
-          dev::q4_dequant_pair(k4[cbase], ksc[kj], k0, k1);
+          dev::q4_dequant_pair(k4[cbase], ksc[row], k0, k1);
           Ks[kr][2 * cw] = f32_to_bf16(k0);
           Ks[kr][2 * cw + 1] = f32_to_bf16(k1);
           float v0, v1;
-          dev::q4_dequant_pair(v4[cbase], vsc[kj], v0, v1);
+          dev::q4_dequant_pair(v4[cbase], vsc[row], v0, v1);
           Vt[2 * cw][kr] = f32_to_bf16(v0);
           Vt[2 * cw + 1][kr] = f32_to_bf16(v1);
         } else {
@@ -674,8 +680,9 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
         const int r = idx / (D / 8), w = (idx % (D / 8)) * 8;
         const int j = j0 + r;
         if (j < kv_end) {
-          const std::size_t off = static_cast<std::size_t>(j) * D + w;
-          const float sk = ksc[j];
+          const int row = (d_pt != nullptr) ? d_pt[j] : j;
+          const std::size_t off = static_cast<std::size_t>(row) * D + w;
+          const float sk = ksc[row];
           const uint64_t kraw = *reinterpret_cast<const uint64_t*>(k8 + off);
           const std::int8_t* const kp =
               reinterpret_cast<const std::int8_t*>(&kraw);
@@ -693,8 +700,9 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
         const int r = idx / (D / 8), w = (idx % (D / 8)) * 8;
         const int j = j0 + r;
         if (j < kv_end) {
-          const std::size_t off = static_cast<std::size_t>(j) * D + w;
-          const float sv = vsc[j];
+          const int row = (d_pt != nullptr) ? d_pt[j] : j;
+          const std::size_t off = static_cast<std::size_t>(row) * D + w;
+          const float sv = vsc[row];
           const uint64_t vraw = *reinterpret_cast<const uint64_t*>(v8 + off);
           const std::int8_t* const vp =
               reinterpret_cast<const std::int8_t*>(&vraw);
@@ -971,7 +979,7 @@ int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::int8_t* cache_k8, const std::int8_t* cache_v8,
                       const float* k_scale, const float* v_scale, bool int8,
                       const std::uint8_t* cache_k4, const std::uint8_t* cache_v4,
-                      bool int4) {
+                      bool int4, const int* d_pt) {
   if (q_rot == nullptr || out == nullptr || !std::isfinite(scale) || Hk <= 0 ||
       Hq % Hk != 0 || rows <= 0 || base_pos < 0 || stride < base_pos + rows ||
       d != 128 || Hq / Hk != 4 ||
@@ -990,15 +998,15 @@ int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
   if (int8)
     prefill_attention_kernel<128, 4, true, false><<<grid, kAttnWarps * 32>>>(
         q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, cache_k8,
-        cache_v8, k_scale, v_scale, nullptr, nullptr);
+        cache_v8, k_scale, v_scale, nullptr, nullptr, d_pt);
   else if (int4)
     prefill_attention_kernel<128, 4, false, true><<<grid, kAttnWarps * 32>>>(
         q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, nullptr,
-        nullptr, k_scale, v_scale, cache_k4, cache_v4);
+        nullptr, k_scale, v_scale, cache_k4, cache_v4, d_pt);
   else
     prefill_attention_kernel<128, 4, false, false><<<grid, kAttnWarps * 32>>>(
         q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, nullptr,
-        nullptr, nullptr, nullptr, nullptr, nullptr);
+        nullptr, nullptr, nullptr, nullptr, nullptr, d_pt);
   G4_PF_CHECK();
   return 0;
 }

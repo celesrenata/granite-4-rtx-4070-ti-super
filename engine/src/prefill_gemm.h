@@ -86,7 +86,7 @@ int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                        const std::int8_t* cache_k8, const std::int8_t* cache_v8,
                        const float* k_scale, const float* v_scale, bool int8,
                        const std::uint8_t* cache_k4, const std::uint8_t* cache_v4,
-                       bool int4);
+                       bool int4, const int* d_pt = nullptr);
 
 // act[r][i] = bf16(silu(gu[r][i]) * gu[r][I + i]).
 int prefill_silu_mul(const float* gu, int I, int rows, std::uint16_t* act);
