@@ -150,6 +150,17 @@ class PagedKV {
   // `seq`. n must be <= sequence_tokens(seq). Returns false otherwise.
   bool row_table(int seq, std::size_t n, int* out) const;
 
+  // Drop a LIVE sequence's references to its pages (freeing pages that reach
+  // ref count 0) and reset its filled count to zero, keeping the sequence
+  // alive so a new prompt can immediately match_prefix + reserve on the same
+  // id. Serves the serve loop, where a session slot outlives a request.
+  // `release` instead makes the slot unusable (live == false).
+  //
+  // Pages retained in the prefix cache stay cached and shared with the other
+  // sequences that reference them; only this sequence's private pages are
+  // freed.
+  void reset_sequence(int seq);
+
   // Decrement every page the sequence references; free the pages that reach
   // ref count 0. The sequence becomes unusable.
   void release(int seq);

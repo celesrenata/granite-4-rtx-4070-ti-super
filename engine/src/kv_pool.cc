@@ -191,15 +191,36 @@ bool PagedKV::reserve(int seq, std::size_t token_count, const Tokens& tokens) {
   Sequence& s = seqs_[seq];
   if (token_count <= s.filled) return true;
   const std::size_t B = config_.tokens_per_page;
-  const std::size_t new_tokens = token_count - s.filled;
-  const std::size_t pages_needed = (new_tokens + B - 1) / B;
+
+  // Fill an existing partial last page before appending new ones, so the
+  // block table stays dense and page-aligned (page i owns logical window
+  // [i*B, (i+1)*B)): row_table and prefix_key assume exactly that. Without
+  // this, every incremental reserve would append a fresh page and map
+  // positions to the wrong page.
+  const std::size_t n = s.block_table.size();
+  const std::size_t page_capacity = n * B;  // logical window of the pages held
+  const bool tail_partial = s.filled < page_capacity;
+  // Tokens that do not fit in the pages already held.
+  const std::size_t overflow =
+      token_count > page_capacity ? token_count - page_capacity : 0;
+  const std::size_t pages_needed = (overflow + B - 1) / B;
 
   // Evict retained (cached, unreferenced) pages until the free pool can hold
-  // the requested pages. Fail before allocating anything if we cannot.
+  // the requested pages. Fail before mutating anything if we cannot.
   if (free_list_.size() < pages_needed) {
     for (std::size_t e = free_list_.size(); e < pages_needed; ++e) {
       if (evict_one() == pages_.size()) return false;
     }
+  }
+
+  if (tail_partial) {
+    Page& p = pages_[s.block_table.back()];
+    const std::size_t take =
+        std::min(page_capacity - s.filled, token_count - s.filled);
+    p.tokens.insert(p.tokens.end(), tokens.begin() + s.filled,
+                    tokens.begin() + s.filled + take);
+    s.filled += take;
+    if (s.filled >= token_count) return true;
   }
 
   const std::size_t start = s.filled;  // capture: s.filled moves per page
@@ -274,6 +295,18 @@ bool PagedKV::row_table(int seq, std::size_t n, int* out) const {
     out[p] = static_cast<int>(page_id * B + token_local);
   }
   return true;
+}
+
+void PagedKV::reset_sequence(int seq) {
+  if (seq < 0 || seq >= static_cast<int>(seqs_.size()) || !seqs_[seq].live) {
+    return;
+  }
+  Sequence& s = seqs_[seq];
+  for (const std::size_t page_id : s.block_table) drop_ref(page_id);
+  s.block_table.clear();
+  s.filled = 0;
+  // The sequence stays live with an empty block table, so match_prefix /
+  // reserve can be called again on the same id (serve-loop slot reuse).
 }
 
 void PagedKV::release(int seq) {

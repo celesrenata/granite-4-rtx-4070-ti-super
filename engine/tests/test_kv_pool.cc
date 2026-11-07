@@ -127,10 +127,11 @@ static void test_alloc_and_locate() {
                                    static_cast<std::size_t>(-1),
                                    static_cast<std::size_t>(-1)}),
          "locate out-of-range token");
-  // capacity: a 17th token needs a 4th page that is free (still fits).
+  // 11 tokens (page 3 = tokens 8..11): the 11th token lands in the existing
+  // partial page 2, so no new page is allocated.
   auto toks11 = seq_tokens(100, 11);
-  expect(pool.reserve(s, 11, toks11), "grow to 11 tokens (uses last page)");
-  expect(pool.free_pages() == 0, "all 4 pages now used");
+  expect(pool.reserve(s, 11, toks11), "grow to 11 tokens (fills partial page)");
+  expect(pool.free_pages() == 1, "11th token fills partial page 2, no new page");
   auto toks17 = seq_tokens(100, 17);  // would need a 5th page
   expect(!pool.reserve(s, 17, toks17), "reserve beyond capacity fails");
   expect(pool.sequence_tokens(s) == 11, "sequence size unchanged on failure");
