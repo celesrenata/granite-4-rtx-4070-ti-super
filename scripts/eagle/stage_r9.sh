@@ -14,16 +14,17 @@ PY=/nix/store/a1ix6fp6hinpbnra6vwn43zvkvhsyam3-python3-3.13.15-env/bin/python3
 LOG=$E/stage_r9.log
 cd $E
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a $LOG; }
-restart() { systemctl start granite4-rtx; log "granite4-rtx restarted ($(systemctl is-active granite4-rtx))"; }
+restart() { pkill -f "[d]ump-hidden" && sleep 3; systemctl start granite4-rtx; log "granite4-rtx restarted ($(systemctl is-active granite4-rtx))"; }
 podrun() {
   podman run --rm --network host --gpus all --shm-size=8g \
     -v $E:/w/eagle -v $CK:/w/ckpt --entrypoint "" localhost/granite4-eagle:latest \
     /opt/conda/bin/python "$@"
 }
-if pgrep -f "[g]en_chat.py" > /dev/null; then
-  log "waiting for gen_chat to finish"
-  until grep -q "^DONE" gen_chat_r9.log; do sleep 60; done
-fi
+# The log is appended across runs, so wait for the process, then check the
+# last line (an old DONE line must not start the GPU stages early).
+log "waiting for gen_chat to exit"
+while pgrep -f "[g]en_chat.py" > /dev/null; do sleep 60; done
+tail -1 gen_chat_r9.log | grep -q "^DONE" || { log "gen_chat exited without DONE"; exit 1; }
 # Hold out the last ~10% of generated conversations (override with EVAL_FROM).
 EVAL_FROM=${EVAL_FROM:-$($PY -c "import json;c=[json.loads(l)['conv'] for l in open('ds/chat_r9/gen.jsonl')];print(int(max(c)*0.9))")}
 log "eval split: conv >= $EVAL_FROM"
@@ -64,6 +65,7 @@ done
 log "== X export r9"
 podrun /w/eagle/export_head.py --ckpt /w/eagle/runs/r9/ckpt.pt --vocab /w/eagle/runs/r3/draft_vocab.npy \
   --out /w/eagle/heads/r9.safetensors >> $LOG 2>&1 || { log "export failed"; exit 1; }
+chmod 644 $E/heads/r9.safetensors  # the service user must be able to read it
 log "== A live A/B (warm serve, held-out prompts)"
 rm -f /tmp/ab_plain.json
 for h in plain r8 r9; do
