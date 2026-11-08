@@ -278,12 +278,7 @@ __global__ void __launch_bounds__(kArgmaxThreads)
 // verify kernel with the same per-element arithmetic, so each session's row
 // is bit-identical to that session decoding alone.
 // ---------------------------------------------------------------------------
-struct MultiRows {
-  int n;
-  int pos[kMaxVerifyRows];             // position of row r (the token at tok[r][pos])
-  const int* pt[kMaxVerifyRows];       // position -> arena row table of row r
-  std::int32_t* tok[kMaxVerifyRows];   // the session's token buffer
-};
+using MultiRows = GpuMultiRows;  // forward_gpu_api.h
 
 __global__ void embed_multi_kernel(const MultiRows* __restrict__ mr,
                                    const std::uint16_t* emb, float mult, std::uint16_t* out,
@@ -1403,6 +1398,7 @@ namespace {
 // while accumulating up to kMaxVerifyRows activation rows; each row is
 // bit-identical to its single-token decode twin. Declared here because it is
 // a standalone TU linked into the same library (no shared header).
+extern "C" int granite4_verify_skinny_enabled();
 extern "C" int granite4_verify_gemv(const std::uint16_t* d_a,
                                     const std::uint8_t* d_b, float scale,
                                     int tokens, int rows, int k,
@@ -1673,6 +1669,7 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
   const float resid_scale = g->spec.residual_multiplier;
   const bool direct = direct_path(g);
   const HeadView hv = head_view(g);
+  const bool skinny = granite4_verify_skinny_enabled() != 0;
   auto bucket = [&](int b, int layer, int which) {
     if (probe != nullptr) probe->bucket(b, layer, which);
   };
@@ -1708,9 +1705,15 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
     if (granite4_kernel_rmsnorm(d_hidden, lw.attn_norm, rms_eps, 1, H, d_normed) != 0)
       return -1;
     gemv(StepProbe::kQkv, layer, 0);
-    row_gemm_dequant_qkv_kernel<<<qkv_rows, kRowGemvThreads>>>(
-        d_normed, lw.wq, lw.wk, lw.wv, lw.sc[0], lw.sc[1], lw.sc[2], Hq * d, Hk * d,
-        Hk * d, H, d_qf, d_k_new, d_v_new);
+    if (skinny) {
+      if (granite4_verify_qkv(d_normed, lw.wq, lw.wk, lw.wv, lw.sc[0], lw.sc[1], lw.sc[2], 1,
+                              Hq * d, Hk * d, Hk * d, H, d_qf, d_k_new, d_v_new) != 0)
+        return -1;
+    } else {
+      row_gemm_dequant_qkv_kernel<<<qkv_rows, kRowGemvThreads>>>(
+          d_normed, lw.wq, lw.wk, lw.wv, lw.sc[0], lw.sc[1], lw.sc[2], Hq * d, Hk * d,
+          Hk * d, H, d_qf, d_k_new, d_v_new);
+    }
     G4_CUDA_CHECK(cudaGetLastError());
     gemv(StepProbe::kQkv, layer, 1);
     bucket(StepProbe::kAttnGemm, layer, 1);
@@ -1789,9 +1792,15 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
         return -1;
     }
     gemv(StepProbe::kO, layer, 0);
-    row_gemm_dequant_resid_kernel<<<H, kRowGemvThreads>>>(d_attn_out, lw.wo, lw.sc[3],
-                                                          d_hidden, resid_scale, H, H,
-                                                          d_hidden);
+    if (skinny) {
+      if (granite4_verify_gemv_resid(d_attn_out, lw.wo, lw.sc[3], d_hidden, resid_scale, 1, H,
+                                     H, d_hidden) != 0)
+        return -1;
+    } else {
+      row_gemm_dequant_resid_kernel<<<H, kRowGemvThreads>>>(d_attn_out, lw.wo, lw.sc[3],
+                                                            d_hidden, resid_scale, H, H,
+                                                            d_hidden);
+    }
     G4_CUDA_CHECK(cudaGetLastError());
     gemv(StepProbe::kO, layer, 1);
     bucket(StepProbe::kAttnOut, layer, 1);
@@ -1801,16 +1810,24 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
     if (granite4_kernel_rmsnorm(d_hidden, lw.ffn_norm, rms_eps, 1, H, d_normed2) != 0)
       return -1;
     gemv(StepProbe::kGateUp, layer, 0);
-    if (granite4_kernel_silu_gate_up(lw.wg, lw.wu, d_normed2, lw.sc[4], lw.sc[5], I, H,
-                                     d_gate_out) != 0)
+    if ((skinny ? granite4_verify_silu(lw.wg, lw.wu, d_normed2, lw.sc[4], lw.sc[5], I, H, 1,
+                                       d_gate_out)
+                : granite4_kernel_silu_gate_up(lw.wg, lw.wu, d_normed2, lw.sc[4], lw.sc[5], I,
+                                               H, d_gate_out)) != 0)
       return -1;
     gemv(StepProbe::kGateUp, layer, 1);
     bucket(StepProbe::kFfnGemm, layer, 1);
     bucket(StepProbe::kFfnOut, layer, 0);
     gemv(StepProbe::kDown, layer, 0);
-    row_gemm_dequant_resid_kernel<<<H, kRowGemvThreads>>>(d_gate_out, lw.wd, lw.sc[6],
-                                                          d_hidden, resid_scale, H, I,
-                                                          d_hidden);
+    if (skinny) {
+      if (granite4_verify_gemv_resid(d_gate_out, lw.wd, lw.sc[6], d_hidden, resid_scale, 1, H,
+                                     I, d_hidden) != 0)
+        return -1;
+    } else {
+      row_gemm_dequant_resid_kernel<<<H, kRowGemvThreads>>>(d_gate_out, lw.wd, lw.sc[6],
+                                                            d_hidden, resid_scale, H, I,
+                                                            d_hidden);
+    }
     G4_CUDA_CHECK(cudaGetLastError());
     gemv(StepProbe::kDown, layer, 1);
     bucket(StepProbe::kFfnOut, layer, 1);
@@ -1829,8 +1846,13 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
     if (hidden != nullptr)
       G4_CUDA_CHECK(cudaMemcpyAsync(hidden, d_normed, sizeof(std::uint16_t) * H,
                                     cudaMemcpyDeviceToDevice, cudaStreamPerThread));
-    row_gemm_dequant_kernel<<<V, kRowGemvThreads>>>(d_normed, hv.lm_head, hv.lm_scale, V,
-                                                    H, logits);
+    if (skinny) {
+      if (granite4_verify_gemv(d_normed, hv.lm_head, hv.lm_scale, 1, V, H, logits) != 0)
+        return -1;
+    } else {
+      row_gemm_dequant_kernel<<<V, kRowGemvThreads>>>(d_normed, hv.lm_head, hv.lm_scale, V,
+                                                      H, logits);
+    }
     G4_CUDA_CHECK(cudaGetLastError());
     if (chain_tokens != nullptr) {
       argmax_rows_kernel<<<1, kArgmaxThreads>>>(logits, V, chain_tokens, g->d_pos);
@@ -1993,7 +2015,8 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
 // scratch_batched / attn_scratch are g's. Logits land in d_logits [n][V], the
 // greedy ids in d_ids, then each session's token and position advance.
 int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logits,
-                       std::int32_t* d_ids) {
+                       std::int32_t* d_ids, std::uint16_t* d_hidden_out = nullptr,
+                       bool advance = true) {
   const int rows = n;
   const int L = g->L, H = g->H, I = g->I, Hq = g->Hq, Hk = g->Hk, d = g->d, V = g->V;
   const float rms_eps = g->spec.rms_norm_eps;
@@ -2071,8 +2094,11 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
           0 ||
       granite4_verify_gemv(d_normed, hv.lm_head, hv.lm_scale, rows, V, H, d_logits) != 0)
     return -1;
+  if (d_hidden_out != nullptr)
+    G4_CUDA_CHECK(cudaMemcpyAsync(d_hidden_out, d_normed, sizeof(std::uint16_t) * rows * H,
+                                  cudaMemcpyDeviceToDevice, cudaStreamPerThread));
   argmax_rows_kernel<<<rows, kArgmaxThreads>>>(d_logits, V, d_ids, nullptr);
-  multi_scatter_advance_kernel<<<1, 32>>>(d_mr, d_ids);
+  if (advance) multi_scatter_advance_kernel<<<1, 32>>>(d_mr, d_ids);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
@@ -2697,6 +2723,58 @@ int gpu_decode_multi(GpuCtx* const* ctxs, std::int32_t* const* d_tokens, int n, 
   for (int i = 0; i < n; ++i) ctxs[i]->written += steps;
   return 0;
 }
+int gpu_forward_multi(GpuCtx* const* row_ctx, std::int32_t* const* row_tokens,
+                      const int* row_pos, int n, std::uint16_t* d_logits,
+                      std::int32_t* d_argmax, std::uint16_t* d_hidden, char* error,
+                      std::size_t error_size) {
+  auto seterr = [&](const char* what) {
+    if (error != nullptr && error_size > 0) std::snprintf(error, error_size, "%s", what);
+    return -1;
+  };
+  if (row_ctx == nullptr || row_tokens == nullptr || row_pos == nullptr || d_logits == nullptr ||
+      d_argmax == nullptr || n < 1 || n > kMaxVerifyRows)
+    return seterr("invalid multi-forward arguments");
+  GpuCtx* const g = row_ctx[0];
+  // Per session: its rows are consecutive positions from its watermark.
+  std::vector<GpuCtx*> seen;
+  std::vector<int> next_pos;
+  for (int r = 0; r < n; ++r) {
+    GpuCtx* c = row_ctx[r];
+    if (c == nullptr || row_tokens[r] == nullptr || c->weights != g->weights ||
+        c->max_pos != g->max_pos || c->kv8 != g->kv8 || c->kv4 != g->kv4 || !c->split_attn ||
+        (c != g && (c->kv_arena == nullptr || c->kv_arena != g->kv_arena)))
+      return seterr("multi-forward: incompatible session");
+    std::size_t i = 0;
+    while (i < seen.size() && seen[i] != c) ++i;
+    if (i == seen.size()) {
+      seen.push_back(c);
+      next_pos.push_back(c->written);
+    }
+    if (row_pos[r] != next_pos[i] || row_pos[r] >= c->mapped || row_pos[r] >= c->max_pos)
+      return seterr("multi-forward: rows must continue each session's watermark");
+    ++next_pos[i];
+  }
+  if (g->d_multi == nullptr) {
+    if (cudaMalloc(&g->d_multi, sizeof(MultiRows)) != cudaSuccess ||
+        cudaMalloc(&g->d_multi_ids, sizeof(std::int32_t) * kMaxVerifyRows) != cudaSuccess)
+      return seterr("multi-forward: cudaMalloc failed");
+  }
+  MultiRows h{};
+  h.n = n;
+  for (int r = 0; r < n; ++r) {
+    h.pos[r] = row_pos[r];
+    h.pt[r] = row_ctx[r]->d_pt;
+    h.tok[r] = row_tokens[r];
+  }
+  // (gpu_decode_multi re-uploads its own descriptor before every launch, so
+  // its captured graph stays valid across this call.)
+  if (cudaMemcpyAsync(g->d_multi, &h, sizeof h, cudaMemcpyHostToDevice, cudaStreamPerThread) !=
+          cudaSuccess ||
+      forward_multi_step(g, g->d_multi, n, d_logits, d_argmax, d_hidden, false) != 0)
+    return seterr("multi-forward failed");
+  for (std::size_t i = 0; i < seen.size(); ++i) seen[i]->written = next_pos[i];
+  return 0;
+}
 int gpu_ctx_written(GpuCtx* ctx) { return ctx != nullptr ? ctx->written : -1; }
 
 int gpu_ctx_shared_weights(GpuCtx* ctx, const std::uint16_t** d_embed,
@@ -3013,4 +3091,34 @@ extern "C" int granite4_kernel_verify_attention_stage(
       rows, cache_stride, d_out, d_pt);
 }
 
+// Multi-row helpers for the EAGLE head's batched steps (eagle_gpu.cu): the
+// same kernels the multi-session target step runs, over a device
+// GpuMultiRows descriptor.
+int gpu_multi_rope(const std::uint16_t* x, const float* cos_tbl, const float* sin_tbl,
+                   const GpuMultiRows* d_rows, int rows, int heads, int d, std::uint16_t* out) {
+  if (x == nullptr || d_rows == nullptr || rows < 1 || rows > kMaxVerifyRows || (d & 1) != 0)
+    return -1;
+  const std::size_t n = static_cast<std::size_t>(rows) * heads * d;
+  rope_multi_kernel<<<static_cast<unsigned>((n + 255) / 256), 256>>>(x, cos_tbl, sin_tbl, d_rows,
+                                                                    rows, heads, d, out);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+int gpu_multi_kv_append(const std::uint16_t* k, const std::uint16_t* v, int bits,
+                        void* cache_k, void* cache_v, float* k_scale, float* v_scale,
+                        const GpuMultiRows* d_rows, int rows, int stride, int Hk, int d) {
+  if (d_rows == nullptr || rows < 1 || rows > kMaxVerifyRows) return -1;
+  if (bits == 8)
+    kv_append_int8_multi_kernel<<<dim3(Hk, rows), d>>>(
+        k, v, static_cast<std::int8_t*>(cache_k), static_cast<std::int8_t*>(cache_v), k_scale,
+        v_scale, d_rows, stride, Hk, d);
+  else if (bits == 4)
+    kv_append_int4_multi_kernel<<<dim3(Hk, rows), d / 2>>>(
+        k, v, static_cast<std::uint8_t*>(cache_k), static_cast<std::uint8_t*>(cache_v), k_scale,
+        v_scale, d_rows, stride, Hk, d);
+  else
+    kv_append_multi_kernel<<<dim3((Hk * d + 255) / 256, rows), 256>>>(
+        k, v, static_cast<std::uint16_t*>(cache_k), static_cast<std::uint16_t*>(cache_v), d_rows,
+        rows, stride, Hk, d);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
 }  // namespace granite4
