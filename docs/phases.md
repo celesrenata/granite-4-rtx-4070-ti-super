@@ -902,6 +902,70 @@ outputs were unaffected (the last layer's pass overwrote them), and dumps are
 bit-identical before/after. It cost 39 extra lm_head passes (~0.4 GB of FP8
 weights each, estimated ~24 ms) per prefill chunk with output rows.
 
+### P4 round 6 — round overheads, grouped verify attention, tree drafting (2026-11-08, gremlin-1)
+
+Profiling a 2-session EAGLE round (`G4_EAGLE_TIMING=1` now times batched
+rounds): verify 16.15 ms (87%), head 2.14 ms for 3 steps, commit 0.04 ms,
+steady-state gap 0.25 ms. A head step costs 0.64 ms (near its 366 MB weight
+stream); the verify is the weight pass. So the levers were tokens per round
+and the verify's non-GEMM work:
+
+1. **Batched rounds draft 3 per session** (`G4_EAGLE_K_BATCHED`, solo keeps
+   `--eagle-k`, now 4): r10, 2 in flight, k=3 beat k=4/5/6.
+2. **Cached plain-rate probe.** The adaptive policy measured plain decode with
+   an 8-token burst + re-sync forward on every batch change; the plain rate
+   per (sessions, 4K context bucket) is now measured once and reused
+   (`G4_EAGLE_PROBE_CACHE=0` reverts): +4.7% chat at 2 in flight.
+3. **Grouped multi-session attention.** `gpu_forward_multi` ran one attention
+   block per row, so each verify row re-read its session's whole KV; a
+   session's consecutive rows now share K/V tiles above 1K positions
+   (`G4_MULTI_GROUP=0` reverts; bit-identical, kernel-tested).
+4. **Tree drafting** (default; `G4_EAGLE_TREE=0` restores the chain). Rows
+   of `GpuMultiRows` can be tree rows: KV slot (token index / KV write) apart
+   from the RoPE position, and an ancestor tail that remaps the logical
+   positions above `tbase` in attention, so a node attends to exactly the
+   keys of its path. `gpu_forward_tree` verifies anchor + nodes; the accepted
+   path's KV moves into place (`gpu_ctx_kv_move`, in order: node indices grow
+   along a path). Tree rows of one session share prefix tiles; tiles reaching
+   past `tbase` are filled and attended per row. The head runs the same rows
+   on its draft KV (`eagle_forward_tree`, nothing to move: draft entries past
+   the anchor are dropped each round) and drafts top-B children
+   (`eagle_draft_topk`). Kernel tests: every tree row bit-identical to the
+   sequential decode of its path, and the moved path continues exactly
+   (bf16/KV8/KV4; one tile, tails across tile and split boundaries at the
+   production split width).
+   Default trees (`G4_EAGLE_TREE` / `G4_EAGLE_TREE_SOLO` take rank-tuple
+   specs): the best static r9 chat trees from `tree_estimate.py`, cut to the
+   depth that won end to end (each level is a head step): 7 nodes / depth 3
+   for 2 sessions (8 verify rows each), 13 nodes / depth 4 solo.
+5. **Resume watermark fix.** A request that stopped on the target's
+   correction token left the watermark over the rejected draft's KV, and
+   `finish()` kept that position as valid history for the next turn.
+
+| conc_bench (r10, KV8) | before round | chain + 1-3 | tree |
+|---|---:|---:|---:|
+| chat, 2 in flight | 184.0 | 205.3 | 225.9 |
+| novel, 2 in flight | 171.5 | 192.2 | 212.1 |
+| serving, 2 in flight | 211.7 | 230.8 | 246.4 |
+| doc (~3K ctx), 2 in flight | - | 108.6 | 133.8 |
+| chat, sequential | 102.6 | 107.8 | 120.1 |
+| live API, 1 / 2 clients | 85.2 / 163.4 | 98.3 / 190.0 | 114.0 / 210.5 |
+
+Tree outputs equal the chain's on every family, `ab_heads` outputs equal
+plain greedy (incl. 8-13K prompts), and `serve_pool_smoke` with
+`G4_FORCE_REPREFILL=1` is identical to plain on every turn. Known: a resumed
+turn re-forwards the head's lag (the last round's rows) through prefill to
+rebuild head features, which re-rounds those positions' KV; the lag depends
+on the drafting, so near-ties on resumed turns can differ between chain and
+tree (or with the policy on/off) - fresh turns cannot. Keeping the last
+round's verify features per session would let resume skip that re-forward.
+
+Rejected here: an EAGLE-3-style multi-layer head (`dump-hidden
+--feat-layers`, `train_eagle.py --extra-layers`; +1.8% over its matched
+control, +0.2% over r10 - not worth capturing two more features on every
+target path). r11 (r10 + ~2.7x more self-distilled chat,
+`scripts/eagle/stage_r11.sh`) is in progress.
+
 ## Rules across phases
 
 - No kernel or code is copied from `reference/qwen3-27b-5090/`; it is kept
