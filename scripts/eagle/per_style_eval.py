@@ -32,7 +32,8 @@ def main():
     dev = "cuda"
     fr = te.load_frozen(a.ckpt, dev)
     st = torch.load(a.head, map_location="cpu")
-    head = te.EagleHead()
+    n_extra = sum(1 for k in st["head"] if k.startswith("ln_x."))
+    head = te.EagleHead(n_extra=n_extra)
     head.load_state_dict(st["head"], strict=False)
     head = head.to(dev).to(torch.bfloat16)
     vocab = np.load(a.vocab)
@@ -53,7 +54,9 @@ def main():
         n = toks.shape[0]
         s = styles[r]
         with torch.no_grad():
-            preds = te.unroll(head, emb, toks, hid, a.depth, cos, sin)
+            ex = rec.get_extra(r) if n_extra else None
+            preds = te.unroll(head, emb, toks, hid, a.depth, cos, sin,
+                              extra=ex.to(dev) if ex is not None else None)
             draft = [vt[(p.to(torch.bfloat16) @ lm_sub.t()).argmax(-1)] for p in preds]
             hit = []
             for d, dr in enumerate(draft, start=1):

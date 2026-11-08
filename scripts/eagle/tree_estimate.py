@@ -39,7 +39,8 @@ def main():
     dev = "cuda"
     fr = te.load_frozen(a.ckpt, dev)
     st = torch.load(a.head, map_location="cpu")
-    head = te.EagleHead()
+    n_extra = sum(1 for k in st["head"] if k.startswith("ln_x."))
+    head = te.EagleHead(n_extra=n_extra)
     head.load_state_dict(st["head"], strict=False)
     head = head.to(dev).to(torch.bfloat16)
     vt = torch.as_tensor(np.load(a.vocab), device=dev)
@@ -62,7 +63,9 @@ def main():
         start = int(mask.nonzero()[0]) - 1 if (mask is not None and mask.any()) else 0
         start = max(start, 0)
         with torch.no_grad():
-            preds = te.unroll(head, emb, toks, hid, a.depth, cos, sin)
+            ex = rec.get_extra(r) if n_extra else None
+            preds = te.unroll(head, emb, toks, hid, a.depth, cos, sin,
+                              extra=ex.to(dev) if ex is not None else None)
             ranks = []
             for d, p in enumerate(preds, start=1):
                 m = n - 1 - d

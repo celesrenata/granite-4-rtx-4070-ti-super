@@ -235,12 +235,19 @@ int gpu_forward_range(GpuCtx* ctx, const std::int32_t* d_tokens, int end,
 // final-normed hidden state (the lm_head input, [H] bf16) at
 // d_hidden + (t - hidden_from) * H; d_logits may be nullptr, which skips the
 // lm_head (hidden-state dumps, draft-head features).
+constexpr int kMaxFeatLayers = 2;
 struct GpuForwardOut {
   std::uint16_t* d_logits = nullptr;
   int logits_from = 0;
   std::int32_t* d_argmax = nullptr;
   std::uint16_t* d_hidden = nullptr;
   int hidden_from = -1;
+  // Optional intermediate features (prefill path only, >= 17 rows): the raw
+  // residual stream after layer feat_layers[k] (-1: unused) for rows
+  // [hidden_from, end), written to d_layer_feat + (k * feat_rows + r) * H.
+  std::uint16_t* d_layer_feat = nullptr;
+  int feat_layers[kMaxFeatLayers] = {-1, -1};
+  int feat_rows = 0;
 };
 
 // Device views of the target's packed embedding (bf16 [vocab][hidden]) and

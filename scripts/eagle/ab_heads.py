@@ -28,7 +28,8 @@ extra = dict(kv.split("=", 1) for kv in sys.argv[4:])
 tok = tokenizer.ByteBPE(CK + "/tokenizer.json")
 
 convs = json.load(open(E + "/ds/chat_prompts.json"))
-chat = [c["turns"][0] for c in convs[1700:1730]]
+# The last 30 conversations: held out by every head (r10 trains on < 2159).
+chat = [c["turns"][0] for c in convs[-30:]]
 serving = [d["prompt"] for d in json.load(open(E + "/ds/serving/eval.json"))][:24]
 novel = ["Write a short story about a lighthouse keeper who discovers a message in a bottle.",
          "Explain how a refrigerator works to a ten year old.",
