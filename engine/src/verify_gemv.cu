@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 #include "device_math.cuh"
 #include "model_config.h"
@@ -236,12 +237,39 @@ bool dispatch(int tokens, F&& f) {
 }
 
 int launched() { return cudaGetLastError() == cudaSuccess ? 0 : -1; }
+// G4_SKINNY (default on): route every entry point to the tensor-core skinny
+// kernels (skinny_gemm.cu); a shape they reject (K % 256, q/k rows % 64, the
+// tests' toy models) takes the per-row kernels. The choice depends only on the
+// shape, and decode calls these same entry points with one token, so decode
+// and verify rows stay bit-identical either way.
+bool skinny_on() {
+  static const bool on = [] {
+    const char* e = std::getenv("G4_SKINNY");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
 }  // namespace
+extern "C" int granite4_skinny_gemv(const std::uint16_t*, const std::uint8_t*, float, int, int,
+                                    int, std::uint16_t*);
+extern "C" int granite4_skinny_gemv_resid(const std::uint16_t*, const std::uint8_t*, float,
+                                          const std::uint16_t*, float, int, int, int,
+                                          std::uint16_t*);
+extern "C" int granite4_skinny_qkv(const std::uint16_t*, const std::uint8_t*,
+                                   const std::uint8_t*, const std::uint8_t*, float, float, float,
+                                   int, int, int, int, int, std::uint16_t*, std::uint16_t*,
+                                   std::uint16_t*);
+extern "C" int granite4_skinny_silu(const std::uint8_t*, const std::uint8_t*,
+                                    const std::uint16_t*, float, float, int, int, int,
+                                    std::uint16_t*);
+extern "C" int granite4_verify_skinny_enabled() { return skinny_on() ? 1 : 0; }
 
 // A is [tokens][k] bf16, B is [rows][k] fp8, C is [tokens][rows] bf16.
 extern "C" int granite4_verify_gemv(const std::uint16_t* d_a, const std::uint8_t* d_b,
                                     float scale, int tokens, int rows, int k,
                                     std::uint16_t* d_c) {
+  if (skinny_on() && granite4_skinny_gemv(d_a, d_b, scale, tokens, rows, k, d_c) == 0)
+    return 0;
   if (rows < 1 || k < 1 || (k & 15) != 0 || !aligned16(d_a) || !aligned16(d_b)) return -1;
   if (!dispatch(tokens, [&]<int T>() { gemv_kernel<T><<<rows, kThreads>>>(d_a, d_b, scale, rows, k, d_c); }))
     return -1;
@@ -253,6 +281,9 @@ extern "C" int granite4_verify_gemv_resid(const std::uint16_t* d_a, const std::u
                                           float scale, const std::uint16_t* d_residual,
                                           float residual_scale, int tokens, int rows, int k,
                                           std::uint16_t* d_out) {
+  if (skinny_on() && granite4_skinny_gemv_resid(d_a, d_b, scale, d_residual, residual_scale,
+                                                 tokens, rows, k, d_out) == 0)
+    return 0;
   if (rows < 1 || k < 1 || (k & 15) != 0 || !aligned16(d_a) || !aligned16(d_b)) return -1;
   if (!dispatch(tokens, [&]<int T>() {
         gemv_resid_kernel<T><<<rows, kThreads>>>(d_a, d_b, scale, d_residual, residual_scale,
@@ -267,6 +298,9 @@ extern "C" int granite4_verify_qkv(const std::uint16_t* d_a, const std::uint8_t*
                                    float sq, float sk, float sv, int tokens, int nq, int nk,
                                    int nv, int k, std::uint16_t* d_q, std::uint16_t* d_k,
                                    std::uint16_t* d_v) {
+  if (skinny_on() && granite4_skinny_qkv(d_a, d_wq, d_wk, d_wv, sq, sk, sv, tokens, nq, nk, nv,
+                                          k, d_q, d_k, d_v) == 0)
+    return 0;
   if (nq < 1 || nk < 1 || nv < 1 || k < 1 || (k & 15) != 0 || !aligned16(d_a) ||
       !aligned16(d_wq) || !aligned16(d_wk) || !aligned16(d_wv))
     return -1;
@@ -281,6 +315,8 @@ extern "C" int granite4_verify_qkv(const std::uint16_t* d_a, const std::uint8_t*
 extern "C" int granite4_verify_silu(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                     const std::uint16_t* d_x, float sg, float su, int n,
                                     int k, int tokens, std::uint16_t* d_out) {
+  if (skinny_on() && granite4_skinny_silu(d_wg, d_wu, d_x, sg, su, n, k, tokens, d_out) == 0)
+    return 0;
   if (n < 1 || k < 1 || (k & 3) != 0 || (reinterpret_cast<std::uintptr_t>(d_x) & 7u) != 0 ||
       (reinterpret_cast<std::uintptr_t>(d_wg) & 3u) != 0 ||
       (reinterpret_cast<std::uintptr_t>(d_wu) & 3u) != 0)

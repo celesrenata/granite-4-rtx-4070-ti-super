@@ -35,6 +35,21 @@ EagleHead* eagle_fork(const EagleHead* base, GpuCtx* target, std::string* err);
 // Bytes of the draft-KV pool (shared by the base and all forks).
 std::size_t eagle_kv_bytes(const EagleHead* h);
 void eagle_free(EagleHead* h);
+// One head step over rows of several sessions at once (the batched EAGLE
+// round): session i's rows [pos0, pos0 + rows) read tokens d_tokens[j + 1]
+// and features d_feat[j - pos0], write predicted features to d_feat_out and,
+// with d_draft_out, the last row's draft token. heads[i] is session i's head
+// (all forks of one base; heads[0] leads), paged (eagle_load kv_rows > 0),
+// pos0 == eagle_written(heads[i]). Sum of rows <= kMaxVerifyRows. Each row's
+// arithmetic is that of eagle_forward's per-row path.
+struct EagleRowsReq {
+  const std::int32_t* d_tokens;
+  int pos0, rows;
+  const std::uint16_t* d_feat;
+  std::uint16_t* d_feat_out;
+  std::int32_t* d_draft_out;
+};
+int eagle_forward_multi(EagleHead* const* heads, int n, const EagleRowsReq* req);
 
 // Head entries [pos0, pos0 + rows): entry j reads token d_tokens[j + 1] and
 // feature row d_feat[j - pos0] ([rows][H] bf16, device) and writes its

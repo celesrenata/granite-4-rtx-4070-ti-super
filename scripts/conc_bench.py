@@ -36,6 +36,7 @@ def run(proc, reqs, inflight):
     """Send reqs keeping `inflight` in flight; returns ({id: generated}, wall_s)."""
     t0 = time.time()
     out, sent, i = {}, 0, 0
+    acc = [0, 0]
     while len(out) < len(reqs):
         while sent - len(out) < inflight and i < len(reqs):
             proc.stdin.write(json.dumps(reqs[i]) + "\n")
@@ -46,6 +47,10 @@ def run(proc, reqs, inflight):
         if "error" in d:
             raise SystemExit(f"engine error: {d}")
         out[d["id"]] = d["generated"]
+        if d.get("draft"):
+            acc[0] += d["draft"]["accepted"]
+            acc[1] += d["draft"]["proposed"]
+    run.accept = acc[0] / acc[1] if acc[1] else None
     return out, time.time() - t0
 
 
@@ -59,11 +64,19 @@ def main():
     ap.add_argument("--prompts", default="/opt/granite4-rtx-4070-ti-super/eagle/ds/chat_prompts.json")
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--kv", default="1")
+    ap.add_argument("--env", nargs="*", default=[], help="extra engine env KEY=VAL")
+    ap.add_argument("--families", default="chat,novel,serving")
     a = ap.parse_args()
     tok = tokenizer.ByteBPE(Path(a.ckpt) / "tokenizer.json")
     chat = [c["turns"][0] for c in json.load(open(a.prompts))[1700:1712]]
-    fams = {"chat": chat, "novel": NOVEL}
+    serving = [d["prompt"] for d in json.load(open(
+        "/opt/granite4-rtx-4070-ti-super/eagle/ds/serving/eval.json"))][:12]
+    allf = {"chat": chat, "novel": NOVEL, "serving": serving}
+    fams = {f: allf[f] for f in a.families.split(",")}
     env = dict(os.environ, G4_KV8=a.kv, G4_FORCE_REPREFILL="1")
+    for kv in a.env:
+        k, _, v = kv.partition("=")
+        env[k] = v
     cmd = [a.engine, "serve", "--checkpoint", a.ckpt, "--gpu", "1", "--max-context", "32768",
            "--sessions", "2"]
     if a.eagle:
@@ -82,15 +95,19 @@ def main():
                 r["eagle"] = a.eagle_k
             reqs.append(r)
         seq, ws = run(proc, reqs, 1)
+        acc_seq = run.accept
         for r in reqs:
             rid += 1
             r["id"] += 10000  # fresh ids for the second pass
         con, wc = run(proc, reqs, a.inflight)
+        acc_con = run.accept
         n = sum(len(v) for v in seq.values())
         same = all(seq[r["id"] - 10000] == con[r["id"]] for r in reqs)
         print(f"{fam:6s} {len(reqs)} prompts {n} tok: sequential {n / ws:6.1f} tok/s, "
               f"{a.inflight} in flight {n / wc:6.1f} tok/s ({ws / wc:.2f}x), "
-              f"outputs identical: {same}", flush=True)
+              f"outputs identical: {same}"
+              + (f", accept seq {acc_seq:.3f} / conc {acc_con:.3f}" if acc_seq is not None and acc_con is not None else ""),
+              flush=True)
     proc.stdin.close()
     proc.wait()
 

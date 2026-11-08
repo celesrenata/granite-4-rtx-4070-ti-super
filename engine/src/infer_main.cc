@@ -243,6 +243,7 @@ class GpuSession {
  public:
   ~GpuSession() {
     cudaFree(d_feat_);
+    cudaFree(d_feat_own_);
     cudaFree(d_tokens_);
     cudaFree(d_logits_);
     cudaFree(d_argmax_);
@@ -437,13 +438,28 @@ class GpuSession {
 
   GpuCtx* ctx() { return ctx_; }
   std::uint16_t* logits_buffer() { return d_logits_; }
+  std::int32_t* argmax_buffer() { return d_argmax_; }
   std::int32_t* d_tokens() { return d_tokens_; }
   const std::string& dir() const { return dir_; }
   // Device scratch for draft-head features: [max_pos][hidden] (prompt) and
   // [kMaxVerifyRows][hidden] (verify rows, chain); allocated on first use.
   bool feature_buffers(std::uint16_t** prompt, std::uint16_t** verify, std::uint16_t** chain,
                        std::string* error) {
-    if (feat_owner_ != nullptr) return feat_owner_->feature_buffers(prompt, verify, chain, error);
+    if (feat_owner_ != nullptr) {
+      // The [max_pos] prompt-feature buffer is shared (EagleRun uses it only
+      // inside start()); the small verify / chain buffers are per session, so
+      // two sessions can draft in the same batched round.
+      std::uint16_t *p, *v, *c;
+      if (!feat_owner_->feature_buffers(&p, &v, &c, error)) return false;
+      if (d_feat_own_ == nullptr) {
+        const std::size_t H = static_cast<std::size_t>(hidden_);
+        G4_HOST_CUDA_CHECK(cudaMalloc(&d_feat_own_, 2 * H * 2 * kMaxVerifyRows));
+      }
+      *prompt = p;
+      *verify = d_feat_own_;
+      *chain = d_feat_own_ + static_cast<std::size_t>(kMaxVerifyRows) * hidden_;
+      return true;
+    }
     if (d_feat_ == nullptr) {
       const std::size_t H = static_cast<std::size_t>(hidden_);
       G4_HOST_CUDA_CHECK(cudaMalloc(&d_feat_, 2 * H * (max_pos_ + 2 * kMaxVerifyRows)));
@@ -468,6 +484,7 @@ class GpuSession {
   std::int32_t* d_argmax_ = nullptr;   // [logit_rows]
   std::uint16_t* d_feat_ = nullptr;    // draft-head features (feature_buffers)
   GpuSession* feat_owner_ = nullptr;   // borrowed feature buffers (share_scratch_from)
+  std::uint16_t* d_feat_own_ = nullptr;  // per-session verify/chain rows when borrowing
   std::string dir_;
   int max_pos_ = 0, vocab_ = 0, hidden_ = 0, logit_rows_ = 0;
 };
@@ -793,11 +810,14 @@ class EagleRun {
     // Drop head entries past the last true-feature row (chain entries came
     // from predicted features) so the next turn resumes from truth.
     if (head_ != nullptr && started_) eagle_truncate(head_, head_valid_);
+    cudaFree(d_last_);
   }
   EagleRun(const EagleRun&) = delete;
   EagleRun& operator=(const EagleRun&) = delete;
 
-  // Prefill (resuming from `prefix` when > 0) and emit the first token.
+  // Prefill (resuming from `prefix` when > 0), emit the first token and run
+  // the head's catch-up over the prompt (its draft d_1 lands at
+  // d_tokens[L + 1]). The shared prompt-feature buffer is used only here.
   // *done is set when the request already finished. false = error.
   bool start(int prefix, bool* done, std::string* error) {
     *done = false;
@@ -808,7 +828,8 @@ class EagleRun {
     seq_ = a_.tokens;
     const int plen = static_cast<int>(seq_.size());
     out_->drafted = true;
-    if (!s_.feature_buffers(&f_prompt_, &f_verify_, &f_chain_, error)) return false;
+    std::uint16_t* f_prompt = nullptr;
+    if (!s_.feature_buffers(&f_prompt, &f_verify_, &f_chain_, error)) return false;
     // Resume from the session's cached conversation. The target KV holds
     // [0, prefix); the head holds entries [0, eagle_written) (built from true
     // target features, so valid whenever they lie inside the cached prefix).
@@ -821,14 +842,13 @@ class EagleRun {
     if (prefix > 0) hq0 = std::max(0, std::min({prefix, eagle_written(head_), plen - 1}));
     std::vector<std::int32_t> ids;
     if (!s_.truncate(hq0) || !s_.upload(seq_, 0, plen, error) ||
-        !s_.forward(plen, plen - 1, error, f_prompt_, hq0) || !s_.argmax(1, &ids, error))
+        !s_.forward(plen, plen - 1, error, f_prompt, hq0) || !s_.argmax(1, &ids, error))
       return false;
     eagle_truncate(head_, hq0);
     started_ = true;
     head_valid_ = hq0;
     L_ = plen;
     hq_ = hq0;
-    feat_ = f_prompt_;
     if (emit(ids[0])) {
       *done = true;
       return true;
@@ -839,43 +859,63 @@ class EagleRun {
     min_accept_ = eagle_min_accept();
     decided_ = min_accept_ <= 0.0;
     t0_ = std::chrono::steady_clock::now();
+    // Head catch-up over [hq0, L): writes head entries and drafts d_1.
+    const std::size_t H = static_cast<std::size_t>(s_.hidden());
+    if (d_last_ == nullptr && cudaMalloc(&d_last_, H * 2) != cudaSuccess) {
+      *error = "eagle: cudaMalloc failed";
+      return false;
+    }
+    const int rows = L_ - hq_;
+    std::int32_t* const d_tok = s_.d_tokens();
+    if (eagle_forward(head_, d_tok, hq_, rows, f_prompt, f_prompt, d_tok + L_ + 1) != 0 ||
+        cudaMemcpyAsync(d_last_, f_prompt + static_cast<std::size_t>(rows - 1) * H, H * 2,
+                        cudaMemcpyDeviceToDevice, cudaStreamPerThread) != cudaSuccess) {
+      *error = "eagle: head forward failed";
+      return false;
+    }
+    head_valid_ = L_;
+    step1_done_ = true;
     return true;
   }
 
-  // One draft + verify round. Returns true when the loop should stop: the
-  // request finished (done()), drafting stopped paying (plain()), or an error
-  // (error non-empty). false = keep drafting.
-  bool round(std::string* error) {
-    const auto r_t0 = std::chrono::steady_clock::now();
+  // ---- one round, in phases (so a scheduler can batch sessions) ----------
+  // plan_k: drafts this round (0 = verify the anchor alone).
+  int plan_k() {
     const int remaining = a_.max_tokens - static_cast<int>(gen_.size());
-    const int k = std::max(0, std::min({a_.eagle_k, remaining - 1, s_.max_pos() - L_ - 2}));
+    k_ = std::max(0, std::min({a_.eagle_k, remaining - 1, s_.max_pos() - L_ - 2}));
+    r_t0_ = std::chrono::steady_clock::now();
+    return k_;
+  }
+  // Head step 1 (catch-up over the last round's verified rows), unless start()
+  // already ran it. Valid after plan_k() with k > 0.
+  bool needs_step1() const { return k_ > 0 && !step1_done_; }
+  EagleRowsReq step1_req() {
     std::int32_t* const d_tok = s_.d_tokens();
-    const std::size_t H = static_cast<std::size_t>(s_.hidden());
-    Ev h0{}, v0{};
-    if (k > 0) {
-      if (et_) cudaEventCreate(&h0.a), cudaEventCreate(&h0.b),
-          cudaEventRecord(h0.a, cudaStreamPerThread);
-      const int rows = L_ - hq_;
-      std::uint16_t* const last = feat_ + static_cast<std::size_t>(rows - 1) * H;
-      bool ok = eagle_forward(head_, d_tok, hq_, rows, feat_, feat_, d_tok + L_ + 1) == 0;
-      for (int i = 2; ok && i <= k; ++i)
-        ok = eagle_forward(head_, d_tok, L_ + i - 2, 1, i == 2 ? last : f_chain_, f_chain_,
-                           d_tok + L_ + i) == 0;
-      if (et_) cudaEventRecord(h0.b, cudaStreamPerThread), h_ev_.push_back(h0);
-      if (!ok) {
-        *error = "eagle: head forward failed";
-        return true;
-      }
-      head_valid_ = L_;  // entries [hq, L) came from true target features
-    }
-    // Target verify over anchor + drafts: greedy ids t_0..t_k and features.
-    if (et_) cudaEventCreate(&v0.a), cudaEventCreate(&v0.b),
-        cudaEventRecord(v0.a, cudaStreamPerThread);
-    std::vector<std::int32_t> ids;
-    if (!s_.forward(L_ + k + 1, L_, error, f_verify_, L_) || !s_.argmax(k + 1, &ids, error) ||
-        !s_.tokens(L_ + 1, L_ + 1 + k, &drafts_, error))
-      return true;
-    if (et_) cudaEventRecord(v0.b, cudaStreamPerThread), v_ev_.push_back(v0);
+    return EagleRowsReq{d_tok, hq_, L_ - hq_, f_verify_, f_verify_, d_tok + L_ + 1};
+  }
+  // After step 1: its last predicted feature feeds chain step 2.
+  void step1_finished() {
+    step1_done_ = true;
+    head_valid_ = L_;  // entries [hq, L) came from true target features
+    last_ = f_verify_ + static_cast<std::size_t>(L_ - hq_ - 1) * s_.hidden();
+  }
+  // Chain step i (2..k): one row at position L + i - 2.
+  EagleRowsReq chain_req(int i) {
+    std::int32_t* const d_tok = s_.d_tokens();
+    const std::uint16_t* in = i == 2 ? (last_ != nullptr ? last_ : d_last_) : f_chain_;
+    return EagleRowsReq{d_tok, L_ + i - 2, 1, in, f_chain_, d_tok + L_ + i};
+  }
+  int verify_from() const { return L_; }
+  int k() const { return k_; }
+  std::uint16_t* verify_features() { return f_verify_; }
+
+  // Commit after the verify forward over [L, L + k] (target greedy ids
+  // ids[0..k], features in verify_features()). Returns true when the loop
+  // should stop: done(), plain() or an error. `probe` = this session's round
+  // is timed for the adaptive policy (solo rounds).
+  bool commit(const std::vector<std::int32_t>& ids, bool probe, std::string* error) {
+    const int k = k_;
+    if (!s_.tokens(L_ + 1, L_ + 1 + k, &drafts_, error)) return true;
     int acc = 0;
     while (acc < k && drafts_[static_cast<std::size_t>(acc)] == ids[static_cast<std::size_t>(acc)])
       ++acc;
@@ -887,12 +927,14 @@ class EagleRun {
       et_acc_ += acc;
       et_prop_ += k;
     }
-    if (!decided_ && k > 0) {
+    recent_acc_ += acc;
+    ++recent_rounds_;
+    if (!decided_ && k > 0 && probe) {
       if (rounds_seen_ > 0) {  // round 0 carries the head's prompt catch-up
         probe_acc_ += acc;
         probe_tok_ += acc + 1;
         probe_ms_ += std::chrono::duration<double, std::milli>(
-                         std::chrono::steady_clock::now() - r_t0).count();
+                         std::chrono::steady_clock::now() - r_t0_).count();
       }
       ++rounds_seen_;
     }
@@ -909,9 +951,10 @@ class EagleRun {
     eagle_truncate(head_, L_);
     head_valid_ = std::min(head_valid_, L_);
     hq_ = L_;
-    feat_ = f_verify_;
     L_ = nl;
-    if (!decided_ && rounds_seen_ > kEagleProbeRounds) {
+    step1_done_ = false;
+    last_ = nullptr;
+    if (probe && !decided_ && rounds_seen_ > kEagleProbeRounds) {
       decided_ = true;
       const double avg = static_cast<double>(probe_acc_) / kEagleProbeRounds;
       const int left = a_.max_tokens - static_cast<int>(gen_.size());
@@ -939,13 +982,8 @@ class EagleRun {
         if (done_) return true;
         if (plain_rate >= eagle_rate) {
           plain_ = true;  // the anchor already sits at d_tokens[written]
-        } else {
-          // Re-sync: features of [hq, L + burst) for the head's next catch-up
-          // (rows [hq, L) were verified, rows [L, L + burst) decoded; both are
-          // recomputed bit-identically by the verify-shaped forward).
-          if (!s_.truncate(hq_) || !s_.forward_hidden(L_ + burst, hq_, f_verify_, error))
-            return true;
-          L_ += burst;
+        } else if (!resync(burst, error)) {
+          return true;
         }
       }
       if (plain_ && policy_ != nullptr) policy_->off = true;  // measured: not paying
@@ -954,6 +992,57 @@ class EagleRun {
                      rounds_seen_, avg);
     }
     return plain_;
+  }
+  // After `burst` plainly decoded tokens (already emitted): features of
+  // [hq, L + burst) for the head's next catch-up, recomputed bit-identically
+  // by a verify-shaped hidden forward (rows [hq, L) verified, rows
+  // [L, L + burst) decoded).
+  bool resync(int burst, std::string* error) {
+    if (!s_.truncate(hq_) || !s_.forward_hidden(L_ + burst, hq_, f_verify_, error)) return false;
+    L_ += burst;
+    return true;
+  }
+  // Accepted drafts per round since the last call (batched policy).
+  double take_recent_accept() {
+    const double v = recent_rounds_ ? static_cast<double>(recent_acc_) / recent_rounds_ : 0.0;
+    recent_acc_ = recent_rounds_ = 0;
+    return v;
+  }
+  int pending_rows() const { return L_ - hq_; }
+
+  // One solo round (head steps, verify, commit); see commit() for the result.
+  bool round(std::string* error) {
+    const int k = plan_k();
+    std::int32_t* const d_tok = s_.d_tokens();
+    Ev h0{}, v0{};
+    if (k > 0) {
+      if (et_) cudaEventCreate(&h0.a), cudaEventCreate(&h0.b),
+          cudaEventRecord(h0.a, cudaStreamPerThread);
+      bool ok = true;
+      if (needs_step1()) {
+        const EagleRowsReq q = step1_req();
+        ok = eagle_forward(head_, q.d_tokens, q.pos0, q.rows, q.d_feat, q.d_feat_out,
+                           q.d_draft_out) == 0;
+        step1_finished();
+      }
+      for (int i = 2; ok && i <= k; ++i) {
+        const EagleRowsReq q = chain_req(i);
+        ok = eagle_forward(head_, d_tok, q.pos0, 1, q.d_feat, q.d_feat_out, q.d_draft_out) == 0;
+      }
+      if (et_) cudaEventRecord(h0.b, cudaStreamPerThread), h_ev_.push_back(h0);
+      if (!ok) {
+        *error = "eagle: head forward failed";
+        return true;
+      }
+    }
+    // Target verify over anchor + drafts: greedy ids t_0..t_k and features.
+    if (et_) cudaEventCreate(&v0.a), cudaEventCreate(&v0.b),
+        cudaEventRecord(v0.a, cudaStreamPerThread);
+    std::vector<std::int32_t> ids;
+    if (!s_.forward(L_ + k + 1, L_, error, f_verify_, L_) || !s_.argmax(k + 1, &ids, error))
+      return true;
+    if (et_) cudaEventRecord(v0.b, cudaStreamPerThread), v_ev_.push_back(v0);
+    return commit(ids, true, error);
   }
 
   // Leave drafting at a round boundary (another session needs the batch);
@@ -1006,15 +1095,18 @@ class EagleRun {
   DraftReport& report_;
   EaglePolicy* policy_;
   std::vector<std::int32_t> seq_, drafts_;
-  std::uint16_t *f_prompt_ = nullptr, *f_verify_ = nullptr, *f_chain_ = nullptr;
-  std::uint16_t* feat_ = nullptr;  // features of positions [hq, L)
-  int L_ = 0, hq_ = 0, head_valid_ = 0;
+  std::uint16_t *f_verify_ = nullptr, *f_chain_ = nullptr;
+  std::uint16_t* d_last_ = nullptr;      // start()'s last catch-up feature (own copy)
+  const std::uint16_t* last_ = nullptr;  // step-2 input after an in-round step 1
+  int L_ = 0, hq_ = 0, head_valid_ = 0, k_ = 0;
   bool started_ = false, done_ = false, plain_ = false, decided_ = false, et_ = false;
+  bool step1_done_ = false;
   double min_accept_ = 0.0, probe_ms_ = 0.0;
   int rounds_seen_ = 0, probe_acc_ = 0, probe_tok_ = 0;
+  int recent_acc_ = 0, recent_rounds_ = 0;
   long et_rounds_ = 0, et_acc_ = 0, et_prop_ = 0;
   std::vector<Ev> h_ev_, v_ev_;
-  std::chrono::steady_clock::time_point t0_;
+  std::chrono::steady_clock::time_point t0_, r_t0_;
 };
 
 // Plain chained greedy decode from the current watermark (anchor at
@@ -1627,18 +1719,9 @@ int gpu_serve_cmd(const Args& cli) {
     }
     Job& jr = *j;
     jobs.push_back(std::move(j));
-    const bool others = active_count() > 1;
-    // Another job is running: EAGLE jobs give way to the batched plain decode.
-    if (others)
-      for (auto& o : jobs)
-        if (!o->done && o->eagle != nullptr) {
-          o->eagle->yield_plain();
-          o->plain = true;
-        }
     const bool greedy = a.seed == 0 && a.draft_k == 0;
     bool ok;
-    if (greedy && a.eagle_k > 0 && heads[jr.sess] != nullptr && !policy[jr.sess].off &&
-        !others) {
+    if (greedy && a.eagle_k > 0 && heads[jr.sess] != nullptr && !policy[jr.sess].off) {
       jr.eagle = std::make_unique<EagleRun>(s, heads[jr.sess], jr.a, &jr.g, &policy[jr.sess]);
       bool done = false;
       ok = jr.eagle->start(jr.resume, &done, &jr.err);
@@ -1656,6 +1739,181 @@ int gpu_serve_cmd(const Args& cli) {
     }
     return true;
   };
+  // ---- batched EAGLE round over several sessions ------------------------
+  // Head steps (step 1 + chain) for all runs in eagle_forward_multi calls,
+  // one verify forward over every run's anchor + drafts (gpu_forward_multi),
+  // then each run commits. Policy: after kEagleProbeRounds timed rounds the
+  // batch decodes a timed plain burst (gpu_decode_multi, all sessions) and
+  // keeps whichever path produced tokens faster; a winning EAGLE re-syncs
+  // every head (exact). The decision is per batch composition.
+  std::uint16_t* d_multi_hidden = nullptr;
+  if (cudaMalloc(&d_multi_hidden, sizeof(std::uint16_t) * kMaxVerifyRows *
+                                      static_cast<std::size_t>(cfg.hidden_size)) != cudaSuccess)
+    return fail("cudaMalloc failed (batched EAGLE features)");
+  struct BatchPolicy {
+    std::vector<Job*> members;
+    int rounds = 0;
+    long tokens = 0;
+    double ms = 0.0;
+    bool decided = false;
+  } bp;
+  auto fail_job = [&](Job& j, const std::string& e) {
+    if (j.err.empty()) j.err = e;
+    j.eagle->report_timing();
+    finish(j);
+  };
+  auto batched_round = [&](std::vector<Job*>& ej) {
+    if (bp.members != ej) bp = BatchPolicy{ej};
+    const auto t0 = std::chrono::steady_clock::now();
+    std::size_t gen_before = 0;
+    for (Job* j : ej) gen_before += j->g.ids.size();
+    int kmax = 0;
+    std::vector<int> ks;
+    for (Job* j : ej) {
+      ks.push_back(j->eagle->plan_k());
+      kmax = std::max(kmax, ks.back());
+    }
+    // Head steps, batched across sessions (falls back to per-session calls
+    // when the rows do not fit one batch).
+    auto head_step = [&](std::vector<std::pair<Job*, EagleRowsReq>>& reqs) -> bool {
+      if (reqs.empty()) return true;
+      std::vector<EagleHead*> hs;
+      std::vector<EagleRowsReq> rq;
+      for (auto& [j, q] : reqs) {
+        hs.push_back(heads[j->sess]);
+        rq.push_back(q);
+      }
+      if (eagle_forward_multi(hs.data(), static_cast<int>(hs.size()), rq.data()) == 0)
+        return true;
+      for (std::size_t i = 0; i < hs.size(); ++i)
+        if (eagle_forward(hs[i], rq[i].d_tokens, rq[i].pos0, rq[i].rows, rq[i].d_feat,
+                          rq[i].d_feat_out, rq[i].d_draft_out) != 0)
+          return false;
+      return true;
+    };
+    std::vector<std::pair<Job*, EagleRowsReq>> reqs;
+    for (std::size_t i = 0; i < ej.size(); ++i)
+      if (ej[i]->eagle->needs_step1()) reqs.emplace_back(ej[i], ej[i]->eagle->step1_req());
+    bool ok = head_step(reqs);
+    for (auto& [j, q] : reqs) j->eagle->step1_finished();
+    for (int step = 2; ok && step <= kmax; ++step) {
+      reqs.clear();
+      for (std::size_t i = 0; i < ej.size(); ++i)
+        if (ks[i] >= step) reqs.emplace_back(ej[i], ej[i]->eagle->chain_req(step));
+      ok = head_step(reqs);
+    }
+    if (!ok) {
+      for (Job* j : ej) fail_job(*j, "eagle: head forward failed");
+      return;
+    }
+    // One verify forward over every run's anchor + drafts.
+    std::vector<GpuCtx*> rc;
+    std::vector<std::int32_t*> rt;
+    std::vector<int> rp;
+    for (std::size_t i = 0; i < ej.size(); ++i)
+      for (int r = 0; r <= ks[i]; ++r) {
+        rc.push_back(sessions[ej[i]->sess].ctx());
+        rt.push_back(sessions[ej[i]->sess].d_tokens());
+        rp.push_back(ej[i]->eagle->verify_from() + r);
+      }
+    const int nrows = static_cast<int>(rc.size());
+    GpuSession& lead = sessions[ej[0]->sess];
+    std::vector<std::int32_t> ids;
+    char cerr[256] = "";
+    if (nrows > kMaxVerifyRows ||
+        gpu_forward_multi(rc.data(), rt.data(), rp.data(), nrows, lead.logits_buffer(),
+                          lead.argmax_buffer(), d_multi_hidden, cerr, sizeof cerr) != 0 ||
+        !lead.argmax(nrows, &ids, &err)) {
+      for (Job* j : ej) fail_job(*j, std::string("eagle batched verify: ") + cerr);
+      return;
+    }
+    const std::size_t H = static_cast<std::size_t>(cfg.hidden_size);
+    int off = 0;
+    for (std::size_t i = 0; i < ej.size(); ++i) {
+      Job& j = *ej[i];
+      const int n = ks[i] + 1;
+      cudaMemcpyAsync(j.eagle->verify_features(), d_multi_hidden + off * H,
+                      sizeof(std::uint16_t) * n * H, cudaMemcpyDeviceToDevice,
+                      cudaStreamPerThread);
+      std::vector<std::int32_t> mine(ids.begin() + off, ids.begin() + off + n);
+      off += n;
+      if (j.eagle->commit(mine, false, &j.err)) {
+        if (!j.err.empty() || j.eagle->done()) {
+          j.eagle->report_timing();
+          finish(j);
+        } else {
+          j.plain = true;
+        }
+      }
+    }
+    // Policy (per batch): time rounds 2..5, then one timed plain burst.
+    std::size_t gen_after = 0;
+    for (Job* j : ej) gen_after += j->g.ids.size();
+    ++bp.rounds;
+    if (bp.rounds >= 2 && !bp.decided) {
+      bp.tokens += static_cast<long>(gen_after - gen_before);
+      bp.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                   .count();
+    }
+    if (bp.decided || bp.rounds < kEagleProbeRounds + 1 || eagle_min_accept() <= 0.0) return;
+    bp.decided = true;
+    std::vector<Job*> live;
+    for (Job* j : ej)
+      if (!j->done && !j->plain) live.push_back(j);
+    if (live.size() < 2) return;
+    int burst = kEagleBurst;
+    for (Job* j : live) {
+      GpuSession& s = sessions[j->sess];
+      burst = std::min({burst, j->a.max_tokens - static_cast<int>(j->g.ids.size()),
+                        kMaxVerifyRows - j->eagle->pending_rows(), s.mapped() - s.written(),
+                        s.max_pos() - 1 - s.written()});
+    }
+    if (burst < 2) return;
+    std::vector<GpuCtx*> cs;
+    std::vector<std::int32_t*> ts;
+    std::vector<int> pos;
+    for (Job* j : live) {
+      cs.push_back(sessions[j->sess].ctx());
+      ts.push_back(sessions[j->sess].d_tokens());
+      pos.push_back(sessions[j->sess].written());
+    }
+    const auto b0 = std::chrono::steady_clock::now();
+    if (gpu_decode_multi(cs.data(), ts.data(), static_cast<int>(live.size()), burst,
+                         lead.logits_buffer(), cerr, sizeof cerr) != 0) {
+      for (Job* j : live) fail_job(*j, std::string("eagle burst: ") + cerr);
+      return;
+    }
+    std::vector<std::vector<std::int32_t>> got(live.size());
+    for (std::size_t i = 0; i < live.size(); ++i)
+      if (!sessions[live[i]->sess].tokens(pos[i] + 1, pos[i] + 1 + burst, &got[i], &err)) {
+        fail_job(*live[i], "eagle burst readback failed");
+        return;
+      }
+    const double plain_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0).count();
+    const double plain_rate = static_cast<double>(burst * live.size()) / std::max(plain_ms, 1e-3);
+    const double eagle_rate = static_cast<double>(bp.tokens) / std::max(bp.ms, 1e-3);
+    const bool to_plain = plain_rate >= eagle_rate;
+    if (debug)
+      std::fprintf(stderr, "G4_EAGLE batch probe (%zu sessions): eagle %.1f tok/s, plain %.1f "
+                   "tok/s -> %s\n", live.size(), 1000.0 * eagle_rate, 1000.0 * plain_rate,
+                   to_plain ? "plain" : "eagle");
+    for (std::size_t i = 0; i < live.size(); ++i) {
+      Job& j = *live[i];
+      bool stop = false;
+      for (std::int32_t t : got[i])
+        if ((stop = j.eagle->emit(t))) break;
+      if (stop) {
+        j.eagle->report_timing();
+        finish(j);
+      } else if (to_plain) {
+        j.eagle->yield_plain();
+        j.plain = true;
+      } else if (!j.eagle->resync(burst, &j.err)) {
+        fail_job(j, "eagle resync failed");
+      }
+    }
+  };
   std::deque<std::string> pending;
   for (;;) {
     {
@@ -1671,22 +1929,23 @@ int gpu_serve_cmd(const Args& cli) {
     while (!pending.empty() && admit(pending.front())) pending.pop_front();
     jobs.remove_if([](const std::unique_ptr<Job>& j) { return j->done; });
     if (jobs.empty()) continue;
-    // EAGLE: only while its job is the only one.
-    for (auto& jp : jobs) {
-      Job& j = *jp;
-      if (j.done || j.eagle == nullptr || j.plain) continue;
-      if (active_count() > 1) {
-        j.eagle->yield_plain();
-        j.plain = true;
-        continue;
-      }
-      if (j.eagle->round(&j.err)) {
-        if (!j.err.empty() || j.eagle->done()) {
-          if (j.eagle) j.eagle->report_timing();
-          finish(j);
-        } else {
-          j.plain = true;  // drafting stopped paying: plain decode from here
+    // EAGLE jobs: a solo round when alone, else one batched round for all.
+    {
+      std::vector<Job*> ej;
+      for (auto& jp : jobs)
+        if (!jp->done && jp->eagle != nullptr && !jp->plain) ej.push_back(jp.get());
+      if (ej.size() == 1) {
+        Job& j = *ej[0];
+        if (j.eagle->round(&j.err)) {
+          if (!j.err.empty() || j.eagle->done()) {
+            j.eagle->report_timing();
+            finish(j);
+          } else {
+            j.plain = true;  // drafting stopped paying: plain decode from here
+          }
         }
+      } else if (ej.size() >= 2) {
+        batched_round(ej);
       }
     }
     // Plain jobs: one batched chunk for all of them.
@@ -1749,6 +2008,7 @@ int gpu_serve_cmd(const Args& cli) {
     }
   }
   reader.join();
+  cudaFree(d_multi_hidden);
   return 0;
 }
 #endif  // GRANITE_CUDA

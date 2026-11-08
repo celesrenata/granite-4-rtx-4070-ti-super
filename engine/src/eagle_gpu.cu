@@ -212,6 +212,10 @@ struct EagleHead {
   bool paged = false;
   bool owns_tables = true;  // cos/sin: a forked session head borrows the base's
   std::vector<void*> allocs;  // owned allocations (a fork lists only its own)
+  // eagle_forward_multi buffers (the lead head's, allocated on first use).
+  void* multi_desc = nullptr;
+  std::uint16_t *multi_feat = nullptr, *multi_out = nullptr, *multi_last = nullptr,
+                *multi_logits = nullptr;
 
   ~EagleHead() {
     for (void* p : allocs) cudaFree(p);
@@ -222,7 +226,9 @@ struct EagleHead {
   }
   template <class T>
   bool alloc(T** p, std::size_t bytes, std::string* err) {
-    if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(p), bytes), err, "eagle: cudaMalloc"))
+    std::string dummy;
+    if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(p), bytes), err != nullptr ? err : &dummy,
+                 "eagle: cudaMalloc"))
       return false;
     allocs.push_back(*p);
     return true;
@@ -465,6 +471,8 @@ EagleHead* eagle_fork(const EagleHead* base, GpuCtx* target, std::string* err) {
   // scratch, logits and watermark.
   auto h = std::make_unique<EagleHead>(*base);
   h->allocs.clear();  // the copy must not free what the base owns
+  h->multi_desc = nullptr;
+  h->multi_feat = h->multi_out = h->multi_last = h->multi_logits = nullptr;
   h->owns_tables = false;
   h->attn_scratch = nullptr;
   h->scratch = nullptr;
@@ -697,6 +705,146 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
     const std::uint16_t* last = d_feat_out + static_cast<std::size_t>(rows - 1) * H;
     if (granite4_verify_gemv(last, h->lm, h->lm_scale, 1, h->Vd, H, h->logits) != 0) return -1;
     argmax_map_kernel<<<1, 1024>>>(h->logits, h->Vd, h->vocab, d_draft_out);
+  }
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+namespace {
+// concat_kernel with row r's token at tok[r][pos[r] + 1] (multi-session rows).
+__global__ void concat_multi_kernel(const GpuMultiRows* __restrict__ mr, const std::uint16_t* emb,
+                                    const std::uint16_t* feat, int H, std::uint16_t* x) {
+  const int r = blockIdx.y;
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= 2 * H) return;
+  const std::size_t o = static_cast<std::size_t>(r) * 2 * H + j;
+  if (j < H) {
+    x[o] = emb[static_cast<std::size_t>(mr->tok[r][mr->pos[r] + 1]) * H + j];
+  } else {
+    x[o] = feat[static_cast<std::size_t>(r) * H + (j - H)];
+  }
+}
+}  // namespace
+
+int eagle_forward_multi(EagleHead* const* heads, int n, const EagleRowsReq* req) {
+  if (heads == nullptr || req == nullptr || n < 1 || n > kMaxVerifyRows) return -1;
+  EagleHead* const h = heads[0];  // lead: scratch, weights (shared by every fork)
+  int R = 0;
+  for (int i = 0; i < n; ++i) {
+    const EagleHead* hi = heads[i];
+    if (hi == nullptr || hi->fc != h->fc || hi->kv_stride != h->kv_stride || hi->target == nullptr ||
+        req[i].rows < 1 || req[i].pos0 != hi->written || req[i].pos0 + req[i].rows > hi->max_pos ||
+        req[i].pos0 + req[i].rows > gpu_ctx_mapped_rows(hi->target))
+      return -1;
+    R += req[i].rows;
+  }
+  if (R > kMaxVerifyRows) return -1;
+  const int H = h->H, I = h->I, nq = h->Hq * h->d, nk = h->Hk * h->d;
+  if (h->multi_desc == nullptr &&
+      (!h->alloc(&h->multi_desc, sizeof(GpuMultiRows), nullptr) ||
+       !h->alloc(&h->multi_feat, static_cast<std::size_t>(kMaxVerifyRows) * H * 2, nullptr) ||
+       !h->alloc(&h->multi_out, static_cast<std::size_t>(kMaxVerifyRows) * H * 2, nullptr) ||
+       !h->alloc(&h->multi_last, static_cast<std::size_t>(kMaxVerifyRows) * H * 2, nullptr) ||
+       !h->alloc(&h->multi_logits, static_cast<std::size_t>(kMaxVerifyRows) * h->Vd * 2, nullptr)))
+    return -1;
+  GpuMultiRows desc{};
+  desc.n = R;
+  int r = 0;
+  for (int i = 0; i < n; ++i) {
+    const int* pt = gpu_ctx_kv_rows_device(heads[i]->target);
+    for (int j = 0; j < req[i].rows; ++j, ++r) {
+      desc.pos[r] = req[i].pos0 + j;
+      desc.pt[r] = pt;
+      desc.tok[r] = const_cast<std::int32_t*>(req[i].d_tokens);
+    }
+    if (cudaMemcpyAsync(h->multi_feat + static_cast<std::size_t>(r - req[i].rows) * H,
+                        req[i].d_feat, sizeof(std::uint16_t) * req[i].rows * H,
+                        cudaMemcpyDeviceToDevice, cudaStreamPerThread) != cudaSuccess)
+      return -1;
+  }
+  if (cudaMemcpyAsync(h->multi_desc, &desc, sizeof desc, cudaMemcpyHostToDevice,
+                      cudaStreamPerThread) != cudaSuccess)
+    return -1;
+  GpuMultiRows* const md = static_cast<GpuMultiRows*>(h->multi_desc);
+  std::uint16_t* s = h->scratch;
+  auto take = [&](std::size_t per_row) {
+    std::uint16_t* q = s;
+    s += per_row * R;
+    return q;
+  };
+  std::uint16_t *xin = take(2 * H), *x = take(H), *xn = take(H), *q = take(nq), *k = take(nk),
+                *v = take(nk), *qr = take(nq), *kr = take(nk), *att = take(nq), *hh = take(H),
+                *hn = take(H), *act = take(I);
+  std::uint16_t* const f = h->multi_out;
+  concat_multi_kernel<<<dim3((2 * H + 255) / 256, R), 256>>>(md, h->embed, h->multi_feat, H, xin);
+  if (h->ln_e != nullptr)
+    input_norm_kernel<<<dim3(2, R), kNormThreads>>>(xin, h->ln_e, h->ln_h, H, h->eps);
+  if (granite4_verify_gemv(xin, h->fc, h->sc[0], R, H, 2 * H, x) != 0) return -1;
+  bias_kernel<<<dim3((H + 255) / 256, R), 256>>>(x, h->bias, H);
+  if (granite4_kernel_rmsnorm(x, h->ln1, h->eps, R, H, xn) != 0 ||
+      granite4_verify_qkv(xn, h->wq, h->wk, h->wv, h->sc[1], h->sc[2], h->sc[3], R, nq, nk, nk, H,
+                          q, k, v) != 0 ||
+      gpu_multi_rope(q, h->cos_tbl, h->sin_tbl, md, R, h->Hq, h->d, qr) != 0 ||
+      gpu_multi_rope(k, h->cos_tbl, h->sin_tbl, md, R, h->Hk, h->d, kr) != 0)
+    return -1;
+  const int* const row_pos = md->pos;
+  const int* const* const row_pt = md->pt;
+  int rc;
+  if (h->kv_bits == 8) {
+    rc = gpu_multi_kv_append(kr, v, 8, h->kv8_k, h->kv8_v, h->kv8_k_scale, h->kv8_v_scale, md, R,
+                             h->kv_stride, h->Hk, h->d);
+    if (rc == 0)
+      rc = attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
+                      h->kv_stride, h->attn_scratch, att, h->kv8_k, h->kv8_v, h->kv8_k_scale,
+                      h->kv8_v_scale, true, nullptr, nullptr, false, nullptr, h->max_pos,
+                      row_pos, row_pt);
+  } else if (h->kv_bits == 4) {
+    rc = gpu_multi_kv_append(kr, v, 4, h->kv4_k, h->kv4_v, h->kv4_k_scale, h->kv4_v_scale, md, R,
+                             h->kv_stride, h->Hk, h->d);
+    if (rc == 0)
+      rc = attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
+                      h->kv_stride, h->attn_scratch, att, nullptr, nullptr, h->kv4_k_scale,
+                      h->kv4_v_scale, false, h->kv4_k, h->kv4_v, true, nullptr, h->max_pos,
+                      row_pos, row_pt);
+  } else {
+    rc = gpu_multi_kv_append(kr, v, 16, h->kv_k, h->kv_v, nullptr, nullptr, md, R, h->kv_stride,
+                             h->Hk, h->d);
+    if (rc == 0)
+      rc = attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
+                      h->kv_stride, h->attn_scratch, att, nullptr, nullptr, nullptr, nullptr,
+                      false, nullptr, nullptr, false, nullptr, h->max_pos, row_pos, row_pt);
+  }
+  if (rc != 0 ||
+      granite4_verify_gemv_resid(att, h->wo, h->sc[4], x, 1.0f, R, H, nq, hh) != 0 ||
+      granite4_kernel_rmsnorm(hh, h->ln2, h->eps, R, H, hn) != 0 ||
+      granite4_verify_silu(h->wg, h->wu, hn, h->sc[5], h->sc[6], I, H, R, act) != 0 ||
+      granite4_verify_gemv_resid(act, h->wd, h->sc[7], hh, 1.0f, R, H, I, hh) != 0 ||
+      granite4_kernel_rmsnorm(hh, h->lnf, h->eps, R, H, f) != 0)
+    return -1;
+  // Scatter the predicted features; gather each session's last row for its draft.
+  r = 0;
+  int drafts = 0;
+  for (int i = 0; i < n; ++i) {
+    if (cudaMemcpyAsync(req[i].d_feat_out, f + static_cast<std::size_t>(r) * H,
+                        sizeof(std::uint16_t) * req[i].rows * H, cudaMemcpyDeviceToDevice,
+                        cudaStreamPerThread) != cudaSuccess)
+      return -1;
+    r += req[i].rows;
+    if (req[i].d_draft_out != nullptr &&
+        cudaMemcpyAsync(h->multi_last + static_cast<std::size_t>(drafts++) * H,
+                        f + static_cast<std::size_t>(r - 1) * H, sizeof(std::uint16_t) * H,
+                        cudaMemcpyDeviceToDevice, cudaStreamPerThread) != cudaSuccess)
+      return -1;
+    heads[i]->written = req[i].pos0 + req[i].rows;
+  }
+  if (drafts > 0) {
+    if (granite4_verify_gemv(h->multi_last, h->lm, h->lm_scale, drafts, h->Vd, H,
+                             h->multi_logits) != 0)
+      return -1;
+    int d = 0;
+    for (int i = 0; i < n; ++i)
+      if (req[i].d_draft_out != nullptr)
+        argmax_map_kernel<<<1, 1024>>>(h->multi_logits + static_cast<std::size_t>(d++) * h->Vd,
+                                       h->Vd, h->vocab, req[i].d_draft_out);
   }
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }

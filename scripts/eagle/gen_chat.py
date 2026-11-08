@@ -10,6 +10,7 @@ run can be stopped and restarted. No GPU of its own: it only uses the API.
 """
 import argparse
 import json
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -32,46 +33,67 @@ def main():
     ap.add_argument("--limit", type=int, default=1800)
     ap.add_argument("--max-tokens", type=int, default=448)
     ap.add_argument("--url", default="http://127.0.0.1:2701/v1/chat/completions")
+    ap.add_argument("--workers", type=int, default=2,
+                    help="conversations in flight (the engine runs one per session)")
     a = ap.parse_args()
     convs = json.load(open(a.prompts))[: a.limit]
     out = Path(a.out)
-    done = set()
+    saved = {}
     if out.exists():
         for line in out.read_text().splitlines():
             r = json.loads(line)
-            done.add((r["conv"], len(r["messages"])))
-    t0, n_tok, n_rep = time.time(), 0, 0
-    with out.open("a") as f:
-        for i, c in enumerate(convs):
+            saved[(r["conv"], len(r["messages"]))] = r["reply"]
+    t0 = time.time()
+    stats = {"tok": 0, "rep": 0}
+    lock = threading.Lock()
+    todo = list(enumerate(convs))
+    f = out.open("a")
+
+    def work():
+        while True:
+            with lock:
+                if not todo:
+                    return
+                i, c = todo.pop(0)
             msgs = []
             for t, user in enumerate(c["turns"]):
                 msgs = msgs + [{"role": "user", "content": user}]
                 key = (i, len(msgs))
-                prev = None
-                if key in done:
-                    # Rebuild the history from the saved reply for the next turn.
-                    for line in out.read_text().splitlines():
-                        r = json.loads(line)
-                        if (r["conv"], len(r["messages"])) == key:
-                            prev = r["reply"]
-                            break
+                if key in saved:
+                    prev = saved[key]
                 else:
-                    try:
-                        reply, finish, ntok = chat(a.url, msgs, a.max_tokens)
-                    except Exception as e:  # skip a failed request, keep going
-                        print(f"conv {i} turn {t}: {e}", flush=True)
+                    reply = None
+                    for attempt in range(120):  # the API may be down (GPU windows)
+                        try:
+                            reply, finish, ntok = chat(a.url, msgs, a.max_tokens)
+                            break
+                        except Exception as e:
+                            if attempt == 0:
+                                print(f"conv {i} turn {t}: {e}; retrying", flush=True)
+                            time.sleep(30)
+                    if reply is None:
                         break
-                    f.write(json.dumps({"conv": i, "src": c["src"], "messages": msgs,
-                                        "reply": reply, "finish": finish}) + "\n")
-                    f.flush()
+                    with lock:
+                        f.write(json.dumps({"conv": i, "src": c["src"], "messages": msgs,
+                                            "reply": reply, "finish": finish}) + "\n")
+                        f.flush()
+                        stats["tok"] += ntok
+                        stats["rep"] += 1
+                        if stats["rep"] % 25 == 0:
+                            el = time.time() - t0
+                            print(f"conv {i}/{len(convs)}: {stats['rep']} new replies, "
+                                  f"{stats['tok']} tokens, {stats['tok'] / el:.1f} tok/s, "
+                                  f"{el / 60:.1f} min", flush=True)
                     prev = reply
-                    n_tok += ntok
-                    n_rep += 1
                 msgs = msgs + [{"role": "assistant", "content": prev}]
-            if i % 25 == 0 and n_rep:
-                el = time.time() - t0
-                print(f"conv {i}/{len(convs)}: {n_rep} replies, {n_tok} tokens, "
-                      f"{n_tok / el:.1f} tok/s, {el / 60:.1f} min", flush=True)
+
+    ths = [threading.Thread(target=work) for _ in range(max(1, a.workers))]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join()
+    f.close()
+    n_rep, n_tok = stats["rep"], stats["tok"]
     print("DONE", n_rep, "replies", n_tok, "tokens", flush=True)
 
 

@@ -65,6 +65,7 @@ extern "C" int granite4_kernel_row_gemm_resid_dequant(
     const std::uint16_t* d_a, const std::uint8_t* d_B, float scale,
     const std::uint16_t* d_residual, float residual_scale, int tokens, int N, int K,
     std::uint16_t* d_out);
+extern "C" int granite4_verify_skinny_enabled();
 extern "C" int granite4_verify_gemv(const std::uint16_t* d_a,
                                      const std::uint8_t* d_b, float scale,
                                      int tokens, int rows, int k,
@@ -909,35 +910,47 @@ static void test_verify_kernels_bit_identical_device() {
     const std::uint8_t* const wk = dw + static_cast<std::size_t>(nq) * K;
     const std::uint8_t* const wv = wk + static_cast<std::size_t>(nk) * K;
     bool launch_ok = true, gemv_ok = true, resid_ok = true, qkv_ok = true, silu_ok = true;
+    // The reference row is what decode computes: with the skinny kernels on
+    // (G4_SKINNY, default) decode calls these same entry points with one
+    // token; with them off it runs the per-row decode kernels.
+    const bool sk = granite4_verify_skinny_enabled() != 0;
     for (int T = 1; T <= kMaxT; ++T) {
       const std::size_t n = static_cast<std::size_t>(T) * N;
       launch_ok &= granite4_verify_gemv(da, dw, 0.0007f, T, N, K, dgot) == 0;
       for (int t = 0; t < T; ++t)
-        launch_ok &= granite4_kernel_row_gemm_dequant(at(da, t, K), dw, 0.0007f, N, K,
-                                                      at(dref, t, N)) == 0;
+        launch_ok &= (sk ? granite4_verify_gemv(at(da, t, K), dw, 0.0007f, 1, N, K, at(dref, t, N))
+                         : granite4_kernel_row_gemm_dequant(at(da, t, K), dw, 0.0007f, N, K,
+                                                            at(dref, t, N))) == 0;
       gemv_ok &= same(dgot, dref, n);
 
       launch_ok &= granite4_verify_gemv_resid(da, dw, 0.0006f, dres, 0.75f, T, N, K, dgot) == 0;
       for (int t = 0; t < T; ++t)
-        launch_ok &= granite4_kernel_row_gemm_resid_dequant(at(da, t, K), dw, 0.0006f,
-                                                            at(dres, t, N), 0.75f, 1, N, K,
-                                                            at(dref, t, N)) == 0;
+        launch_ok &= (sk ? granite4_verify_gemv_resid(at(da, t, K), dw, 0.0006f, at(dres, t, N),
+                                                      0.75f, 1, N, K, at(dref, t, N))
+                         : granite4_kernel_row_gemm_resid_dequant(at(da, t, K), dw, 0.0006f,
+                                                                  at(dres, t, N), 0.75f, 1, N,
+                                                                  K, at(dref, t, N))) == 0;
       resid_ok &= same(dgot, dref, n);
 
       launch_ok &= granite4_verify_qkv(da, dw, wk, wv, .0007f, .0008f, .0009f, T, nq, nk, nk,
                                        K, dq, dk, dv) == 0;
       for (int t = 0; t < T; ++t)
-        launch_ok &= granite4_kernel_qkv_dequant(at(da, t, K), dw, wk, wv, .0007f, .0008f,
-                                                 .0009f, nq, nk, K, at(rq, t, nq),
-                                                 at(rk, t, nk), at(rv, t, nk)) == 0;
+        launch_ok &= (sk ? granite4_verify_qkv(at(da, t, K), dw, wk, wv, .0007f, .0008f, .0009f,
+                                               1, nq, nk, nk, K, at(rq, t, nq), at(rk, t, nk),
+                                               at(rv, t, nk))
+                         : granite4_kernel_qkv_dequant(at(da, t, K), dw, wk, wv, .0007f, .0008f,
+                                                       .0009f, nq, nk, K, at(rq, t, nq),
+                                                       at(rk, t, nk), at(rv, t, nk))) == 0;
       qkv_ok &= same(dq, rq, static_cast<std::size_t>(T) * nq) &&
                 same(dk, rk, static_cast<std::size_t>(T) * nk) &&
                 same(dv, rv, static_cast<std::size_t>(T) * nk);
 
       launch_ok &= granite4_verify_silu(dw, dw2, da, 0.03125f, 0.02734375f, N, K, T, dgot) == 0;
       for (int t = 0; t < T; ++t)
-        launch_ok &= granite4_kernel_silu_gate_up(dw, dw2, at(da, t, K), 0.03125f, 0.02734375f,
-                                                  N, K, at(dref, t, N)) == 0;
+        launch_ok &= (sk ? granite4_verify_silu(dw, dw2, at(da, t, K), 0.03125f, 0.02734375f, N,
+                                                K, 1, at(dref, t, N))
+                         : granite4_kernel_silu_gate_up(dw, dw2, at(da, t, K), 0.03125f,
+                                                        0.02734375f, N, K, at(dref, t, N))) == 0;
       silu_ok &= same(dgot, dref, n);
     }
     expect(launch_ok, "verify kernels: launches");

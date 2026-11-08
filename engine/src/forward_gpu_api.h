@@ -141,6 +141,34 @@ void gpu_weights_free(GpuCtx* ctx);
 // Number of sequence positions already processed by this ctx (the
 // KV-written watermark); gpu_forward_range recomputes positions at or
 // below this value only when end <= written.
+// Device descriptor of a multi-session batch: row r is position pos[r] of the
+// session whose position -> arena-row table is pt[r] and whose token buffer is
+// tok[r] (device pointers).
+struct GpuMultiRows {
+  int n;
+  int pos[kMaxVerifyRows];
+  const int* pt[kMaxVerifyRows];
+  std::int32_t* tok[kMaxVerifyRows];
+};
+// One forward over rows of several sessions sharing weights + one KV arena:
+// row r is position row_pos[r] of session row_ctx[r] (token from
+// row_tokens[r][row_pos[r]]). Each session's rows must be consecutive and
+// start at its watermark; its watermark then advances past them. Writes
+// logits [n][vocab], greedy ids d_argmax[n] and, if d_hidden is non-null, the
+// final-normed hidden states [n][hidden]. Each row is bit-identical to that
+// session's own (batched-verify or decode) forward at that position.
+// row_ctx[0] leads (its scratch runs the step). n <= kMaxVerifyRows.
+int gpu_forward_multi(GpuCtx* const* row_ctx, std::int32_t* const* row_tokens,
+                      const int* row_pos, int n, std::uint16_t* d_logits,
+                      std::int32_t* d_argmax, std::uint16_t* d_hidden, char* error,
+                      std::size_t error_size);
+// The multi-row RoPE / KV append kernels over a device descriptor (the EAGLE
+// head's batched steps use them on its own KV pool). bits: 16 / 8 / 4.
+int gpu_multi_rope(const std::uint16_t* x, const float* cos_tbl, const float* sin_tbl,
+                   const GpuMultiRows* d_rows, int rows, int heads, int d, std::uint16_t* out);
+int gpu_multi_kv_append(const std::uint16_t* k, const std::uint16_t* v, int bits,
+                        void* cache_k, void* cache_v, float* k_scale, float* v_scale,
+                        const GpuMultiRows* d_rows, int rows, int stride, int Hk, int d);
 // Multi-session greedy decode: `steps` steps, each decoding the next token
 // of all n sessions in one batched forward (the weights stream once for all
 // rows). Session i continues from its watermark exactly as gpu_decode_greedy

@@ -48,7 +48,7 @@ if(GRANITE_ENABLE_CUDA)
       "${CMAKE_CUDA_FLAGS} -lineinfo --expt-relaxed-constexpr --default-stream per-thread")
   find_package(CUDAToolkit REQUIRED)
   list(APPEND GRANITE_ENGINE_SOURCES src/kernels.cu src/kernels_phase2.cu
-       src/kernels_phase3.cu src/forward_gpu.cu src/verify_gemv.cu
+       src/kernels_phase3.cu src/forward_gpu.cu src/verify_gemv.cu src/skinny_gemm.cu
        src/prefill_gemm.cu src/attention_split.cu src/eagle_gpu.cu)
 endif()
 
@@ -163,12 +163,15 @@ if(GRANITE_ENABLE_CUDA)
   # Standalone build of the fused-k verify GEMV (also linked into granite4,
   # where the batched verify forward uses it for the lm_head).
   add_executable(granite4-verify-gemv-test
-                 src/verify_gemv.cu tests/test_verify_gemv.cu)
+                 src/verify_gemv.cu src/skinny_gemm.cu tests/test_verify_gemv.cu)
   target_link_libraries(granite4-verify-gemv-test PRIVATE CUDA::cudart)
   add_test(NAME verify_gemv_device COMMAND granite4-verify-gemv-test)
   add_executable(granite4-verify-gemv-bench
-                 src/verify_gemv.cu tests/verify_gemv_bench.cu)
+                 src/verify_gemv.cu src/skinny_gemm.cu tests/verify_gemv_bench.cu)
   target_link_libraries(granite4-verify-gemv-bench PRIVATE CUDA::cudart)
+  add_executable(granite4-skinny-test tests/test_skinny.cu)
+  target_include_directories(granite4-skinny-test PRIVATE src)
+  target_link_libraries(granite4-skinny-test PRIVATE granite4_static CUDA::cudart)
 endif()
 
 # Phase 1 checkpoint CLI (host-only: verify + FP8 export). Linked statically
