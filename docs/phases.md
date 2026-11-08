@@ -761,6 +761,62 @@ few percent, because lookup proposes rarely there and each miss costs a
 verify round. A model drafter (EAGLE-style head) is the next step; it can
 now verify chains of up to 8 tokens at ~0.4 ms per extra row.
 
+### P4 round 4 — long-context attention + adaptive EAGLE (2026-11-07, gremlin-1)
+
+Context: 2 resident sessions x 32768 positions with EAGLE r8 (k=6) on one
+shared KV8 pool. Profiling at 13-30K context found three causes:
+
+1. **Verify attention re-read the KV once per row.** `attn_split` ran one
+   block per (kv head, split, row), so a 7-row EAGLE verify streamed the whole
+   context 7 times (42.2 ms/round at 13.5K vs a 19.6 ms decode step). Blocks
+   now hold up to 8 rows and stage each K/V tile once for all of them
+   (one row per block below 1K positions, where the grid would be too small).
+   Every row keeps its exact per-row arithmetic: `test_attn_split_rows_bit_identical_device`
+   checks R-row == R single-row calls bit for bit (bf16/KV8/KV4, paged, R=2/7/13).
+2. **The int8/int4 tile fills were scalar.** The split-KV KV8 fill read one
+   byte per thread; it now loads 16 codes (int8) / 32 codes (int4) per thread.
+   The prefill KV8/KV4 V-tile fill mapped consecutive threads along head dims,
+   putting a whole warp on one shared-memory bank (Vt pitch is a multiple of
+   128 B); it now maps them along positions like the bf16 fill, and
+   quantized prefill uses 8 warps per block to amortize the dequant
+   (`G4_PREFILL_ATTN_WARPS=4|8` overrides).
+3. **EAGLE acceptance is text-dependent.** The same binary accepts 75-81% of
+   drafts on the serve_styles prompts the head was trained on but ~8% on novel
+   prose (also on the pre-P4 production binary - not a regression). At long
+   context a round costs ~2.2 decode steps, so drafting lost there. An
+   adaptive policy (`EaglePolicy`, `G4_EAGLE_MIN_ACCEPT`, 0 disables) times
+   4 probe rounds against a timed 8-token plain burst and keeps the faster
+   path; a conversation that switches off stays off. The EAGLE prompt
+   catch-up (>= 64 rows) also runs on the tensor-core prefill GEMMs now
+   (`G4_EAGLE_PREFILL=0` restores the GEMV path).
+
+| Measurement (KV8 unless noted) | Before | After |
+|---|---:|---:|
+| `kv-bench` 30000 ctx prefill | 18.0 s | 14.8 s |
+| `kv-bench` 30000 ctx decode | 39.1 tok/s | 48.3 tok/s (bf16: 43.7) |
+| plain decode, 13.5K chat prompt | 46.5 tok/s | 59.9 tok/s |
+| EAGLE k=6 verify round, 13.5K | 42.2 ms | 26.8 ms |
+| serve smoke, fresh 12K prompt + 96 tok (2 sessions, EAGLE) | 8.2 s | 5.8 s |
+| serve smoke, resumed turn | 2.9-3.7 s | 1.8 s |
+| serve smoke, fresh 30K prompt | 28.2 s | 17.2 s |
+
+Warm serve, fresh requests, eos stop, max 256 tokens, tok/s incl. prefill:
+
+| Family | plain | EAGLE always (old) | EAGLE adaptive (new) |
+|---|---:|---:|---:|
+| serve_styles (20 prompts) | 67.9 | 146.9 | 146.9 |
+| novel prose (5 prompts) | 69.5 | 82.8 | 76.4 |
+| long 8-13K chat (2 prompts) | 34.3 | 22.6 | 32.5 |
+
+All variants are token-identical to plain greedy (kernel tests, `generate`
+on long/novel/serve_style prompts, `scripts/serve_pool_smoke.py` with
+`G4_FORCE_REPREFILL=1`, and the warm-serve outputs). Resumed turns can differ
+from a full re-prefill: the KV of earlier generated tokens came from the
+decode path, and re-forwarding them through prefill rounds bf16 differently
+(confirmed: the new build matches the old build exactly whenever both take
+the same resume path). Known gap: the policy decides once per request, so a
+reply whose acceptance rises late stays plain (novel: -9% vs always-on).
+
 ## Rules across phases
 
 - No kernel or code is copied from `reference/qwen3-27b-5090/`; it is kept

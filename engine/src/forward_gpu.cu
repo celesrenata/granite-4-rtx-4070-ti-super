@@ -2406,6 +2406,21 @@ const int* gpu_ctx_kv_rows_device(const GpuCtx* ctx) {
 // Let `ctx` borrow `owner`'s prefill scratch instead of allocating its own
 // (~0.8 GiB). Valid only while the two contexts never prefill concurrently -
 // the serve loop runs one request at a time. Call before the first prefill.
+int gpu_ctx_prefill_scratch(GpuCtx* ctx, GpuPrefillScratch* out) {
+  if (ctx == nullptr || out == nullptr || !ensure_prefill_scratch(ctx)) return -1;
+  const PrefillScratch p = prefill_scratch(ctx);
+  out->hidden = p.hidden;
+  out->normed = p.normed;
+  out->qkv = p.qkv;
+  out->q_rot = p.q_rot;
+  out->attn = p.attn;
+  out->act = p.act;
+  out->gu = p.gu;
+  out->ws = p.ws;
+  out->ws_bytes = p.ws_bytes;
+  out->rows = ctx->prefill_rows;
+  return 0;
+}
 int gpu_ctx_share_prefill_scratch(GpuCtx* ctx, GpuCtx* owner) {
   if (ctx == nullptr || owner == nullptr || ctx == owner || ctx->prefill != nullptr ||
       owner->prefill_owner != nullptr || ctx->L != owner->L || ctx->H != owner->H ||

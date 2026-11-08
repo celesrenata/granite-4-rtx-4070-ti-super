@@ -727,6 +727,39 @@ bool generate_draft(GpuSession& s, const Args& a, Generation* out, std::string* 
   return true;
 }
 
+// Adaptive drafting. EAGLE pays only while its rounds produce tokens faster
+// than plain chained greedy decode, and both sides of that move with the
+// context: a round is the head steps plus a (k + 1)-row verify (~1.5 decode
+// steps at short context, ~2.2 at 13k on the RTX 4070 Ti SUPER), and the
+// head's acceptance depends on the text (75-80% on the serving styles it was
+// trained on, ~8% on novel prose). So the policy measures instead of guessing:
+// after kEagleProbeRounds timed rounds (the first round, which carries the
+// prompt catch-up, is not timed), a request
+//   - keeps drafting if it averages >= kEagleKeepAccept accepted tokens/round,
+//   - stops if it averages < G4_EAGLE_MIN_ACCEPT (default 0.35),
+//   - otherwise decodes a timed plain burst of 8 tokens and keeps whichever is
+//     faster in tokens per millisecond (host-timed; both paths sync on their
+//     readback). Winning EAGLE re-syncs the head with one hidden-only forward
+//     over the burst rows - verify rows are bit-identical to decode rows, so
+//     the KV and the output are unchanged.
+// Stopping finishes the request on the chained greedy decode and the
+// conversation remembers it: later turns skip the head (and its catch-up).
+// Output is identical in every case (the verify is exact greedy).
+// G4_EAGLE_MIN_ACCEPT=0 disables the policy (always draft).
+struct EaglePolicy {
+  bool off = false;  // drafting disabled for this conversation
+};
+double eagle_min_accept() {
+  static const double v = [] {
+    const char* e = std::getenv("G4_EAGLE_MIN_ACCEPT");
+    return e != nullptr ? std::atof(e) : 0.35;
+  }();
+  return v;
+}
+constexpr int kEagleProbeRounds = 4;
+constexpr double kEagleKeepAccept = 2.0;
+constexpr int kEagleBurst = 8;
+
 // EAGLE draft-verify loop. Invariants at the top of a round: the target KV
 // holds positions [0, L); the anchor (the target's greedy token at L, already
 // emitted) is in d_tokens[L]; head entries [0, hq) are valid and `feat`
@@ -737,7 +770,7 @@ bool generate_draft(GpuSession& s, const Args& a, Generation* out, std::string* 
 // gate accepts the prefix d_i == t_{i-1}; t_a is the new anchor. Everything
 // up to the read-back of t and d is enqueued without a host round trip.
 bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* out,
-                    std::string* error, int prefix = -1) {
+                    std::string* error, int prefix = -1, EaglePolicy* policy = nullptr) {
   if (head == nullptr) {
     *error = "eagle: no head loaded (start with --eagle HEAD)";
     return false;
@@ -793,8 +826,14 @@ bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* o
   struct Ev { cudaEvent_t a, b; };
   std::vector<Ev> h_ev, v_ev;
   long et_rounds = 0, et_acc = 0, et_prop = 0;
+  // Adaptive drafting (see EaglePolicy): timed probe rounds, then one decision.
+  const double min_accept = eagle_min_accept();
+  int rounds_seen = 0, probe_acc = 0, probe_tok = 0;
+  double probe_ms = 0.0;
+  bool decided = min_accept <= 0.0, go_plain = false;
   const auto et_t0 = std::chrono::steady_clock::now();
   auto round = [&](std::string* out_err) -> bool {
+    const auto r_t0 = std::chrono::steady_clock::now();
     const int remaining = a.max_tokens - static_cast<int>(generated.size());
     const int k = std::max(0, std::min({a.eagle_k, remaining - 1, s.max_pos() - L - 2}));
     Ev h0, v0;
@@ -828,6 +867,15 @@ bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* o
     report.accepted += acc;
     ++report.steps;
     if (et) { et_rounds++; et_acc += acc; et_prop += k; }
+    if (!decided && k > 0) {
+      if (rounds_seen > 0) {  // round 0 carries the head's prompt catch-up
+        probe_acc += acc;
+        probe_tok += acc + 1;
+        probe_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - r_t0).count();
+      }
+      ++rounds_seen;
+    }
     bool stop = false;
     for (int i = 0; i < acc && !stop; ++i) stop = emit(drafts[static_cast<std::size_t>(i)]);
     if (!stop) stop = emit(ids[static_cast<std::size_t>(acc)]);
@@ -844,11 +892,72 @@ bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* o
     hq = L;
     feat = f_verify;
     L = nl;
-    return false;
+    if (!decided && rounds_seen > kEagleProbeRounds) {
+      decided = true;
+      const double avg = static_cast<double>(probe_acc) / kEagleProbeRounds;
+      const int left = a.max_tokens - static_cast<int>(generated.size());
+      // The burst plus the rows already pending for the head ([hq, L)) must
+      // fit one verify-sized hidden forward for the re-sync.
+      const int burst = std::min({kEagleBurst, left, kMaxVerifyRows - (L - hq)});
+      if (avg < min_accept) {
+        go_plain = true;
+      } else if (avg < kEagleKeepAccept && burst >= 2) {
+        const auto b0 = std::chrono::steady_clock::now();
+        std::vector<std::int32_t> bt;
+        if (!s.decode_greedy(burst, error) || !s.tokens(L + 1, L + 1 + burst, &bt, error))
+          return true;
+        const double plain_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0)
+                .count();
+        const double plain_rate = burst / std::max(plain_ms, 1e-3);
+        const double eagle_rate = probe_tok / std::max(probe_ms, 1e-3);
+        if (std::getenv("G4_SERVE_DEBUG") != nullptr || et)
+          std::fprintf(stderr, "G4_EAGLE probe: %.2f accepted/round, eagle %.1f tok/s, "
+                       "plain %.1f tok/s -> %s\n", avg, 1000.0 * eagle_rate,
+                       1000.0 * plain_rate, plain_rate >= eagle_rate ? "plain" : "eagle");
+        bool stop2 = false;
+        for (std::int32_t t : bt)
+          if ((stop2 = emit(t))) break;
+        if (stop2) return true;
+        if (plain_rate >= eagle_rate) {
+          go_plain = true;  // the anchor already sits at d_tokens[written]
+        } else {
+          // Re-sync: features of [hq, L + burst) for the head's next catch-up
+          // (rows [hq, L) were verified, rows [L, L + burst) decoded; both are
+          // recomputed bit-identically by the verify-shaped forward).
+          if (!s.truncate(hq) || !s.forward_hidden(L + burst, hq, f_verify, error)) return true;
+          L += burst;
+        }
+      }
+    }
+    return go_plain;  // drafting is not paying: leave the loop, finish greedily
   };
   bool stop = false;
   do stop = round(error); while (!stop && error->empty());
   if (!error->empty()) return false;
+  if (go_plain && static_cast<int>(generated.size()) < a.max_tokens &&
+      !(a.eos >= 0 && !generated.empty() && a.is_eos(generated.back()))) {
+    // The anchor (last emitted token) sits at d_tokens[L], the target KV holds
+    // [0, L): continue as plain chained greedy decode, 8 tokens per readback.
+    if (policy != nullptr) policy->off = true;
+    if (std::getenv("G4_SERVE_DEBUG") != nullptr || et)
+      std::fprintf(stderr, "G4_EAGLE drafting off after %d rounds (%.2f accepted/round)\n",
+                   rounds_seen, static_cast<double>(probe_acc) / kEagleProbeRounds);
+    constexpr int kChunk = 8;
+    std::vector<std::int32_t> ids2;
+    bool done = false;
+    while (!done && static_cast<int>(generated.size()) < a.max_tokens) {
+      const int pos = s.written();
+      const int steps = std::min(kChunk, a.max_tokens - static_cast<int>(generated.size()));
+      if (!s.decode_greedy(steps, error) || !s.tokens(pos + 1, pos + 1 + steps, &ids2, error))
+        return false;
+      for (std::int32_t t : ids2)
+        if (emit(t)) {
+          done = true;
+          break;
+        }
+    }
+  }
   const double et_wall =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - et_t0).count();
   if (et) {
@@ -873,9 +982,12 @@ bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* o
 }
 
 bool gpu_generate(GpuSession& s, const Args& a, Generation* out, std::string* error,
-                  EagleHead* head = nullptr, int prefix = -1) {
+                  EagleHead* head = nullptr, int prefix = -1, EaglePolicy* policy = nullptr) {
   if (!check_request(s, a, prefix, error)) return false;
-  if (a.eagle_k > 0) return generate_eagle(s, head, a, out, error, prefix);
+  // A conversation whose drafts were not paying decodes plainly (same tokens).
+  if (a.eagle_k > 0 && policy != nullptr && policy->off)
+    return generate_greedy(s, a, out, error, prefix);
+  if (a.eagle_k > 0) return generate_eagle(s, head, a, out, error, prefix, policy);
   if (a.draft_k > 0) return generate_draft(s, a, out, error, prefix);
   return a.seed == 0 ? generate_greedy(s, a, out, error, prefix)
                      : generate_sampled(s, a, out, error, prefix);
@@ -1159,6 +1271,7 @@ int gpu_serve_cmd(const Args& cli) {
   // and when it last served a request (LRU for pool eviction).
   std::vector<std::vector<std::int32_t>> hist(n_sessions);
   std::vector<long> last_used(n_sessions, 0);
+  std::vector<EaglePolicy> policy(n_sessions);  // per conversation
   long tick = 0;
   // Give session i enough pool pages for `need` positions and publish its row
   // table. Its resident pages never move, so a resumed conversation's KV stays
@@ -1179,6 +1292,7 @@ int gpu_serve_cmd(const Args& cli) {
         return false;
       }
       pool.drop(slot[victim]);
+      policy[victim] = EaglePolicy{};
       hist[victim].clear();
       sessions[victim].truncate(0);
       eagle_truncate(heads[victim], 0);
@@ -1312,8 +1426,11 @@ int gpu_serve_cmd(const Args& cli) {
           last_used[picked] = ++tick;
           // A turn that does not resume re-prefills from 0: the head's draft
           // history no longer matches the session's KV.
-          if (resume == 0) eagle_truncate(heads[picked], 0);
-          ok = gpu_generate(s, a, &g, &err, heads[picked], resume);
+          if (resume == 0) {
+            eagle_truncate(heads[picked], 0);
+            policy[picked] = EaglePolicy{};  // a new conversation probes again
+          }
+          ok = gpu_generate(s, a, &g, &err, heads[picked], resume, &policy[picked]);
         }
       }
       if (ok) reply = generate_document(g.ids, g.drafted ? &g.report : nullptr);

@@ -31,6 +31,7 @@
 #include <cuda_runtime.h>
 
 #include "attention_gpu.h"
+#include "prefill_gemm.h"
 #include "checkpoint.h"
 #include "device_math.cuh"
 #include "kernel_math.h"
@@ -207,6 +208,7 @@ struct EagleHead {
   // handed back at the main-cache level cover the draft cache too.
   int kv_stride = 0;
   GpuCtx* target = nullptr;  // paged: the session whose row table addresses the KV
+  GpuCtx* scratch_ctx = nullptr;  // the session whose prefill scratch the catch-up borrows
   bool paged = false;
   bool owns_tables = true;  // cos/sin: a forked session head borrows the base's
   std::vector<void*> allocs;  // owned allocations (a fork lists only its own)
@@ -328,6 +330,7 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
   h->kv_stride = kv_rows > 0 ? kv_rows : max_pos;
   h->paged = kv_rows > 0;
   h->target = h->paged ? target : nullptr;
+  h->scratch_ctx = target;
   const std::int64_t H = h->H, I = h->I, nq = h->Hq * h->d, nk = h->Hk * h->d;
   HostTensor t;
   struct W {
@@ -468,6 +471,7 @@ EagleHead* eagle_fork(const EagleHead* base, GpuCtx* target, std::string* err) {
   h->logits = nullptr;
   h->written = 0;
   h->target = target;
+  h->scratch_ctx = target;
   if (!h->alloc(&h->attn_scratch,
                 attn_split_scratch_bytes(h->Hq, kMaxVerifyRows, h->max_pos), err) ||
       !h->alloc(&h->scratch, row_elems(*h) * kMaxVerifyRows * 2, err) ||
@@ -494,6 +498,99 @@ std::size_t eagle_device_bytes(const EagleHead* h) {
   return 2 * H * H + 2 * nq * H + 2 * nk * H + 3 * I * H + static_cast<std::size_t>(h->Vd) * H;
 }
 
+namespace {
+// Prompt catch-up on tensor cores: rows [p, p + R) of the head in one pass of
+// prefill GEMMs (FP8 x bf16, tensor cores) + prefill attention, in the
+// session's prefill scratch (idle between the target's forwards). Same math
+// as the per-row verify-GEMV path, different accumulation order: drafts may
+// differ in rare near-ties, the output never does (the target verifies).
+int eagle_rows_prefill(EagleHead* h, const std::int32_t* d_tokens, int p, int R,
+                       const std::uint16_t* d_feat, std::uint16_t* f,
+                       const GpuPrefillScratch& s, const int* d_pt) {
+  const int H = h->H, I = h->I, nq = h->Hq * h->d, nk = h->Hk * h->d;
+  const int nqkv = nq + 2 * nk;
+  // xin [R][2H] lives in the (not yet used) f32 gate|up buffer.
+  std::uint16_t* const xin = reinterpret_cast<std::uint16_t*>(s.gu);
+  std::uint16_t* const x = s.hidden;
+  std::uint16_t* const xn = s.normed;
+  concat_kernel<<<dim3((2 * H + 255) / 256, R), 256>>>(d_tokens, p + 1, h->embed, d_feat, H, xin);
+  if (h->ln_e != nullptr)
+    input_norm_kernel<<<dim3(2, R), kNormThreads>>>(xin, h->ln_e, h->ln_h, H, h->eps);
+  GemmEpilogue ep;
+  ep.scale0 = h->sc[0];
+  ep.out_bf16 = x;
+  ep.ldc = H;
+  if (prefill_gemm(GemmOut::kBf16, xin, 2 * H, h->fc, R, H, 2 * H, ep, s.ws, s.ws_bytes) != 0)
+    return -1;
+  bias_kernel<<<dim3((H + 255) / 256, R), 256>>>(x, h->bias, H);
+  if (granite4_kernel_rmsnorm(x, h->ln1, h->eps, R, H, xn) != 0) return -1;
+  // q | k | v into one token-major [R][nqkv] row (three tensors, three scales).
+  struct P {
+    const std::uint8_t* w;
+    float sc;
+    int off, n;
+  };
+  for (const P& pj : {P{h->wq, h->sc[1], 0, nq}, P{h->wk, h->sc[2], nq, nk},
+                      P{h->wv, h->sc[3], nq + nk, nk}}) {
+    GemmEpilogue e;
+    e.scale0 = pj.sc;
+    e.out_bf16 = s.qkv + pj.off;
+    e.ldc = nqkv;
+    if (prefill_gemm(GemmOut::kBf16, xn, H, pj.w, R, pj.n, H, e, s.ws, s.ws_bytes) != 0)
+      return -1;
+  }
+  const bool i8 = h->kv_bits == 8, i4 = h->kv_bits == 4;
+  int rc;
+  if (i8)
+    rc = prefill_rope_split_append_int8(s.qkv, h->cos_tbl, h->sin_tbl, p, R, h->Hq, h->Hk, h->d,
+                                        h->kv_stride, s.q_rot, h->kv8_k, h->kv8_v,
+                                        h->kv8_k_scale, h->kv8_v_scale, d_pt);
+  else if (i4)
+    rc = prefill_rope_split_append_int4(s.qkv, h->cos_tbl, h->sin_tbl, p, R, h->Hq, h->Hk, h->d,
+                                        h->kv_stride, s.q_rot, h->kv4_k, h->kv4_v,
+                                        h->kv4_k_scale, h->kv4_v_scale, d_pt);
+  else
+    rc = prefill_rope_split_append(s.qkv, h->cos_tbl, h->sin_tbl, p, R, h->Hq, h->Hk, h->d,
+                                   h->kv_stride, s.q_rot, h->kv_k, h->kv_v, d_pt);
+  if (rc != 0 ||
+      prefill_attention(s.q_rot, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, p, R,
+                        h->kv_stride, s.attn, h->kv8_k, h->kv8_v,
+                        i8 ? h->kv8_k_scale : h->kv4_k_scale,
+                        i8 ? h->kv8_v_scale : h->kv4_v_scale, i8, h->kv4_k, h->kv4_v, i4,
+                        d_pt) != 0)
+    return -1;
+  // hh = x + att Wo  (into x, in place: residual may alias the output)
+  GemmEpilogue eo;
+  eo.scale0 = h->sc[4];
+  eo.out_bf16 = x;
+  eo.residual = x;
+  eo.ldc = H;
+  if (prefill_gemm(GemmOut::kResidual, s.attn, nq, h->wo, R, H, nq, eo, s.ws, s.ws_bytes) != 0 ||
+      granite4_kernel_rmsnorm(x, h->ln2, h->eps, R, H, xn) != 0)
+    return -1;
+  GemmEpilogue eg, eu;
+  eg.scale0 = h->sc[5];
+  eg.out_f32 = s.gu;
+  eg.ldc = 2 * I;
+  eu.scale0 = h->sc[6];
+  eu.out_f32 = s.gu + I;
+  eu.ldc = 2 * I;
+  if (prefill_gemm(GemmOut::kF32, xn, H, h->wg, R, I, H, eg, s.ws, s.ws_bytes) != 0 ||
+      prefill_gemm(GemmOut::kF32, xn, H, h->wu, R, I, H, eu, s.ws, s.ws_bytes) != 0 ||
+      prefill_silu_mul(s.gu, I, R, s.act) != 0)
+    return -1;
+  GemmEpilogue ed;
+  ed.scale0 = h->sc[7];
+  ed.out_bf16 = x;
+  ed.residual = x;
+  ed.ldc = H;
+  if (prefill_gemm(GemmOut::kResidual, s.act, I, h->wd, R, H, I, ed, s.ws, s.ws_bytes) != 0 ||
+      granite4_kernel_rmsnorm(x, h->lnf, h->eps, R, H, f) != 0)
+    return -1;
+  return 0;
+}
+}  // namespace
+
 int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows,
                   const std::uint16_t* d_feat, std::uint16_t* d_feat_out,
                   std::int32_t* d_draft_out) {
@@ -503,7 +600,31 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
   if (h->target != nullptr && pos0 + rows > gpu_ctx_mapped_rows(h->target)) return -1;
   const int* const d_pt = h->target != nullptr ? gpu_ctx_kv_rows_device(h->target) : nullptr;
   const int H = h->H, I = h->I, nq = h->Hq * h->d, nk = h->Hk * h->d, half = h->d / 2;
-  for (int c0 = 0; c0 < rows; c0 += kMaxVerifyRows) {
+  // Long catch-ups (a prompt, or the rows a resumed turn adds) run in
+  // prefill-sized chunks on tensor cores; the per-round steps (<= 16 rows)
+  // keep the verify-GEMV path. G4_EAGLE_PREFILL=0 forces the GEMV path.
+  constexpr int kPrefillMinRows = 64;
+  static const bool prefill_ok = [] {
+    const char* e = std::getenv("G4_EAGLE_PREFILL");
+    return e == nullptr || e[0] != '0';
+  }();
+  GpuPrefillScratch ps{};
+  const bool use_prefill = prefill_ok && rows >= kPrefillMinRows && h->scratch_ctx != nullptr &&
+                           h->d == 128 && h->Hq == 4 * h->Hk &&
+                           gpu_ctx_prefill_scratch(h->scratch_ctx, &ps) == 0 && ps.rows >= 64;
+  int c0 = 0;
+  if (use_prefill) {
+    // Whole chunks only; a short tail (< 64 rows) takes the GEMV path below.
+    for (; rows - c0 >= kPrefillMinRows; ) {
+      const int R = std::min(ps.rows, rows - c0);
+      if (eagle_rows_prefill(h, d_tokens, pos0 + c0, R, d_feat + static_cast<std::size_t>(c0) * H,
+                             d_feat_out + static_cast<std::size_t>(c0) * H, ps, d_pt) != 0)
+        return -1;
+      c0 += R;
+      h->written = pos0 + c0;
+    }
+  }
+  for (; c0 < rows; c0 += kMaxVerifyRows) {
     const int R = std::min(kMaxVerifyRows, rows - c0);
     const int p = pos0 + c0;
     std::uint16_t* s = h->scratch;

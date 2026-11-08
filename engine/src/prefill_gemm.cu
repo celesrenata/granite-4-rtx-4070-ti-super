@@ -28,6 +28,8 @@
 #include <cmath>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
+#include <type_traits>
 #include <cstdio>
 
 #include <cuda_runtime.h>
@@ -521,7 +523,6 @@ __global__ void __launch_bounds__(kPrefillInt4D)
 // denominator; this kernel's f32 online softmax agrees within bf16 rounding
 // of the output, the same tolerance as the rest of the tensor-core prefill.
 // ---------------------------------------------------------------------------
-constexpr int kAttnWarps = 4;
 constexpr int kAttnKvTile = 64;
 
 __device__ __forceinline__ float bf16_round(float x) {
@@ -538,8 +539,8 @@ __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
 // bf16 Ks/Vt tiles the bf16 path writes, so everything after the tile fill
 // (QK, online softmax, PV) is byte-identical between the three
 // instantiations.
-template <int D, int G, bool Int8, bool Int4>
-__global__ void __launch_bounds__(kAttnWarps * 32)
+template <int D, int G, bool Int8, bool Int4, int W>
+__global__ void __launch_bounds__(W * 32)
     prefill_attention_kernel(const std::uint16_t* __restrict__ q_rot,
                              const std::uint16_t* __restrict__ cache_k,
                              const std::uint16_t* __restrict__ cache_v, float scale,
@@ -553,7 +554,9 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
                              const std::uint8_t* __restrict__ cache_v4,
                              const int* __restrict__ d_pt) {
   constexpr int kPosPerWarp = 16 / G;
-  constexpr int kPosPerBlock = kAttnWarps * kPosPerWarp;
+  // W warps share each K/V tile: the tile fill (load + dequant) is paid once
+  // per W * kPosPerWarp query positions, so wider blocks amortize it.
+  constexpr int kPosPerBlock = W * kPosPerWarp;
   constexpr int KT = kAttnKvTile;
   constexpr int KP = D + 8;   // K tile pitch (bank-conflict-free B loads)
   constexpr int VP = KT + 8;  // V^T tile pitch
@@ -622,7 +625,7 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
     // K tile row-major (coalesced); V tile transposed, consecutive threads on
     // consecutive positions so the scalar transposed stores do not conflict.
     if (!quantized) {
-      for (int idx = threadIdx.x; idx < KT * D / 8; idx += kAttnWarps * 32) {
+      for (int idx = threadIdx.x; idx < KT * D / 8; idx += W * 32) {
         const int kr = idx / (D / 8), kc = (idx % (D / 8)) * 8;
         const int kj = j0 + kr;
         // Logical position kj lives in arena row d_pt[kj] (identity when
@@ -651,26 +654,33 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
       // values into the same Ks (row-major) / Vt (transposed) tiles the
       // bf16 path writes; out-of-tile rows store 0 (the bf16 path's zero
       // fill) so masked logits and PV stay 0.
-      for (int idx = threadIdx.x; idx < KT * (D / 2); idx += kAttnWarps * 32) {
+      // K: consecutive threads on consecutive code bytes of one row
+      // (row-major Ks, conflict-free word stores).
+      for (int idx = threadIdx.x; idx < KT * (D / 2); idx += W * 32) {
         const int kr = idx / (D / 2), cw = idx % (D / 2);
         const int kj = j0 + kr;
+        std::uint32_t packed = 0u;
         if (kj < kv_end) {
           const int row = (d_pt != nullptr) ? d_pt[kj] : kj;
-          const std::size_t cbase = static_cast<std::size_t>(row) * (D / 2) + cw;
           float k0, k1;
-          dev::q4_dequant_pair(k4[cbase], ksc[row], k0, k1);
-          Ks[kr][2 * cw] = f32_to_bf16(k0);
-          Ks[kr][2 * cw + 1] = f32_to_bf16(k1);
-          float v0, v1;
-          dev::q4_dequant_pair(v4[cbase], vsc[row], v0, v1);
-          Vt[2 * cw][kr] = f32_to_bf16(v0);
-          Vt[2 * cw + 1][kr] = f32_to_bf16(v1);
-        } else {
-          Ks[kr][2 * cw] = std::uint16_t{0};
-          Ks[kr][2 * cw + 1] = std::uint16_t{0};
-          Vt[2 * cw][kr] = std::uint16_t{0};
-          Vt[2 * cw + 1][kr] = std::uint16_t{0};
+          dev::q4_dequant_pair(k4[static_cast<std::size_t>(row) * (D / 2) + cw], ksc[row], k0, k1);
+          packed = static_cast<std::uint32_t>(f32_to_bf16(k0)) |
+                   (static_cast<std::uint32_t>(f32_to_bf16(k1)) << 16);
         }
+        *reinterpret_cast<std::uint32_t*>(&Ks[kr][2 * cw]) = packed;
+      }
+      // V (transposed): consecutive threads on consecutive positions, so the
+      // Vt[dim][pos] stores hit consecutive halfwords (no bank conflicts).
+      for (int idx = threadIdx.x; idx < KT * (D / 2); idx += W * 32) {
+        const int vr = idx % KT, cw = idx / KT;
+        const int vj = j0 + vr;
+        float v0 = 0.0f, v1 = 0.0f;
+        if (vj < kv_end) {
+          const int row = (d_pt != nullptr) ? d_pt[vj] : vj;
+          dev::q4_dequant_pair(v4[static_cast<std::size_t>(row) * (D / 2) + cw], vsc[row], v0, v1);
+        }
+        Vt[2 * cw][vr] = vj < kv_end ? f32_to_bf16(v0) : std::uint16_t{0};
+        Vt[2 * cw + 1][vr] = vj < kv_end ? f32_to_bf16(v1) : std::uint16_t{0};
       }
     } else {
       // KV8: dequant each K row (row-major, one thread per 8-byte chunk) and V
@@ -679,7 +689,7 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
       // dequant runs over the register codes; out-of-tile positions store 0
       // (the bf16 path's zero fill), so the masked logits (and the Vt columns
       // the PV mma still reads) stay 0.
-      for (int idx = threadIdx.x; idx < KT * D / 8; idx += kAttnWarps * 32) {
+      for (int idx = threadIdx.x; idx < KT * D / 8; idx += W * 32) {
         const int r = idx / (D / 8), w = (idx % (D / 8)) * 8;
         const int j = j0 + r;
         if (j < kv_end) {
@@ -699,8 +709,12 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
           *reinterpret_cast<uint4*>(&Ks[r][w]) = zero;
         }
       }
-      for (int idx = threadIdx.x; idx < KT * D / 8; idx += kAttnWarps * 32) {
-        const int r = idx / (D / 8), w = (idx % (D / 8)) * 8;
+      // V (transposed): consecutive threads on consecutive positions (as the
+      // bf16 path), so the scalar Vt[dim][pos] stores hit consecutive
+      // halfwords. Mapping threads along the dims instead put every thread
+      // of a warp on one bank (the Vt row pitch is a multiple of 128 B).
+      for (int idx = threadIdx.x; idx < KT * D / 8; idx += W * 32) {
+        const int r = idx % KT, w = (idx / KT) * 8;
         const int j = j0 + r;
         if (j < kv_end) {
           const int row = (d_pt != nullptr) ? d_pt[j] : j;
@@ -998,21 +1012,38 @@ int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                      (reinterpret_cast<std::uintptr_t>(cache_k) & 15u) != 0 ||
                      (reinterpret_cast<std::uintptr_t>(cache_v) & 15u) != 0)))
     return -1;
-  constexpr int kPosPerBlock = kAttnWarps * (16 / 4);
-  const dim3 grid(static_cast<unsigned>((rows + kPosPerBlock - 1) / kPosPerBlock),
-                  static_cast<unsigned>(Hk));
-  if (int8)
-    prefill_attention_kernel<128, 4, true, false><<<grid, kAttnWarps * 32>>>(
-        q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, cache_k8,
-        cache_v8, k_scale, v_scale, nullptr, nullptr, d_pt);
-  else if (int4)
-    prefill_attention_kernel<128, 4, false, true><<<grid, kAttnWarps * 32>>>(
-        q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, nullptr,
-        nullptr, k_scale, v_scale, cache_k4, cache_v4, d_pt);
+  // Warps per block (each owns 4 positions x 4 heads; all share the K/V
+  // tiles). Quantized caches pay a dequant per tile element, so 8 warps
+  // amortize it over twice the queries (KV8 30k prefill: -7% vs 4); the bf16
+  // fill is a plain copy and 4 warps keep more blocks resident (+3% vs 8).
+  // G4_PREFILL_ATTN_WARPS=4|8 overrides (A/B).
+  static const int forced = [] {
+    const char* e = std::getenv("G4_PREFILL_ATTN_WARPS");
+    return e == nullptr ? 0 : (e[0] == '4' ? 4 : (e[0] == '8' ? 8 : 0));
+  }();
+  const int warps = forced != 0 ? forced : ((int8 || int4) ? 8 : 4);
+  auto launch = [&](auto wtag) {
+    constexpr int Wn = decltype(wtag)::value;
+    constexpr int kPosPerBlock = Wn * (16 / 4);
+    const dim3 grid(static_cast<unsigned>((rows + kPosPerBlock - 1) / kPosPerBlock),
+                    static_cast<unsigned>(Hk));
+    if (int8)
+      prefill_attention_kernel<128, 4, true, false, Wn><<<grid, Wn * 32>>>(
+          q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, cache_k8,
+          cache_v8, k_scale, v_scale, nullptr, nullptr, d_pt);
+    else if (int4)
+      prefill_attention_kernel<128, 4, false, true, Wn><<<grid, Wn * 32>>>(
+          q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, nullptr,
+          nullptr, k_scale, v_scale, cache_k4, cache_v4, d_pt);
+    else
+      prefill_attention_kernel<128, 4, false, false, Wn><<<grid, Wn * 32>>>(
+          q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, nullptr,
+          nullptr, nullptr, nullptr, nullptr, nullptr, d_pt);
+  };
+  if (warps == 4)
+    launch(std::integral_constant<int, 4>{});
   else
-    prefill_attention_kernel<128, 4, false, false><<<grid, kAttnWarps * 32>>>(
-        q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, nullptr,
-        nullptr, nullptr, nullptr, nullptr, nullptr, d_pt);
+    launch(std::integral_constant<int, 8>{});
   G4_PF_CHECK();
   return 0;
 }

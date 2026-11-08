@@ -102,6 +102,24 @@ const int* gpu_ctx_kv_rows_device(const GpuCtx* ctx);
 // only for contexts that never prefill concurrently (the serve loop runs one
 // request at a time). Call before the context's first prefill.
 int gpu_ctx_share_prefill_scratch(GpuCtx* ctx, GpuCtx* owner);
+// The context's tensor-core prefill scratch (allocated on first use), for
+// kernels outside the forward pass that run a prefill-shaped batch between
+// two forwards - the EAGLE head's prompt catch-up. Valid until the next
+// forward on any context that shares it. 0 on success, -1 when it cannot be
+// allocated.
+struct GpuPrefillScratch {
+  std::uint16_t* hidden;  // [rows][H]
+  std::uint16_t* normed;  // [rows][H]
+  std::uint16_t* qkv;     // [rows][(Hq + 2Hk) d]
+  std::uint16_t* q_rot;   // [rows][Hq d]
+  std::uint16_t* attn;    // [rows][Hq d]
+  std::uint16_t* act;     // [rows][I]
+  float* gu;              // [rows][2I] (16-byte aligned; f32 GEMM output)
+  float* ws;              // split-K workspace
+  std::size_t ws_bytes;
+  int rows;               // capacity in rows
+};
+int gpu_ctx_prefill_scratch(GpuCtx* ctx, GpuPrefillScratch* out);
 
 // (See gpu_weights_load above for the weight-object upload; the
 // legacy per-ctx signatures below delegate to it.)

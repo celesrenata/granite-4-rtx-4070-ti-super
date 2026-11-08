@@ -2819,6 +2819,106 @@ static void test_shared_arena_sessions_device() {
   cudaFree(d_tok[0]);
   cudaFree(d_tok[1]);
 }
+// Multi-row split attention == per-row single-row calls, bit for bit. The
+// batched verify (EAGLE / draft-lookup) is only exact if every verify row
+// equals the decode step at that position, so a K-row attn_split must equal K
+// rows=1 calls - in every KV format, through a paged row table, on a pool
+// wider than the sequence bound (max_len < stride), across row groups.
+static void test_attn_split_rows_bit_identical_device() {
+  const int Hq = 8, Hk = 2, d = 128, stride = 3000, max_len = 2100;
+  Xorshift64 rng(0x5eed7);
+  const std::size_t rowsz = static_cast<std::size_t>(Hk) * stride;  // (head, row) slots
+  std::vector<std::uint16_t> ck(rowsz * d), cv(rowsz * d);
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  std::vector<std::int8_t> k8(rowsz * d), v8(rowsz * d);
+  for (auto& x : k8) x = static_cast<std::int8_t>(static_cast<int>(rng.next() % 255) - 127);
+  for (auto& x : v8) x = static_cast<std::int8_t>(static_cast<int>(rng.next() % 255) - 127);
+  std::vector<std::uint8_t> k4(rowsz * d / 2), v4(rowsz * d / 2);
+  for (auto& x : k4) x = static_cast<std::uint8_t>(rng.next() & 0xffu);
+  for (auto& x : v4) x = static_cast<std::uint8_t>(rng.next() & 0xffu);
+  std::vector<float> ks(rowsz), vs(rowsz);
+  for (auto& x : ks) x = 0.002f + 0.02f * rng.next_float_range(1.0);
+  for (auto& x : vs) x = 0.002f + 0.02f * rng.next_float_range(1.0);
+  // Paged table: logical positions scattered over the wider pool.
+  std::vector<int> pool(stride);
+  for (int i = 0; i < stride; ++i) pool[i] = i;
+  for (int i = stride - 1; i > 0; --i) std::swap(pool[i], pool[rng.next() % (i + 1)]);
+  std::vector<int> pt(pool.begin(), pool.begin() + max_len);
+  const int kMaxR = 13;
+  const std::size_t qn = static_cast<std::size_t>(kMaxR) * Hq * d;
+  std::vector<std::uint16_t> q(qn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  std::uint16_t *dk, *dv, *dq, *dmulti, *dsingle;
+  std::int8_t *dk8, *dv8;
+  std::uint8_t *dk4, *dv4;
+  float *dks, *dvs;
+  int* dpt;
+  void* scratch;
+  const std::size_t scr = granite4::attn_split_scratch_bytes(Hq, kMaxR, max_len);
+  if (cudaMalloc(&dk, ck.size() * 2) || cudaMalloc(&dv, cv.size() * 2) ||
+      cudaMalloc(&dk8, k8.size()) || cudaMalloc(&dv8, v8.size()) ||
+      cudaMalloc(&dk4, k4.size()) || cudaMalloc(&dv4, v4.size()) ||
+      cudaMalloc(&dks, ks.size() * 4) || cudaMalloc(&dvs, vs.size() * 4) ||
+      cudaMalloc(&dq, qn * 2) || cudaMalloc(&dmulti, qn * 2) || cudaMalloc(&dsingle, qn * 2) ||
+      cudaMalloc(&dpt, pt.size() * 4) || cudaMalloc(&scratch, scr)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), ck.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cv.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk8, k8.data(), k8.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv8, v8.data(), v8.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk4, k4.data(), k4.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv4, v4.data(), v4.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dks, ks.data(), ks.size() * 4, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dvs, vs.data(), vs.size() * 4, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dpt, pt.data(), pt.size() * 4, cudaMemcpyHostToDevice));
+  const float scale = 0.0078125f * 8.0f;
+  const char* const names[] = {"bf16", "KV8", "KV4"};
+  for (int fmt = 0; fmt < 3; ++fmt) {
+    for (const int base : {100, 1777}) {  // short (one row per block) and long contexts
+    for (const int R : {2, 7, 13}) {
+      for (const bool paged : {false, true}) {
+        const int* t = paged ? dpt : nullptr;
+        auto call = [&](const std::uint16_t* qp, int kvb, int rows, std::uint16_t* out) {
+          if (fmt == 0)
+            return granite4::attn_split(qp, dk, dv, scale, Hq, Hk, d, kvb, nullptr, rows, stride,
+                                        scratch, out, nullptr, nullptr, nullptr, nullptr, false,
+                                        nullptr, nullptr, false, t, max_len);
+          if (fmt == 1)
+            return granite4::attn_split(qp, nullptr, nullptr, scale, Hq, Hk, d, kvb, nullptr,
+                                        rows, stride, scratch, out, dk8, dv8, dks, dvs, true,
+                                        nullptr, nullptr, false, t, max_len);
+          return granite4::attn_split(qp, nullptr, nullptr, scale, Hq, Hk, d, kvb, nullptr, rows,
+                                      stride, scratch, out, nullptr, nullptr, dks, dvs, false,
+                                      dk4, dv4, true, t, max_len);
+        };
+        const std::string tag = std::string("attn_split rows [") + names[fmt] + " R=" +
+                                std::to_string(R) + " base=" + std::to_string(base) +
+                                (paged ? " paged" : "") + "]: ";
+        expect(call(dq, base, R, dmulti) == 0, (tag + "multi-row launch").c_str());
+        bool launches = true;
+        for (int r = 0; r < R; ++r)
+          launches = launches &&
+                     call(dq + static_cast<std::size_t>(r) * Hq * d, base + r, 1,
+                          dsingle + static_cast<std::size_t>(r) * Hq * d) == 0;
+        expect(launches, (tag + "single-row launches").c_str());
+        std::vector<std::uint16_t> a(static_cast<std::size_t>(R) * Hq * d), b(a.size());
+        CUDA_CHECK(cudaMemcpy(a.data(), dmulti, a.size() * 2, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(b.data(), dsingle, b.size() * 2, cudaMemcpyDeviceToHost));
+        expect(std::memcmp(a.data(), b.data(), a.size() * 2) == 0,
+               (tag + "R-row call bit-identical to R single-row calls").c_str());
+      }
+    }
+    }
+  }
+  std::printf("  attn_split rows: multi-row == single-row (bf16/KV8/KV4, R=2/7/13, paged)\n");
+  cudaFree(dk); cudaFree(dv); cudaFree(dk8); cudaFree(dv8); cudaFree(dk4); cudaFree(dv4);
+  cudaFree(dks); cudaFree(dvs); cudaFree(dq); cudaFree(dmulti); cudaFree(dsingle);
+  cudaFree(dpt); cudaFree(scratch);
+}
 int main() {
   int n = 0;
   if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -2859,6 +2959,7 @@ int main() {
   test_batched_rope_device();
   test_batched_forward_range_parity_device();
   test_shared_arena_sessions_device();
+  test_attn_split_rows_bit_identical_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();
