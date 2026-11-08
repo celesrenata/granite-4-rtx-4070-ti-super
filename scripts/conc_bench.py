@@ -68,7 +68,7 @@ def main():
     ap.add_argument("--families", default="chat,novel,serving")
     a = ap.parse_args()
     tok = tokenizer.ByteBPE(Path(a.ckpt) / "tokenizer.json")
-    chat = [c["turns"][0] for c in json.load(open(a.prompts))[1700:1712]]
+    chat = [c["turns"][0] for c in json.load(open(a.prompts))[-12:]]
     serving = [d["prompt"] for d in json.load(open(
         "/opt/granite4-rtx-4070-ti-super/eagle/ds/serving/eval.json"))][:12]
     allf = {"chat": chat, "novel": NOVEL, "serving": serving}

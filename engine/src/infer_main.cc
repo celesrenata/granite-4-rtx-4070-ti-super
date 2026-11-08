@@ -799,6 +799,18 @@ double eagle_min_accept() {
   }();
   return v;
 }
+// Drafts per session when several sessions draft in one batched round. Each
+// extra head step costs the whole batch a step, while deep drafts rarely
+// land: with r10 and 2 in flight, k=3 beat k=4/5/6 on chat/novel/serving
+// (196/188/229 vs 184/172/212 tok/s at k=6). Solo rounds keep --eagle-k.
+// G4_EAGLE_K_BATCHED overrides (values above --eagle-k have no effect).
+int eagle_batched_k() {
+  static const int v = [] {
+    const char* e = std::getenv("G4_EAGLE_K_BATCHED");
+    return e != nullptr ? std::max(1, std::atoi(e)) : 3;
+  }();
+  return v;
+}
 constexpr int kEagleProbeRounds = 4;
 constexpr double kEagleKeepAccept = 2.0;
 constexpr int kEagleBurst = 8;
@@ -899,9 +911,10 @@ class EagleRun {
 
   // ---- one round, in phases (so a scheduler can batch sessions) ----------
   // plan_k: drafts this round (0 = verify the anchor alone).
-  int plan_k() {
+  // cap: batched rounds draft fewer tokens (eagle_batched_k).
+  int plan_k(int cap = 1 << 30) {
     const int remaining = a_.max_tokens - static_cast<int>(gen_.size());
-    k_ = std::max(0, std::min({a_.eagle_k, remaining - 1, s_.max_pos() - L_ - 2}));
+    k_ = std::max(0, std::min({a_.eagle_k, cap, remaining - 1, s_.max_pos() - L_ - 2}));
     r_t0_ = std::chrono::steady_clock::now();
     return k_;
   }
@@ -1818,7 +1831,7 @@ int gpu_serve_cmd(const Args& cli) {
     int kmax = 0;
     std::vector<int> ks;
     for (Job* j : ej) {
-      ks.push_back(j->eagle->plan_k());
+      ks.push_back(j->eagle->plan_k(ej.size() > 1 ? eagle_batched_k() : 1 << 30));
       kmax = std::max(kmax, ks.back());
     }
     // Head steps, batched across sessions (falls back to per-session calls
