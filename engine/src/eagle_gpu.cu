@@ -200,12 +200,23 @@ struct EagleHead {
   std::uint16_t* scratch = nullptr;  // per-row buffers for kMaxVerifyRows rows
   std::uint16_t* logits = nullptr;   // [Vd]
   int written = 0;
-  std::vector<void*> allocs;
+  // Shared draft-KV pool (P4). kv_stride is the arena's rows per head: the
+  // whole pool for a paged head, max_pos for a private one. A paged head's
+  // draft KV lives in the SAME rows as its session's main KV - one row table
+  // (the target context's d_pt) addresses both pools - so pages shared or
+  // handed back at the main-cache level cover the draft cache too.
+  int kv_stride = 0;
+  GpuCtx* target = nullptr;  // paged: the session whose row table addresses the KV
+  bool paged = false;
+  bool owns_tables = true;  // cos/sin: a forked session head borrows the base's
+  std::vector<void*> allocs;  // owned allocations (a fork lists only its own)
 
   ~EagleHead() {
     for (void* p : allocs) cudaFree(p);
-    cudaFree(cos_tbl);
-    cudaFree(sin_tbl);
+    if (owns_tables) {
+      cudaFree(cos_tbl);
+      cudaFree(sin_tbl);
+    }
   }
   template <class T>
   bool alloc(T** p, std::size_t bytes, std::string* err) {
@@ -294,7 +305,11 @@ std::size_t row_elems(const EagleHead& h) {
 }  // namespace
 
 EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig& cfg,
-                      const ForwardSpec& spec, int max_pos, std::string* err) {
+                      const ForwardSpec& spec, int max_pos, std::string* err, int kv_rows) {
+  if (kv_rows != 0 && kv_rows < max_pos) {
+    *err = "eagle head: kv_rows must cover max_pos";
+    return nullptr;
+  }
   TensorManifest man;
   if (!parse_safetensors_file(path, &man, err)) return nullptr;
   auto h = std::make_unique<EagleHead>();
@@ -307,6 +322,12 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
   h->eps = spec.rms_norm_eps;
   h->att_scale = spec.attention_multiplier;
   h->max_pos = max_pos;
+  // kv_rows > 0: the draft KV is one shared arena of kv_rows positions per
+  // head, addressed through `target`'s row table (this head serves that
+  // session; eagle_fork adds the others). 0: a private [max_pos] cache.
+  h->kv_stride = kv_rows > 0 ? kv_rows : max_pos;
+  h->paged = kv_rows > 0;
+  h->target = h->paged ? target : nullptr;
   const std::int64_t H = h->H, I = h->I, nq = h->Hq * h->d, nk = h->Hk * h->d;
   HostTensor t;
   struct W {
@@ -391,11 +412,11 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
         h->Hq == 4 * h->Hk)
       h->kv_bits = static_cast<int>(v);
   }
-  const std::size_t kv = static_cast<std::size_t>(h->Hk) * max_pos * h->d * 2;
-  const std::size_t kv_quant = static_cast<std::size_t>(h->Hk) * max_pos *
+  const std::size_t kv = static_cast<std::size_t>(h->Hk) * h->kv_stride * h->d * 2;
+  const std::size_t kv_quant = static_cast<std::size_t>(h->Hk) * h->kv_stride *
                                static_cast<std::size_t>(h->d);
   const std::size_t kv4_quant = kv_quant / 2;
-  const std::size_t kv_scale = static_cast<std::size_t>(h->Hk) * max_pos * 4;
+  const std::size_t kv_scale = static_cast<std::size_t>(h->Hk) * h->kv_stride * 4;
   bool ok = true;
   switch (h->kv_bits) {
   case 8:
@@ -427,6 +448,42 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
 }
 
 void eagle_free(EagleHead* h) { delete h; }
+
+EagleHead* eagle_fork(const EagleHead* base, GpuCtx* target, std::string* err) {
+  if (base == nullptr || target == nullptr || !base->paged) {
+    *err = "eagle fork: needs a paged base head (eagle_load with kv_rows > 0)";
+    return nullptr;
+  }
+  if (gpu_ctx_kv_stride(target) != base->kv_stride) {
+    *err = "eagle fork: the session's KV rows differ from the head's draft pool";
+    return nullptr;
+  }
+  // Share the weights, tables and the draft-KV arena; own the per-session
+  // scratch, logits and watermark.
+  auto h = std::make_unique<EagleHead>(*base);
+  h->allocs.clear();  // the copy must not free what the base owns
+  h->owns_tables = false;
+  h->attn_scratch = nullptr;
+  h->scratch = nullptr;
+  h->logits = nullptr;
+  h->written = 0;
+  h->target = target;
+  if (!h->alloc(&h->attn_scratch,
+                attn_split_scratch_bytes(h->Hq, kMaxVerifyRows, h->max_pos), err) ||
+      !h->alloc(&h->scratch, row_elems(*h) * kMaxVerifyRows * 2, err) ||
+      !h->alloc(&h->logits, static_cast<std::size_t>(h->Vd) * 2, err))
+    return nullptr;
+  return h.release();
+}
+std::size_t eagle_kv_bytes(const EagleHead* h) {
+  if (h == nullptr) return 0;
+  const std::size_t rows = static_cast<std::size_t>(h->Hk) * h->kv_stride;
+  switch (h->kv_bits) {
+    case 8: return 2 * rows * (h->d + 4);
+    case 4: return 2 * rows * (h->d / 2 + 4);
+    default: return 2 * rows * h->d * 2;
+  }
+}
 void eagle_truncate(EagleHead* h, int written) {
   if (h != nullptr && written >= 0 && written < h->written) h->written = written;
 }
@@ -441,6 +498,10 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
                   const std::uint16_t* d_feat, std::uint16_t* d_feat_out,
                   std::int32_t* d_draft_out) {
   if (h == nullptr || rows < 1 || pos0 != h->written || pos0 + rows > h->max_pos) return -1;
+  // Paged: the draft KV rows are the session's main-cache rows; never write
+  // or read past the positions the host has mapped for it.
+  if (h->target != nullptr && pos0 + rows > gpu_ctx_mapped_rows(h->target)) return -1;
+  const int* const d_pt = h->target != nullptr ? gpu_ctx_kv_rows_device(h->target) : nullptr;
   const int H = h->H, I = h->I, nq = h->Hq * h->d, nk = h->Hk * h->d, half = h->d / 2;
   for (int c0 = 0; c0 < rows; c0 += kMaxVerifyRows) {
     const int R = std::min(kMaxVerifyRows, rows - c0);
@@ -478,27 +539,29 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
         return -1;
       if (h->kv_bits == 8) {
         if (granite4_kernel_kv_append_int8_batched(kr, v, h->kv8_k, h->kv8_v, h->kv8_k_scale,
-                                                  h->kv8_v_scale, p, R, h->max_pos, h->Hk,
-                                                  h->d, nullptr) != 0 ||
+                                                  h->kv8_v_scale, p, R, h->kv_stride, h->Hk,
+                                                  h->d, d_pt) != 0 ||
             attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
-                       h->max_pos, h->attn_scratch, att, h->kv8_k, h->kv8_v, h->kv8_k_scale,
-                       h->kv8_v_scale, true, nullptr, nullptr, false) != 0)
+                       h->kv_stride, h->attn_scratch, att, h->kv8_k, h->kv8_v, h->kv8_k_scale,
+                       h->kv8_v_scale, true, nullptr, nullptr, false, d_pt, h->max_pos) != 0)
           return -1;
       } else {
         if (granite4_kernel_kv_append_int4_batched(kr, v, h->kv4_k, h->kv4_v, h->kv4_k_scale,
-                                                  h->kv4_v_scale, p, R, h->max_pos, h->Hk,
-                                                  h->d, nullptr) != 0 ||
+                                                  h->kv4_v_scale, p, R, h->kv_stride, h->Hk,
+                                                  h->d, d_pt) != 0 ||
             attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
-                       h->max_pos, h->attn_scratch, att, nullptr, nullptr, h->kv4_k_scale,
-                       h->kv4_v_scale, false, h->kv4_k, h->kv4_v, true) != 0)
+                       h->kv_stride, h->attn_scratch, att, nullptr, nullptr, h->kv4_k_scale,
+                       h->kv4_v_scale, false, h->kv4_k, h->kv4_v, true, d_pt,
+                       h->max_pos) != 0)
           return -1;
       }
     } else if (granite4_kernel_verify_qkv_stage(
                    q, k, v, h->cos_tbl + static_cast<std::size_t>(p) * half,
                    h->sin_tbl + static_cast<std::size_t>(p) * half, p, R, h->Hq, h->Hk, h->d,
-                   h->max_pos, qr, kr, h->kv_k, h->kv_v, nullptr) != 0 ||
+                   h->kv_stride, qr, kr, h->kv_k, h->kv_v, d_pt) != 0 ||
                attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
-                          h->max_pos, h->attn_scratch, att) != 0) {
+                          h->kv_stride, h->attn_scratch, att, nullptr, nullptr, nullptr,
+                          nullptr, false, nullptr, nullptr, false, d_pt, h->max_pos) != 0) {
       return -1;
     }
     if (granite4_verify_gemv_resid(att, h->wo, h->sc[4], x, 1.0f, R, H, nq, hh) != 0 ||

@@ -66,6 +66,29 @@ class KvPoolController {
   // that did not cross a page boundary.
   void commit(int slot, const PagedKV::Tokens& all_tokens);
 
+  // --- resident-session lifecycle (no prefix cache) ---------------------------
+  // The serve loop keeps one resident conversation per slot and resumes it
+  // from its own watermark, so it needs exclusive pages it can grow and give
+  // back - not the content-addressed sharing prefill() sets up. These never
+  // match or register cached pages, so a page is only ever written by the
+  // slot that owns it.
+  //
+  // Make the slot live (idempotent) and return its id, or -1 when the pool
+  // has no sequence capacity left.
+  int open_slot();
+  // Grow the slot to hold at least `n_tokens` tokens (page-granular, the new
+  // pages are private and exclusive). Existing pages and their rows are never
+  // moved, so a resident conversation's KV stays valid. false = the pool
+  // cannot hold it; nothing changed.
+  bool ensure(int slot, std::size_t n_tokens);
+  // Hand back every page past the first `n_tokens` tokens (the slot keeps the
+  // pages that cover them).
+  void trim(int slot, std::size_t n_tokens);
+  // Drop all of the slot's pages (its resident KV is no longer valid).
+  void drop(int slot);
+  // Pages needed beyond what the slot holds to reach `n_tokens`.
+  std::size_t pages_missing(int slot, std::size_t n_tokens) const;
+  std::size_t slot_pages(int slot) const;
   // --- device row table (the paged kernels' d_pt) ----------------------------
   // Fill `out` with the physical arena row for each logical position [0, n)
   // of the slot's sequence. n must be <= committed(slot). The mapping is a

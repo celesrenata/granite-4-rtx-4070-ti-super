@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "device_math.cuh"
@@ -168,7 +169,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const float* cache_v_scale = nullptr, bool int8 = false,
                const std::uint8_t* cache_k4 = nullptr,
                const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
-               const int* d_pt = nullptr);
+               const int* d_pt = nullptr, int max_len = 0);
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                       int base_pos, int rows, int stride, std::uint16_t* out,
@@ -2601,6 +2602,223 @@ static void test_batched_forward_range_parity_device() {
   gpu_ctx_free(batch_ctx);
 }
 
+// Two sessions on ONE shared KV arena (P4): each context's KV lives in
+// interleaved, non-contiguous rows of the same pool, the contexts are driven
+// alternately (prefill, decode, a batched verify width), and every logits row
+// must equal - bit for bit - what a private [max_pos] cache produces for the
+// same tokens. Covers all three persistent-KV formats (bf16, KV8, KV4), the
+// unmapped-row guard, row-table validation, and a shared prefill scratch.
+static void test_shared_arena_sessions_device() {
+  ModelConfig model;
+  model.num_layers = 2;
+  model.hidden_size = 512;  // == Hq * d, as the synthetic q projection assumes
+  model.intermediate_size = 256;
+  model.num_attention_heads = 4;
+  model.num_key_value_heads = 1;
+  model.head_dim = 128;  // split-KV attention shape (d == 128, Hq == 4 * Hk)
+  model.vocab_size = 512;
+  model.max_context_length = 131072;
+  ForwardSpec spec;
+  const int L = 2, H = 512, I = 256, Hq = 4, Hk = 1, d = 128, V = 512;
+  const int max_pos = 64, arena_rows = 192;
+  const auto z = [](int v) { return static_cast<std::size_t>(v); };
+  const GpuWeightsLayout lay{z(H), z(I), z(V), z(L), z(Hq), z(Hk), z(d)};
+  Xorshift64 rng(0xA7E4A);
+  std::vector<std::uint8_t> weights(lay.total_bytes());
+  auto fill_bf16 = [&](std::size_t off, std::size_t elems) {
+    for (std::size_t i = 0; i < elems; ++i) {
+      const std::uint16_t v = gen_bf16(rng);
+      weights[off + 2 * i] = static_cast<std::uint8_t>(v & 0xffu);
+      weights[off + 2 * i + 1] = static_cast<std::uint8_t>(v >> 8);
+    }
+  };
+  auto fill_fp8 = [&](std::size_t off, std::size_t elems) {
+    for (std::size_t i = 0; i < elems; ++i)
+      weights[off + i] = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  };
+  fill_bf16(0, z(V) * H);
+  for (int layer = 0; layer < L; ++layer) {
+    const std::size_t base = lay.embed_bytes() + z(layer) * lay.layer_bytes();
+    fill_bf16(base + lay.off_attn_norm(), H);
+    fill_bf16(base + lay.off_ffn_norm(), H);
+    fill_fp8(base + lay.off_q(), z(H) * H);
+    fill_fp8(base + lay.off_k(), z(Hk) * d * H);
+    fill_fp8(base + lay.off_v(), z(Hk) * d * H);
+    fill_fp8(base + lay.off_o(), z(H) * H);
+    fill_fp8(base + lay.off_gate(), z(I) * H);
+    fill_fp8(base + lay.off_up(), z(I) * H);
+    fill_fp8(base + lay.off_down(), z(H) * I);
+  }
+  fill_bf16(lay.final_norm_off(), H);
+  fill_fp8(lay.lm_head_off(), z(V) * H);
+  std::vector<float> scales(lay.num_scales());
+  for (auto& s : scales) s = 0.1f + 0.9f * rng.next_float_range(1.0);
+
+  const int seq_len = 32;
+  std::vector<std::int32_t> tok[2];
+  for (int s = 0; s < 2; ++s) {
+    tok[s].resize(seq_len);
+    for (int i = 0; i < seq_len; ++i) tok[s][i] = (i * (s == 0 ? 97 : 57) + (s == 0 ? 13 : 201)) % V;
+  }
+  std::int32_t* d_tok[2] = {nullptr, nullptr};
+  std::uint16_t* d_logits = nullptr;
+  bool alloc_ok = cudaMalloc(&d_logits, z(max_pos) * V * 2) == cudaSuccess;
+  for (int s = 0; s < 2; ++s) {
+    alloc_ok = alloc_ok && cudaMalloc(&d_tok[s], z(seq_len) * 4) == cudaSuccess;
+    if (alloc_ok)
+      CUDA_CHECK(cudaMemcpy(d_tok[s], tok[s].data(), z(seq_len) * 4, cudaMemcpyHostToDevice));
+  }
+  if (!alloc_ok) {
+    ++g_failures;
+    return;
+  }
+  // 20-row prefill, two single decodes, an 8-row batched verify, a decode.
+  const int ends[] = {20, 21, 22, 30, 31};
+  constexpr int kSteps = 5;
+  char err[256];
+  const char* const modes[] = {"0", "1", "4"};
+  const char* const mode_name[] = {"bf16", "KV8", "KV4"};
+  for (int m = 0; m < 3; ++m) {
+    setenv("G4_KV8", modes[m], 1);
+    std::string tag = std::string("shared arena [") + mode_name[m] + "]: ";
+    // Reference: one private-cache context, run once per token sequence.
+    GpuCtx* ref = gpu_ctx_create(model, spec, max_pos);
+    expect(ref != nullptr, (tag + "ref ctx").c_str());
+    if (ref == nullptr ||
+        gpu_weights_load(ref, weights.data(), weights.size(), scales.data(), scales.size(), err,
+                         sizeof(err)) != 0) {
+      ++g_failures;
+      gpu_ctx_free(ref);
+      continue;
+    }
+    std::vector<std::uint16_t> want[2];
+    for (int s = 0; s < 2; ++s) {
+      expect(gpu_ctx_truncate(ref, 0) == 0, (tag + "ref reset").c_str());
+      for (int e = 0; e < kSteps; ++e) {
+        const int prev = e > 0 ? ends[e - 1] : 0;
+        const bool ok = gpu_forward_range(ref, d_tok[s], ends[e], d_logits, err, sizeof(err)) == 0;
+        expect(ok, (tag + "ref forward").c_str());
+        if (!ok) break;
+        std::vector<std::uint16_t> rows(z(ends[e] - prev) * V);
+        CUDA_CHECK(cudaMemcpy(rows.data(), d_logits + z(prev) * V, rows.size() * 2,
+                              cudaMemcpyDeviceToHost));
+        want[s].insert(want[s].end(), rows.begin(), rows.end());
+      }
+    }
+    gpu_ctx_free(ref);
+    // The shared arena, one weight object, and two contexts on them.
+    GpuKvArena* arena = gpu_kv_arena_create(model, arena_rows, err, sizeof(err));
+    GpuWeights* wobj = gpu_weights_create();
+    expect(arena != nullptr && wobj != nullptr, (tag + "arena + weights").c_str());
+    if (arena == nullptr || wobj == nullptr ||
+        gpu_weights_load(wobj, weights.data(), weights.size(), scales.data(), scales.size(), err,
+                         sizeof(err)) != 0) {
+      ++g_failures;
+      gpu_kv_arena_free(arena);
+      gpu_weights_free_obj(wobj);
+      continue;
+    }
+    expect(gpu_ctx_create_paged(model, spec, arena_rows + 1, arena) == nullptr,
+           (tag + "a context longer than the pool is rejected").c_str());
+    GpuCtx* c[2];
+    for (int s = 0; s < 2; ++s) {
+      c[s] = gpu_ctx_create_paged(model, spec, max_pos, arena);
+      expect(c[s] != nullptr && gpu_ctx_use_weights(c[s], wobj) == 0,
+             (tag + "paged ctx").c_str());
+    }
+    if (c[0] == nullptr || c[1] == nullptr) {
+      ++g_failures;
+      gpu_ctx_free(c[0]);
+      gpu_ctx_free(c[1]);
+      gpu_kv_arena_free(arena);
+      gpu_weights_free_obj(wobj);
+      continue;
+    }
+    expect(gpu_ctx_share_prefill_scratch(c[1], c[0]) == 0, (tag + "share prefill scratch").c_str());
+    // Unmapped contexts must refuse to run.
+    expect(gpu_forward_range(c[0], d_tok[0], 5, d_logits, err, sizeof(err)) != 0,
+           (tag + "forward before mapping rows is rejected").c_str());
+    // Row tables: A on the even rows, B on the odd rows in descending order -
+    // interleaved and non-contiguous inside one arena.
+    std::vector<int> rows_a(max_pos), rows_b(max_pos);
+    for (int i = 0; i < max_pos; ++i) {
+      rows_a[i] = 2 * i;
+      rows_b[i] = 2 * (max_pos - 1 - i) + 1;
+    }
+    std::vector<int> dup = rows_a;
+    dup[7] = dup[3];
+    std::vector<int> oob = rows_a;
+    oob[5] = arena_rows;
+    expect(gpu_ctx_set_kv_rows_n(c[0], dup.data(), max_pos) != 0,
+           (tag + "duplicate rows rejected").c_str());
+    expect(gpu_ctx_set_kv_rows_n(c[0], oob.data(), max_pos) != 0,
+           (tag + "out-of-pool row rejected").c_str());
+    expect(gpu_ctx_set_kv_rows_n(c[0], rows_a.data(), max_pos + 1) != 0,
+           (tag + "more rows than max_pos rejected").c_str());
+    expect(gpu_ctx_mapped_rows(c[0]) == 0, (tag + "failed maps leave it unmapped").c_str());
+    expect(gpu_ctx_set_kv_rows_n(c[0], rows_a.data(), max_pos) == 0 &&
+               gpu_ctx_set_kv_rows_n(c[1], rows_b.data(), 40) == 0,
+           (tag + "map rows").c_str());
+    expect(gpu_forward_range(c[1], d_tok[1], 41, d_logits, err, sizeof(err)) != 0,
+           (tag + "forward past the mapped rows is rejected").c_str());
+    expect(gpu_ctx_set_kv_rows_n(c[1], rows_b.data(), max_pos) == 0, (tag + "remap B").c_str());
+    // Alternate the two sessions step by step; capture each fresh logits row
+    // block right after the forward that wrote it.
+    std::vector<std::uint16_t> got[2];
+    bool ran = true;
+    for (int e = 0; e < kSteps && ran; ++e) {
+      const int prev = e > 0 ? ends[e - 1] : 0;
+      for (int s = 0; s < 2; ++s) {
+        ran = gpu_forward_range(c[s], d_tok[s], ends[e], d_logits, err, sizeof(err)) == 0;
+        expect(ran, (tag + "paged forward").c_str());
+        if (!ran) break;
+        std::vector<std::uint16_t> rows(z(ends[e] - prev) * V);
+        CUDA_CHECK(cudaMemcpy(rows.data(), d_logits + z(prev) * V, rows.size() * 2,
+                              cudaMemcpyDeviceToHost));
+        got[s].insert(got[s].end(), rows.begin(), rows.end());
+      }
+    }
+    bool all_same = true;
+    for (int s = 0; s < 2; ++s) {
+      const bool same = got[s].size() == want[s].size() && !want[s].empty() &&
+                        std::memcmp(got[s].data(), want[s].data(), want[s].size() * 2) == 0;
+      expect(same, (tag + "session " + std::to_string(s) +
+                    " logits are bit-identical to a private cache").c_str());
+      all_same = all_same && same;
+    }
+    if (all_same)
+      std::printf("  shared arena [%s]: 2 interleaved sessions (%zu logits each) "
+                  "bit-identical to private caches\n",
+                  mode_name[m], got[0].size());
+    // Rollback + recompute on a shared arena (the draft-loop rejection path):
+    // truncate A, re-forward the same range, and B's rows must be untouched.
+    if (ran) {
+      std::vector<std::uint16_t> before(z(V)), after(z(V));
+      expect(gpu_ctx_truncate(c[0], 25) == 0, (tag + "truncate A").c_str());
+      expect(gpu_forward_range(c[0], d_tok[0], 31, d_logits, err, sizeof(err)) == 0,
+             (tag + "recompute A").c_str());
+      CUDA_CHECK(cudaMemcpy(after.data(), d_logits + z(30) * V, z(V) * 2, cudaMemcpyDeviceToHost));
+      std::vector<std::uint16_t> want_last(want[0].end() - V, want[0].end());
+      expect(std::memcmp(after.data(), want_last.data(), z(V) * 2) == 0,
+             (tag + "recompute after truncate matches").c_str());
+      expect(gpu_ctx_truncate(c[1], 25) == 0, (tag + "truncate B").c_str());
+      expect(gpu_forward_range(c[1], d_tok[1], 31, d_logits, err, sizeof(err)) == 0,
+             (tag + "recompute B").c_str());
+      CUDA_CHECK(cudaMemcpy(after.data(), d_logits + z(30) * V, z(V) * 2, cudaMemcpyDeviceToHost));
+      std::vector<std::uint16_t> want_last_b(want[1].end() - V, want[1].end());
+      expect(std::memcmp(after.data(), want_last_b.data(), z(V) * 2) == 0,
+             (tag + "B unaffected by A's recompute").c_str());
+    }
+    gpu_ctx_free(c[1]);  // sharer before the scratch owner
+    gpu_ctx_free(c[0]);
+    gpu_kv_arena_free(arena);
+    gpu_weights_free_obj(wobj);
+  }
+  unsetenv("G4_KV8");
+  cudaFree(d_logits);
+  cudaFree(d_tok[0]);
+  cudaFree(d_tok[1]);
+}
 int main() {
   int n = 0;
   if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -2640,6 +2858,7 @@ int main() {
   test_batched_rmsnorm_device();
   test_batched_rope_device();
   test_batched_forward_range_parity_device();
+  test_shared_arena_sessions_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();

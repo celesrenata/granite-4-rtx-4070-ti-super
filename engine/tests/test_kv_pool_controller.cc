@@ -295,7 +295,74 @@ static void test_shutdown() {
   expect(c.cached_pages() == 0, "cache emptied");
 }
 
+// Resident-session lifecycle: two sessions grow inside one pool, never share a
+// row, keep their rows stable as they grow, and give pages back when trimmed.
+static void test_resident_two_sessions_one_pool() {
+  KvPoolController c(small_pool());  // 4 pages x 4 rows
+  const int a = c.open_slot();
+  const int b = c.open_slot();
+  expect(a >= 0 && b >= 0 && a != b, "two resident slots");
+  expect(c.ensure(a, 8), "A grows to 2 pages");
+  expect(c.ensure(b, 8), "B grows to 2 pages (pool now full)");
+  expect(c.free_pages() == 0, "pool full");
+  int ra[8], rb[8];
+  expect(c.row_table(a, 8, ra) && c.row_table(b, 8, rb), "row tables");
+  std::vector<bool> seen(16, false);
+  bool disjoint = true;
+  for (int i = 0; i < 8; ++i) {
+    if (seen[ra[i]]) disjoint = false;
+    seen[ra[i]] = true;
+  }
+  for (int i = 0; i < 8; ++i) {
+    if (seen[rb[i]]) disjoint = false;
+    seen[rb[i]] = true;
+  }
+  expect(disjoint, "A and B never share an arena row");
+  // The pool is exhausted: neither can grow, and a failed grow changes nothing.
+  expect(!c.ensure(a, 12), "A cannot grow past the pool");
+  expect(c.committed(a) == 8, "failed grow leaves A untouched");
+  int ra2[8];
+  expect(c.row_table(a, 8, ra2), "A row table after failed grow");
+  bool same = true;
+  for (int i = 0; i < 8; ++i) same = same && ra[i] == ra2[i];
+  expect(same, "A rows unchanged by a failed grow");
+  // B hands back its second page; A can then grow, and A's old rows hold still.
+  c.trim(b, 4);
+  expect(c.free_pages() == 1, "trim returned B's tail page");
+  expect(c.ensure(a, 12), "A grows into the returned page");
+  int ra3[12];
+  expect(c.row_table(a, 12, ra3), "A 12-row table");
+  same = true;
+  for (int i = 0; i < 8; ++i) same = same && ra[i] == ra3[i];
+  expect(same, "growing A never moves its committed rows");
+  expect(rows_valid(ra3, 12, c.pool_pages(), c.tokens_per_page()),
+         "A table is a valid arena table");
+  int rb2[4];
+  expect(c.row_table(b, 4, rb2), "B keeps its first page");
+  same = true;
+  for (int i = 0; i < 4; ++i) same = same && rb[i] == rb2[i];
+  expect(same, "trimming B never moves its kept rows");
+}
+static void test_resident_drop_and_missing() {
+  KvPoolController c(small_pool());
+  const int a = c.open_slot();
+  expect(c.pages_missing(a, 10) == 3, "10 tokens need 3 pages");
+  expect(c.ensure(a, 10), "grow to 10");
+  expect(c.slot_pages(a) == 3, "3 pages held");
+  expect(c.pages_missing(a, 12) == 0, "12 tokens fit the 3 pages");
+  expect(c.pages_missing(a, 13) == 1, "13 tokens need one more");
+  c.trim(a, 5);
+  expect(c.slot_pages(a) == 2, "trim to 5 tokens keeps 2 pages");
+  expect(c.committed(a) == 5, "trim lowers the filled count");
+  expect(c.ensure(a, 9), "regrow after trim");
+  c.drop(a);
+  expect(c.slot_pages(a) == 0, "drop returns every page");
+  expect(c.free_pages() == 4, "pool whole after drop");
+  expect(c.cached_pages() == 0, "resident pages are never cached");
+}
 int main() {
+  test_resident_two_sessions_one_pool();
+  test_resident_drop_and_missing();
   test_slot_capacity();
   test_prefill_fresh_and_rows();
   test_concurrent_prefix_reuse();

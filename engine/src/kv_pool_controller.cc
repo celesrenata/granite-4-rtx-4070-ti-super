@@ -103,6 +103,53 @@ std::size_t KvPoolController::last_reused(int slot) const {
   return slots_[slot].reused;
 }
 
+int KvPoolController::open_slot() {
+  const int slot = new_slot();
+  if (slot < 0) return -1;
+  slots_[slot].in_use = true;
+  return slot;
+}
+
+bool KvPoolController::ensure(int slot, std::size_t n_tokens) {
+  if (slot < 0 || slot >= static_cast<int>(slots_.size())) return false;
+  Slot& s = slots_[slot];
+  if (!s.in_use) return false;
+  if (n_tokens <= pool_.sequence_tokens(s.seq)) return true;
+  // reserve() wants the full token list; these pages are never registered in
+  // the prefix cache, so the ids are irrelevant placeholders.
+  const PagedKV::Tokens placeholder(n_tokens, 0u);
+  return pool_.reserve(s.seq, n_tokens, placeholder);
+}
+
+void KvPoolController::trim(int slot, std::size_t n_tokens) {
+  if (slot < 0 || slot >= static_cast<int>(slots_.size())) return;
+  Slot& s = slots_[slot];
+  if (!s.in_use) return;
+  pool_.truncate_sequence(s.seq, n_tokens);
+}
+
+void KvPoolController::drop(int slot) {
+  if (slot < 0 || slot >= static_cast<int>(slots_.size())) return;
+  Slot& s = slots_[slot];
+  if (!s.in_use) return;
+  pool_.reset_sequence(s.seq);
+  s.marked_pages = 0;
+  s.reused = 0;
+}
+
+std::size_t KvPoolController::slot_pages(int slot) const {
+  if (slot < 0 || slot >= static_cast<int>(slots_.size())) return 0;
+  const Slot& s = slots_[slot];
+  return s.in_use ? pool_.block_table(s.seq).size() : 0;
+}
+
+std::size_t KvPoolController::pages_missing(int slot, std::size_t n_tokens) const {
+  const std::size_t B = pool_.page_rows();
+  const std::size_t want = (n_tokens + B - 1) / B;
+  const std::size_t have = slot_pages(slot);
+  return want > have ? want - have : 0;
+}
+
 void KvPoolController::mark_new_full(Slot& s, std::size_t n_tokens) {
   const std::size_t B = pool_.page_rows();
   const std::size_t full = n_tokens / B;

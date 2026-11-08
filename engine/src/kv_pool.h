@@ -161,6 +161,16 @@ class PagedKV {
   // freed.
   void reset_sequence(int seq);
 
+  // Shrink a LIVE sequence to the pages that cover its first `n_tokens`
+  // tokens, dropping the references to every page past that (freeing those
+  // that reach ref count 0). The sequence stays live and keeps its first
+  // ceil(n_tokens / tokens_per_page) pages, so a serve slot can hand back the
+  // pages it reserved for tokens it never wrote. A kept page that is already
+  // in the prefix cache is full and shared, so it is never cut short: the
+  // sequence then keeps it whole (filled rounds up to the page boundary).
+  // No-op when the sequence already holds <= that many pages.
+  void truncate_sequence(int seq, std::size_t n_tokens);
+
   // Decrement every page the sequence references; free the pages that reach
   // ref count 0. The sequence becomes unusable.
   void release(int seq);

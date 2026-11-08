@@ -65,6 +65,44 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
 // Free a context and all its device memory.
 void gpu_ctx_free(GpuCtx* ctx);
 
+// ---------------------------------------------------------------------------
+// Shared paged KV arena (P4). One allocation holds the persistent KV cache of
+// every resident sequence; each context addresses it through its own
+// position -> arena-row table, so N sessions share one pool instead of each
+// owning a private [max_positions] cache.
+// ---------------------------------------------------------------------------
+struct GpuKvArena;
+// Allocate an arena of `rows` positions per (layer, kv head), in the format
+// G4_KV8 selects (unset/0 bf16, 1 int8, 4 int4). Needs split-KV attention
+// (d == 128, Hq == 4 * Hk). nullptr + `error` on failure.
+GpuKvArena* gpu_kv_arena_create(const ModelConfig& model, int rows, char* error,
+                                std::size_t error_size);
+void gpu_kv_arena_free(GpuKvArena* arena);
+std::size_t gpu_kv_arena_bytes(const GpuKvArena* arena);
+int gpu_kv_arena_rows(const GpuKvArena* arena);
+// Like gpu_ctx_create, but the context's KV lives in `arena` (not owned: the
+// caller keeps the arena alive for every context on it). max_positions is the
+// longest sequence the context may hold, <= the arena's rows. The context has
+// NO row mapping until gpu_ctx_set_kv_rows_n; forwards past the mapped
+// positions are rejected.
+GpuCtx* gpu_ctx_create_paged(const ModelConfig& model, const ForwardSpec& spec,
+                             int max_positions, GpuKvArena* arena);
+// Map the first n logical positions to arena rows (each in [0, arena rows) and
+// distinct within the table). 0 on success; -1 leaves the table untouched.
+int gpu_ctx_set_kv_rows_n(GpuCtx* ctx, const int* h_rows, int n);
+// Positions [0, mapped) of the context have a valid row.
+int gpu_ctx_mapped_rows(const GpuCtx* ctx);
+// Rows per (layer, head) of the context's KV cache (the arena's pool size).
+int gpu_ctx_kv_stride(const GpuCtx* ctx);
+// The context's device position -> row table (stable address for its life),
+// for kernels outside the forward pass (the EAGLE draft head) that must
+// address the same rows.
+const int* gpu_ctx_kv_rows_device(const GpuCtx* ctx);
+// Borrow `owner`'s prefill scratch (~0.8 GiB) instead of allocating one. Valid
+// only for contexts that never prefill concurrently (the serve loop runs one
+// request at a time). Call before the context's first prefill.
+int gpu_ctx_share_prefill_scratch(GpuCtx* ctx, GpuCtx* owner);
+
 // (See gpu_weights_load above for the weight-object upload; the
 // legacy per-ctx signatures below delegate to it.)
 

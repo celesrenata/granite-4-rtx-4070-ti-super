@@ -259,11 +259,14 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                std::uint16_t* out, const std::int8_t* cache_k8,
                const std::int8_t* cache_v8, const float* cache_k_scale,
                const float* cache_v_scale, bool int8, const std::uint8_t* cache_k4,
-               const std::uint8_t* cache_v4, bool int4, const int* d_pt) {
+               const std::uint8_t* cache_v4, bool int4, const int* d_pt, int max_len) {
+  // `stride` addresses the cache arena; the split layout follows the longest
+  // logical sequence (== stride for a private, contiguous cache).
+  const int ml = max_len > 0 ? max_len : stride;
   if (q == nullptr || scratch == nullptr || out == nullptr ||
       !std::isfinite(scale) || d != kD || Hk <= 0 || Hq != kG * Hk ||
-      rows <= 0 || rows > kMaxVerifyRows || stride <= 0 ||
-      (d_pos == nullptr && kv_base + rows > stride) ||
+      rows <= 0 || rows > kMaxVerifyRows || stride <= 0 || ml > stride ||
+      (d_pos == nullptr && kv_base + rows > ml) ||
       (int8 && int4) ||
       (int8 && (cache_k8 == nullptr || cache_v8 == nullptr ||
                 cache_k_scale == nullptr || cache_v_scale == nullptr)) ||
@@ -271,23 +274,23 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                 cache_k_scale == nullptr || cache_v_scale == nullptr)) ||
       (!int8 && !int4 && (cache_k == nullptr || cache_v == nullptr)))
     return -1;
-  const int tps = tiles_per_split(stride);
-  const int splits = ((stride + kTile - 1) / kTile + tps - 1) / tps;
-  float2* const ml = static_cast<float2*>(scratch);
-  float* const po = reinterpret_cast<float*>(ml + static_cast<std::size_t>(rows) * Hq * splits);
+  const int tps = tiles_per_split(ml);
+  const int splits = ((ml + kTile - 1) / kTile + tps - 1) / tps;
+  float2* const pml = static_cast<float2*>(scratch);
+  float* const po = reinterpret_cast<float*>(pml + static_cast<std::size_t>(rows) * Hq * splits);
   if (int8)
     attn_split_kernel<true, false><<<dim3(Hk, splits, rows), kThreads>>>(
-        q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, ml, po,
+        q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, pml, po,
         cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr, d_pt);
   else if (int4)
     attn_split_kernel<false, true><<<dim3(Hk, splits, rows), kThreads>>>(
-        q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, ml, po,
+        q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, pml, po,
         nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt);
   else
     attn_split_kernel<false, false><<<dim3(Hk, splits, rows), kThreads>>>(
-        q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, ml, po,
+        q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, pml, po,
         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, d_pt);
-  attn_combine_kernel<<<dim3(Hq, rows), kD>>>(ml, po, Hq, kv_base, d_pos, tps, splits, out);
+  attn_combine_kernel<<<dim3(Hq, rows), kD>>>(pml, po, Hq, kv_base, d_pos, tps, splits, out);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) {
     std::fprintf(stderr, "granite4: attn_split: %s\n", cudaGetErrorString(e));

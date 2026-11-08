@@ -309,6 +309,34 @@ void PagedKV::reset_sequence(int seq) {
   // reserve can be called again on the same id (serve-loop slot reuse).
 }
 
+void PagedKV::truncate_sequence(int seq, std::size_t n_tokens) {
+  if (seq < 0 || seq >= static_cast<int>(seqs_.size()) || !seqs_[seq].live) {
+    return;
+  }
+  Sequence& s = seqs_[seq];
+  const std::size_t B = config_.tokens_per_page;
+  const std::size_t keep = (n_tokens + B - 1) / B;
+  if (s.block_table.size() <= keep) {
+    s.filled = std::min(s.filled, n_tokens);
+    return;
+  }
+  for (std::size_t i = keep; i < s.block_table.size(); ++i) {
+    drop_ref(s.block_table[i]);
+  }
+  s.block_table.resize(keep);
+  s.filled = std::min(s.filled, n_tokens);
+  if (keep > 0) {
+    Page& last = pages_[s.block_table.back()];
+    if (last.in_cache) {
+      // A cached page is full and shared: keep it whole.
+      s.filled = keep * B;
+    } else {
+      const std::size_t in_last = s.filled > (keep - 1) * B ? s.filled - (keep - 1) * B : 0;
+      if (last.tokens.size() > in_last) last.tokens.resize(in_last);
+    }
+  }
+}
+
 void PagedKV::release(int seq) {
   if (seq < 0 || seq >= static_cast<int>(seqs_.size()) || !seqs_[seq].live) {
     return;

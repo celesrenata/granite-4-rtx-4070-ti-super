@@ -363,6 +363,32 @@
               type = lib.types.ints.positive;
               default = 8192;
             };
+            sessions = lib.mkOption {
+              description = ''
+                Resident conversations the GPU engine keeps at once. Each
+                session holds up to maxContext positions and has its own EAGLE
+                state; all of them share ONE KV pool (and one EAGLE draft-KV
+                pool in the same row space), so a conversation costs only the
+                pages it has written and an idle one gives the rest back. A
+                request goes to the session whose cached history is the
+                longest prefix of its prompt and resumes from there.
+                Requests still run one at a time.
+              '';
+              type = lib.types.ints.between 1 16;
+              default = 1;
+            };
+            kvPoolTokens = lib.mkOption {
+              description = ''
+                Size of the shared KV pool in positions (rounded up to a 64
+                position page). null: sessions x maxContext, so every session
+                can fill its whole context at once. A smaller pool
+                oversubscribes it: when it runs short the least recently used
+                other session's cache is dropped and that conversation
+                re-prefills on its next request. Must be >= maxContext.
+              '';
+              type = lib.types.nullOr lib.types.ints.positive;
+              default = null;
+            };
             kv8 = lib.mkOption {
               description = ''
                 Store the engine's persistent KV cache as int8 (Q8_0: per-row
@@ -466,6 +492,7 @@
               environment = lib.optionalAttrs serving ({
                 GRANITE4_GATE = gateFile;
                 GRANITE4_MAX_CONTEXT = toString cfg.maxContext;
+                GRANITE4_SESSIONS = toString cfg.sessions;
                 # Serve engine KV storage: G4_KV8 in {"0" bf16, "1" int8,
                 # "4" int4} (engine first-char dispatch: "4" selects the
                 # int4 KV path). The parity gate runs as ExecStartPre in
@@ -474,6 +501,8 @@
                 # this value only changes the *serve* engine's KV format,
                 # never what the gate validates.
                 G4_KV8 = if cfg.kv4 then "4" else (if cfg.kv8 then "1" else "0");
+              } // lib.optionalAttrs (cfg.kvPoolTokens != null) {
+                GRANITE4_KV_POOL_TOKENS = toString cfg.kvPoolTokens;
               } // lib.optionalAttrs (cfg.eagle.head != null) {
                 GRANITE4_EAGLE_HEAD = cfg.eagle.head;
                 GRANITE4_EAGLE_K = toString cfg.eagle.k;
