@@ -1623,6 +1623,20 @@ int first_out_row(const GpuForwardOut& out, int end) {
   return first;
 }
 
+// Copy chunk rows [c0, c0 + M) of the residual stream that fall in
+// [hidden_from, hidden_from + feat_rows) into feature slot k.
+int copy_feat_rows(const GpuForwardOut& out, int k, int c0, int M, const std::uint16_t* src,
+                   int H) {
+  const int h0 = hidden_from(out);
+  const int a = std::max(c0, h0), b = std::min(c0 + M, h0 + out.feat_rows);
+  if (b <= a) return 0;
+  std::uint16_t* dst = out.d_layer_feat +
+                       (static_cast<std::size_t>(k) * out.feat_rows + (a - h0)) * H;
+  return cudaMemcpyAsync(dst, src + static_cast<std::size_t>(a - c0) * H,
+                         static_cast<std::size_t>(b - a) * H * 2, cudaMemcpyDeviceToDevice,
+                         cudaStreamPerThread) == cudaSuccess ? 0 : -1;
+}
+
 bool wants_rows(const GpuForwardOut& out) {
   return out.d_logits != nullptr || out.d_hidden != nullptr;
 }
@@ -2304,8 +2318,16 @@ int forward_prefill(GpuCtx* g, const std::int32_t* d_tokens, int start, int end,
           prefill_gemm(GemmOut::kResidual, s.act, I, lw.wd, M, H, I, down, s.ws,
                        s.ws_bytes) != 0)
         return -1;
+      if (out.d_layer_feat != nullptr) {
+        // Multi-layer draft features: residual stream after this layer.
+        for (int k = 0; k < kMaxFeatLayers; ++k)
+          if (out.feat_layers[k] == layer && copy_feat_rows(out, k, c0, M, s.hidden, H) != 0)
+            return -1;
+      }
+    }
 
-    // Logits for the requested rows of this chunk only.
+    // Logits for the requested rows of this chunk only (once, after the
+    // last layer).
     const int first = std::max(c0, first_out_row(out, end));
     const int n = c0 + M - first;
     if (n <= 0) continue;
@@ -2314,7 +2336,6 @@ int forward_prefill(GpuCtx* g, const std::int32_t* d_tokens, int start, int end,
                                 s.normed + r0) != 0 ||
         emit_rows(out, first, c0 + M, s.normed + r0, H, V, hv.lm_head, hv.lm_scale) != 0)
       return -1;
-    }
   }
   return 0;
 }
@@ -2372,6 +2393,8 @@ int forward_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
     rc = forward_prefill(g, d_tokens, start, end, out);
     path = " (prefill)";
   }
+  if (rc != 0 && out.d_layer_feat != nullptr)
+    return seterr("layer features need the prefill path (>= 17 rows)");
   if (rc != 0) {
     path = "";
     if (forward_positions(g, d_tokens, start, end, out, bucketed) != 0)

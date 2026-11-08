@@ -68,6 +68,11 @@ class Records:
                        if need_hidden else None)
         if self.hidden is not None and self.hidden.shape[0] != tok:
             raise SystemExit(f"{root}: hidden rows {self.hidden.shape[0]} != tokens {tok}")
+        # Optional multi-layer features (dump-hidden --feat-layers): [tok][k][H]
+        self.feat = None
+        if need_hidden and (root / "feat.bin").exists():
+            f = np.memmap(root / "feat.bin", dtype=np.int16, mode="r")
+            self.feat = f.reshape(tok, -1, H)
 
     def __len__(self):
         return len(self.lengths)
@@ -78,6 +83,13 @@ class Records:
         mask = torch.from_numpy(self.mask[o:o + n].astype(np.bool_)) if self.mask is not None else None
         hid = torch.from_numpy(np.ascontiguousarray(self.hidden[o:o + n])).view(torch.bfloat16)
         return toks, mask, hid
+
+    def get_extra(self, r):
+        """[n, k, H] bf16 intermediate features, or None."""
+        if self.feat is None:
+            return None
+        n, o = self.lengths[r], self.offsets[r]
+        return torch.from_numpy(np.ascontiguousarray(self.feat[o:o + n])).view(torch.bfloat16)
 
 
 class RecordDataset(torch.utils.data.Dataset):
@@ -92,7 +104,8 @@ class RecordDataset(torch.utils.data.Dataset):
     def __getitem__(self, i):
         if self.rec is None:  # open per worker
             self.rec = Records(self.root)
-        return self.rec.get(i)
+        ex = self.rec.get_extra(i)
+        return (*self.rec.get(i), ex if ex is not None else torch.zeros(0))
 
 
 # --------------------------------------------------------------- model ----
@@ -118,8 +131,18 @@ def apply_rope(x, cos, sin):  # x [heads, n, D]; cos/sin [n, D/2]
 
 
 class EagleHead(nn.Module):
-    def __init__(self, final_norm_init=None, attn_scale=D ** -0.5):
+    def __init__(self, final_norm_init=None, attn_scale=D ** -0.5, n_extra=0):
         super().__init__()
+        # Multi-layer input (EAGLE-3 style): the first draft step's feature is
+        # fuse([ln_x0 low; ln_x1 mid; ln_h final]) instead of ln_h(final).
+        # fuse starts as [0 | 0 | I], so an older head loads unchanged.
+        self.n_extra = n_extra
+        if n_extra:
+            self.ln_x = nn.ModuleList(RMSNorm(H) for _ in range(n_extra))
+            self.fuse = nn.Linear((n_extra + 1) * H, H, bias=False)
+            with torch.no_grad():
+                self.fuse.weight.zero_()
+                self.fuse.weight[:, n_extra * H:].copy_(torch.eye(H))
         # Exported with the weights (engine eagle_gpu.cu reads it).
         self.register_buffer("attn_scale", torch.tensor([float(attn_scale)]))
         self.fc = nn.Linear(2 * H, H, bias=True)
@@ -139,6 +162,13 @@ class EagleHead(nn.Module):
         for m in (self.o, self.down):
             m.weight.data.mul_(0.5)
         nn.init.zeros_(self.fc.bias)
+
+    def feat1(self, fin, extra):
+        """Feature input of the first draft step (true target features)."""
+        if not self.n_extra or extra is None or extra.numel() == 0:
+            return self.ln_h(fin)
+        parts = [self.ln_x[k](extra[:, k]) for k in range(self.n_extra)] + [self.ln_h(fin)]
+        return self.fuse(torch.cat(parts, -1))
 
     def qkv(self, x, cos, sin):
         xn = self.ln1(x)
@@ -170,9 +200,10 @@ def masked_attention(q, k, v, mask, scale, chunk=256):
     return torch.cat(outs, 1)
 
 
-def unroll(head, emb_w, toks, feats, depth, cos, sin, noise=0.0, grad_ckpt=False):
+def unroll(head, emb_w, toks, feats, depth, cos, sin, noise=0.0, grad_ckpt=False, extra=None):
     """Predicted features per step: preds[d-1][i] ~ feature i + d, for the
-    chain started at entry i (i < n - d). toks [n], feats [n, H] (bf16)."""
+    chain started at entry i (i < n - d). toks [n], feats [n, H] (bf16),
+    extra [n, k, H] intermediate features (multi-layer heads) or None."""
     n = toks.shape[0]
     keys, vals, preds = [], [], []
     feat_in = feats[: n - 1]
@@ -188,7 +219,8 @@ def unroll(head, emb_w, toks, feats, depth, cos, sin, noise=0.0, grad_ckpt=False
         pos = torch.arange(d - 1, d - 1 + m, device=toks.device)
 
         def block(fin, tok_in, pos=pos, m=m, d=d):
-            x = head.fc(torch.cat([head.ln_e(F.embedding(tok_in, emb_w)), head.ln_h(fin)], -1))
+            g = head.feat1(fin, extra[:m] if extra is not None else None) if d == 1 else head.ln_h(fin)
+            x = head.fc(torch.cat([head.ln_e(F.embedding(tok_in, emb_w)), g], -1))
             q, k, v = head.qkv(x, cos[pos], sin[pos])
             return x, q, k, v
 
@@ -299,9 +331,11 @@ def eval_acceptance(head, frozen, vocab, rec: Records, depth, cos, sin, device, 
     for r in range(len(rec) if max_records is None else min(max_records, len(rec))):
         toks, mask, hid = rec.get(r)
         toks, hid = toks.to(device), hid.to(device)
+        ex = rec.get_extra(r) if head.n_extra else None
+        ex = ex.to(device) if ex is not None else None
         n = toks.shape[0]
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            preds = unroll(head, emb_w, toks, hid, depth, cos, sin)
+            preds = unroll(head, emb_w, toks, hid, depth, cos, sin, extra=ex)
         draft = [vocab_t[(p.to(torch.bfloat16) @ lm_sub.t()).argmax(-1)] for p in preds]
         # hit[d-1][i]: step d of the chain at entry i predicts toks[i + d + 1]
         hit = []
@@ -349,6 +383,8 @@ def main():
                     help="fine-tune: load head weights only (no optimizer state), restart step/scheduler at 0")
     ap.add_argument("--draft-vocab",
                     help="reuse an existing draft_vocab.npy instead of recomputing from --train")
+    ap.add_argument("--extra-layers", type=int, default=0,
+                    help="multi-layer head: number of intermediate features in feat.bin (0: final only)")
     ap.add_argument("--init-layer", type=int, default=-1,
                     help="initialize the head layer from this target layer (-1: random)")
     args = ap.parse_args()
@@ -370,7 +406,7 @@ def main():
     emb_w = frozen["model.embed_tokens.weight"]
     cos, sin = rope_tables(8192, device)
 
-    head = EagleHead(frozen["model.norm.weight"])
+    head = EagleHead(frozen["model.norm.weight"], n_extra=args.extra_layers)
     if args.init_layer >= 0:
         init_from_layer(head, args.ckpt, args.init_layer)
     head = head.to(device)
@@ -384,8 +420,10 @@ def main():
         step0 = st["step"]
     elif args.head:
         st = torch.load(args.head, map_location=device)
-        head.load_state_dict(st["head"])
-        print(f"fine-tune from {args.head} (step 0, fresh optimizer)", flush=True)
+        missing, unexpected = head.load_state_dict(st["head"], strict=False)
+        if unexpected or any(not k.startswith(("fuse.", "ln_x.")) for k in missing):
+            raise SystemExit(f"--head mismatch: missing {missing} unexpected {unexpected}")
+        print(f"fine-tune from {args.head} (step 0, fresh optimizer; new: {missing})", flush=True)
 
     ds = RecordDataset(args.train)
     total_steps = int(math.ceil(len(ds) * args.epochs / args.accum))
@@ -407,15 +445,19 @@ def main():
         g = torch.Generator().manual_seed(1000 + epoch)
         loader = torch.utils.data.DataLoader(ds, batch_size=None, shuffle=True, generator=g,
                                              num_workers=4, pin_memory=True, prefetch_factor=4)
-        for toks, mask, hid in loader:
+        for toks, mask, hid, ex in loader:
             toks, mask, hid = toks.to(device, non_blocking=True), mask.to(device), hid.to(device, non_blocking=True)
+            ex = ex.to(device, non_blocking=True) if (head.n_extra and ex.numel()) else None
+            if head.n_extra and ex is None:
+                raise SystemExit("multi-layer head needs feat.bin in every training record dir")
             n = toks.shape[0]
             if n < 8:
                 continue
             with torch.no_grad():
                 tgt_logits = (hid @ lm_sub.t()).float()  # [n, V'] target dist. over the draft vocab
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                preds = unroll(head, emb_w, toks, hid, args.depth, cos, sin, noise=noise, grad_ckpt=True)
+                preds = unroll(head, emb_w, toks, hid, args.depth, cos, sin, noise=noise,
+                               grad_ckpt=True, extra=ex)
                 loss = 0.0
                 for d, pred in enumerate(preds, start=1):
                     m = n - 1 - d  # entries with a next token to predict

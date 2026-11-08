@@ -102,8 +102,9 @@ using namespace granite4;
 namespace {
 
 struct Args {
-  std::string sub, dir, in, out, eagle;
+  std::string sub, dir, in, out, eagle, feat_out;
   std::vector<std::int32_t> tokens;
+  std::vector<int> feat_layers;  // dump-hidden: residual stream after these layers
   int max_tokens = 0, last = 0, gpu = 0, draft_k = 0, eagle_k = 0;
   long seed = 0;
   long eos = -1;  // stop token (-1: none)
@@ -159,6 +160,13 @@ bool parse_args(int argc, char** argv, Args* a) {
       a->in = argv[++i];
     } else if (s == "--out" && i + 1 < argc) {
       a->out = argv[++i];
+    } else if (s == "--feat-out" && i + 1 < argc) {
+      a->feat_out = argv[++i];
+    } else if (s == "--feat-layers" && i + 1 < argc) {
+      std::stringstream ss(argv[++i]);
+      std::string tok;
+      while (std::getline(ss, tok, ','))
+        if (!tok.empty()) a->feat_layers.push_back(std::stoi(tok));
     } else {
       return false;
     }
@@ -166,7 +174,8 @@ bool parse_args(int argc, char** argv, Args* a) {
   if (a->sub == "serve")
     return !a->dir.empty() && a->max_context > 0 && a->sessions > 0;
   if (a->sub == "dump-hidden")
-    return !a->dir.empty() && !a->in.empty() && !a->out.empty() && a->max_context > 0;
+    return !a->dir.empty() && !a->in.empty() && !a->out.empty() && a->max_context > 0 &&
+           a->feat_layers.size() <= 2 && a->feat_layers.empty() == a->feat_out.empty();
   if (a->sub == "kv-bench")
     return !a->dir.empty() && a->bench_ctx >= 2 && a->bench_decode > 0;
   return !a->sub.empty() && !a->dir.empty() && !a->tokens.empty();
@@ -262,6 +271,7 @@ class GpuSession {
     max_pos_ = max_pos;
     vocab_ = static_cast<int>(cfg.vocab_size);
     hidden_ = static_cast<int>(cfg.hidden_size);
+    layers_ = static_cast<int>(cfg.num_layers);
     logit_rows_ = logit_rows;
     ctx_ = gpu_ctx_create(cfg, kForwardSpec, max_pos);
     if (ctx_ == nullptr) {
@@ -299,6 +309,7 @@ class GpuSession {
     max_pos_ = max_pos;
     vocab_ = static_cast<int>(cfg.vocab_size);
     hidden_ = static_cast<int>(cfg.hidden_size);
+    layers_ = static_cast<int>(cfg.num_layers);
     logit_rows_ = logit_rows;
     ctx_ = arena != nullptr ? gpu_ctx_create_paged(cfg, kForwardSpec, max_pos, arena)
                             : gpu_ctx_create(cfg, kForwardSpec, max_pos);
@@ -335,6 +346,7 @@ class GpuSession {
   int mapped() const { return gpu_ctx_mapped_rows(ctx_); }
   int vocab() const { return vocab_; }
   int hidden() const { return hidden_; }
+  int layers() const { return layers_; }
   int max_pos() const { return max_pos_; }
   int logit_rows() const { return logit_rows_; }
   int written() const { return gpu_ctx_written(ctx_); }
@@ -379,10 +391,17 @@ class GpuSession {
 
   // Forward [written, end) and write the final-normed hidden state of rows
   // [from, end) to d_hidden ([end - from][hidden], device); no lm_head.
-  bool forward_hidden(int end, int from, std::uint16_t* d_hidden, std::string* error) {
+  bool forward_hidden(int end, int from, std::uint16_t* d_hidden, std::string* error,
+                      const std::vector<int>& feat_layers = {},
+                      std::uint16_t* d_feat = nullptr) {
     GpuForwardOut out;
     out.logits_from = from;
     out.d_hidden = d_hidden;
+    if (d_feat != nullptr) {
+      out.d_layer_feat = d_feat;
+      out.feat_rows = end - from;
+      for (std::size_t k = 0; k < feat_layers.size(); ++k) out.feat_layers[k] = feat_layers[k];
+    }
     char err[256] = "";
     if (gpu_forward(ctx_, d_tokens_, end, out, err, sizeof err) != 0) {
       *error = std::string("gpu_forward: ") + err;
@@ -486,7 +505,7 @@ class GpuSession {
   GpuSession* feat_owner_ = nullptr;   // borrowed feature buffers (share_scratch_from)
   std::uint16_t* d_feat_own_ = nullptr;  // per-session verify/chain rows when borrowing
   std::string dir_;
-  int max_pos_ = 0, vocab_ = 0, hidden_ = 0, logit_rows_ = 0;
+  int max_pos_ = 0, vocab_ = 0, hidden_ = 0, layers_ = 0, logit_rows_ = 0;
 };
 
 int fail(const std::string& err) {
@@ -1297,22 +1316,49 @@ int gpu_dump_hidden_cmd(const Args& a) {
   if (cudaMalloc(&d_hidden, cap * 2) != cudaSuccess ||
       cudaHostAlloc(&h_hidden, cap * 2, cudaHostAllocDefault) != cudaSuccess)
     return fail("dump-hidden: allocation failed");
+  // Optional multi-layer features: [tokens][nf][H] bf16 in --feat-out.
+  const std::size_t nf = a.feat_layers.size();
+  std::FILE* fout = nullptr;
+  std::uint16_t* d_feat = nullptr;
+  std::vector<std::uint16_t> h_feat, h_feat_t;
+  if (nf > 0) {
+    for (int l : a.feat_layers)
+      if (l < 0 || l >= s.layers()) return fail("dump-hidden: --feat-layers out of range");
+    fout = std::fopen(a.feat_out.c_str(), "wb");
+    if (fout == nullptr) return fail("dump-hidden: cannot open --feat-out");
+    if (cudaMalloc(&d_feat, cap * nf * 2) != cudaSuccess)
+      return fail("dump-hidden: feature allocation failed");
+    h_feat.resize(cap * nf);
+    h_feat_t.resize(cap * nf);
+  }
   std::vector<std::int32_t> seq;
   long records = 0, tokens = 0;
   const auto t0 = std::chrono::steady_clock::now();
   for (std::int32_t n; std::fread(&n, sizeof n, 1, in) == 1;) {
     if (n <= 0 || n > a.max_context) return fail("dump-hidden: record length out of range");
+    if (nf > 0 && n < 17) return fail("dump-hidden: --feat-layers needs records >= 17 tokens");
     seq.resize(static_cast<std::size_t>(n));
     if (std::fread(seq.data(), sizeof(std::int32_t), seq.size(), in) != seq.size())
       return fail("dump-hidden: truncated record");
     for (std::int32_t t : seq)
       if (t < 0 || t >= s.vocab()) return fail("dump-hidden: token id out of range");
-    if (!s.truncate(0) || !s.upload(seq, 0, n, &err) || !s.forward_hidden(n, 0, d_hidden, &err))
+    if (!s.truncate(0) || !s.upload(seq, 0, n, &err) ||
+        !s.forward_hidden(n, 0, d_hidden, &err, a.feat_layers, d_feat))
       return fail(err);
     const std::size_t bytes = static_cast<std::size_t>(n) * H * 2;
     if (cudaMemcpy(h_hidden, d_hidden, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
       return fail("dump-hidden: copy back failed");
     if (std::fwrite(h_hidden, 1, bytes, out) != bytes) return fail("dump-hidden: write failed");
+    if (nf > 0) {
+      const std::size_t un = static_cast<std::size_t>(n);
+      if (cudaMemcpy(h_feat.data(), d_feat, bytes * nf, cudaMemcpyDeviceToHost) != cudaSuccess)
+        return fail("dump-hidden: feature copy back failed");
+      for (std::size_t k = 0; k < nf; ++k)  // [k][n][H] -> [n][k][H]
+        for (std::size_t r = 0; r < un; ++r)
+          std::memcpy(&h_feat_t[(r * nf + k) * H], &h_feat[(k * un + r) * H], H * 2);
+      if (std::fwrite(h_feat_t.data(), 1, bytes * nf, fout) != bytes * nf)
+        return fail("dump-hidden: feature write failed");
+    }
     ++records;
     tokens += n;
     if (records % 200 == 0) {
@@ -1324,6 +1370,8 @@ int gpu_dump_hidden_cmd(const Args& a) {
   }
   cudaFree(d_hidden);
   cudaFreeHost(h_hidden);
+  if (d_feat != nullptr) cudaFree(d_feat);
+  if (fout != nullptr && std::fclose(fout) != 0) return fail("dump-hidden: feature close failed");
   std::fclose(in);
   if (std::fclose(out) != 0) return fail("dump-hidden: close failed");
   std::fprintf(stderr, "dump-hidden: done, %ld records, %ld tokens\n", records, tokens);
@@ -2111,7 +2159,7 @@ int main(int argc, char** argv) {
         "         [--eagle HEAD.safetensors --eagle-k K]\n"
         "       granite4-infer serve --checkpoint DIR --gpu 1 [--max-context N] [--eagle HEAD]\n"
         "       granite4-infer dump-hidden --checkpoint DIR --gpu 1 --in TOKENS.bin "
-        "--out HIDDEN.bin [--max-context N]\n"
+        "--out HIDDEN.bin [--max-context N] [--feat-layers A,B --feat-out FEAT.bin]\n"
         "       granite4-infer kv-bench --checkpoint DIR --gpu 1 --bench-ctx N "
         "--bench-decode D [--seed S]   (G4_KV8=1 int8 KV, G4_KV8=4 int4 KV)\n");
     return 2;
