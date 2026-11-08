@@ -243,6 +243,33 @@ void bench() {
       if (rep > 0) total += ms;
     }
     const float layer = total / 2;
+    // Per GEMM, each from a cold L2: where the layer loses bandwidth.
+    if (T == 1 || T == 16) {
+      auto one = [&](const char* name, double mb, auto&& fn) {
+        float best = 1e9f;
+        for (int rep = 0; rep < 3; ++rep) {
+          CK(cudaMemset(flush, rep, fl));
+          cudaEventRecord(e0);
+          fn();
+          cudaEventRecord(e1);
+          cudaEventSynchronize(e1);
+          float ms = 0;
+          cudaEventElapsedTime(&ms, e0, e1);
+          best = std::min(best, ms);
+        }
+        std::printf("    T=%2d %-6s %6.1f MB %7.1f us %4.0f GB/s\n", T, name, mb, best * 1e3,
+                    mb / best);  // MB per ms = GB/s
+      };
+      one("qkv", (H + 2.0 * KV) * H / 1e6, [&] {
+        granite4_verify_qkv(a.d, q.d, k.d, v.d, 1.0f, 1.0f, 1.0f, T, H, KV, KV, H, out,
+                            out + static_cast<std::size_t>(16) * H,
+                            out + static_cast<std::size_t>(16) * (H + KV));
+      });
+      one("o", 1.0 * H * H / 1e6, [&] { granite4_verify_gemv(a.d, o.d, 1.0f, T, H, H, out); });
+      one("gateup", 2.0 * I * H / 1e6,
+          [&] { granite4_verify_silu(g.d, u.d, a.d, 1.0f, 1.0f, I, H, T, out); });
+      one("down", 1.0 * I * H / 1e6, [&] { granite4_verify_gemv(a.d, dn.d, 1.0f, T, H, I, out); });
+    }
     CK(cudaMemset(flush, 7, fl));
     cudaEventRecord(e0);
     granite4_verify_gemv(a.d, lm.d, 1.0f, T, V, H, out);

@@ -279,6 +279,9 @@ __global__ void __launch_bounds__(kArgmaxThreads)
 // is bit-identical to that session decoding alone.
 // ---------------------------------------------------------------------------
 using MultiRows = GpuMultiRows;  // forward_gpu_api.h
+// Multi-session verify groups a session's rows in attention from this
+// position on (attention_split.cu kShortCtx: below it one row per block).
+constexpr int kMultiGroupMinCtx = 1024;
 
 __global__ void embed_multi_kernel(const MultiRows* __restrict__ mr,
                                    const std::uint16_t* emb, float mult, std::uint16_t* out,
@@ -2030,7 +2033,7 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
 // greedy ids in d_ids, then each session's token and position advance.
 int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logits,
                        std::int32_t* d_ids, std::uint16_t* d_hidden_out = nullptr,
-                       bool advance = true) {
+                       bool advance = true, int ngroups = 0) {
   const int rows = n;
   const int L = g->L, H = g->H, I = g->I, Hq = g->Hq, Hk = g->Hk, d = g->d, V = g->V;
   const float rms_eps = g->spec.rms_norm_eps;
@@ -2050,6 +2053,7 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
   std::uint16_t* const d_gate_out = d_attn_out + rows * nq;
   const int* const row_pos = d_mr->pos;  // device addresses inside the descriptor
   const int* const* const row_pt = d_mr->pt;
+  const int* const row_grp = ngroups > 0 ? d_mr->grp : nullptr;
 
   embed_multi_kernel<<<dim3((H + 255) / 256, rows), 256>>>(d_mr, hv.embed,
                                                            g->spec.embedding_multiplier,
@@ -2075,7 +2079,7 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
       rc = attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d, 0,
                       nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, nullptr,
                       nullptr, lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
-                      true, nullptr, g->max_pos, row_pos, row_pt);
+                      true, nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups);
     } else if (g->kv8) {
       kv_append_int8_multi_kernel<<<dim3(Hk, rows), d>>>(
           d_k_new_rot, d_v_new, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, d_mr,
@@ -2083,14 +2087,14 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
       rc = attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d, 0,
                       nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, lw.kv8_k,
                       lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, true, nullptr, nullptr, false,
-                      nullptr, g->max_pos, row_pos, row_pt);
+                      nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups);
     } else {
       kv_append_multi_kernel<<<dim3((Hk * d + 255) / 256, rows), 256>>>(
           d_k_new_rot, d_v_new, lw.kv_k, lw.kv_v, d_mr, rows, g->kv_stride, Hk, d);
       rc = attn_split(d_qf_rot, lw.kv_k, lw.kv_v, g->spec.attention_multiplier, Hq, Hk, d, 0,
                       nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, nullptr,
                       nullptr, nullptr, nullptr, false, nullptr, nullptr, false, nullptr,
-                      g->max_pos, row_pos, row_pt);
+                      g->max_pos, row_pos, row_pt, row_grp, ngroups);
     }
     G4_CUDA_CHECK(cudaGetLastError());
     if (rc != 0 ||
@@ -2784,16 +2788,34 @@ int gpu_forward_multi(GpuCtx* const* row_ctx, std::int32_t* const* row_tokens,
   }
   MultiRows h{};
   h.n = n;
+  int max_pos_row = 0;
   for (int r = 0; r < n; ++r) {
     h.pos[r] = row_pos[r];
     h.pt[r] = row_ctx[r]->d_pt;
     h.tok[r] = row_tokens[r];
+    max_pos_row = std::max(max_pos_row, row_pos[r]);
+  }
+  // Attention groups: each session's consecutive rows share K/V tile reads
+  // (up to 8 per block). Short contexts keep one row per block (attn_split's
+  // short-context rule: enough blocks to fill the card, cheap re-reads).
+  // G4_MULTI_GROUP=0 disables.
+  int ngroups = 0;
+  static const bool group_on = env_enabled("G4_MULTI_GROUP");
+  if (group_on && max_pos_row >= kMultiGroupMinCtx) {
+    for (int r = 0; r < n;) {
+      int e = r + 1;
+      while (e < n && e - r < 8 && row_ctx[e] == row_ctx[r] && row_pos[e] == row_pos[e - 1] + 1)
+        ++e;
+      h.grp[ngroups++] = r | ((e - r) << 8);
+      r = e;
+    }
+    if (ngroups == n) ngroups = 0;  // nothing shared: the one-row-per-block path
   }
   // (gpu_decode_multi re-uploads its own descriptor before every launch, so
   // its captured graph stays valid across this call.)
   if (cudaMemcpyAsync(g->d_multi, &h, sizeof h, cudaMemcpyHostToDevice, cudaStreamPerThread) !=
           cudaSuccess ||
-      forward_multi_step(g, g->d_multi, n, d_logits, d_argmax, d_hidden, false) != 0)
+      forward_multi_step(g, g->d_multi, n, d_logits, d_argmax, d_hidden, false, ngroups) != 0)
     return seterr("multi-forward failed");
   for (std::size_t i = 0; i < seen.size(); ++i) seen[i]->written = next_pos[i];
   return 0;

@@ -171,7 +171,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const std::uint8_t* cache_k4 = nullptr,
                const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
                const int* d_pt = nullptr, int max_len = 0,
-               const int* row_pos = nullptr, const int* const* row_pt = nullptr);
+               const int* row_pos = nullptr, const int* const* row_pt = nullptr,
+               const int* row_grp = nullptr, int ngroups = 0);
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                       int base_pos, int rows, int stride, std::uint16_t* out,
@@ -2929,6 +2930,56 @@ static void test_attn_split_rows_bit_identical_device() {
     }
   }
   std::printf("  attn_split rows: multi-row == single-row (bf16/KV8/KV4, R=2/7/13, paged)\n");
+  // Multi-sequence rows grouped per sequence (row_grp) == one row per block:
+  // sequence A rows at 1500..1503 (table pt), B at 1800..1804 (table ptB).
+  {
+    std::vector<int> ptB(pool.rbegin(), pool.rbegin() + max_len);
+    int* dptB;
+    int *drpos, *dgrp;
+    const int** drpt;
+    const int nA = 4, nB = 5, n = nA + nB;
+    CUDA_CHECK(cudaMalloc(&dptB, ptB.size() * 4));
+    CUDA_CHECK(cudaMalloc(&drpos, n * 4));
+    CUDA_CHECK(cudaMalloc(&dgrp, 2 * 4));
+    CUDA_CHECK(cudaMalloc(&drpt, n * sizeof(int*)));
+    CUDA_CHECK(cudaMemcpy(dptB, ptB.data(), ptB.size() * 4, cudaMemcpyHostToDevice));
+    std::vector<int> rpos(n);
+    std::vector<const int*> rpt(n);
+    for (int r = 0; r < n; ++r) {
+      rpos[r] = r < nA ? 1500 + r : 1800 + (r - nA);
+      rpt[r] = r < nA ? dpt : dptB;
+    }
+    const int grp[2] = {0 | (nA << 8), nA | (nB << 8)};
+    CUDA_CHECK(cudaMemcpy(drpos, rpos.data(), n * 4, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(drpt, rpt.data(), n * sizeof(int*), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dgrp, grp, sizeof grp, cudaMemcpyHostToDevice));
+    for (int fmt = 0; fmt < 3; ++fmt) {
+      auto call = [&](const int* g, int ng, std::uint16_t* out) {
+        if (fmt == 0)
+          return granite4::attn_split(dq, dk, dv, scale, Hq, Hk, d, 0, nullptr, n, stride,
+                                      scratch, out, nullptr, nullptr, nullptr, nullptr, false,
+                                      nullptr, nullptr, false, nullptr, max_len, drpos, drpt, g,
+                                      ng);
+        if (fmt == 1)
+          return granite4::attn_split(dq, nullptr, nullptr, scale, Hq, Hk, d, 0, nullptr, n,
+                                      stride, scratch, out, dk8, dv8, dks, dvs, true, nullptr,
+                                      nullptr, false, nullptr, max_len, drpos, drpt, g, ng);
+        return granite4::attn_split(dq, nullptr, nullptr, scale, Hq, Hk, d, 0, nullptr, n,
+                                    stride, scratch, out, nullptr, nullptr, dks, dvs, false, dk4,
+                                    dv4, true, nullptr, max_len, drpos, drpt, g, ng);
+      };
+      const std::string tag = std::string("attn_split groups [") + names[fmt] + "]: ";
+      expect(call(nullptr, 0, dsingle) == 0, (tag + "per-row launch").c_str());
+      expect(call(dgrp, 2, dmulti) == 0, (tag + "grouped launch").c_str());
+      std::vector<std::uint16_t> a(static_cast<std::size_t>(n) * Hq * d), b(a.size());
+      CUDA_CHECK(cudaMemcpy(a.data(), dmulti, a.size() * 2, cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(b.data(), dsingle, b.size() * 2, cudaMemcpyDeviceToHost));
+      expect(std::memcmp(a.data(), b.data(), a.size() * 2) == 0,
+             (tag + "grouped multi-sequence rows bit-identical to one row per block").c_str());
+    }
+    cudaFree(dptB); cudaFree(drpos); cudaFree(dgrp); cudaFree(drpt);
+    std::printf("  attn_split groups: 2 sequences x 4/5 rows grouped == per-row (bf16/KV8/KV4)\n");
+  }
   cudaFree(dk); cudaFree(dv); cudaFree(dk8); cudaFree(dv8); cudaFree(dk4); cudaFree(dv4);
   cudaFree(dks); cudaFree(dvs); cudaFree(dq); cudaFree(dmulti); cudaFree(dsingle);
   cudaFree(dpt); cudaFree(scratch);

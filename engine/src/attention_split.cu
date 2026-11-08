@@ -86,14 +86,18 @@ __global__ void __launch_bounds__(kThreads)
                       const std::uint8_t* __restrict__ cache_v4,
                       const int* __restrict__ d_pt,
                       const int* __restrict__ row_pos,
-                      const int* const* __restrict__ row_pt) {
+                      const int* const* __restrict__ row_pt,
+                      const int* __restrict__ row_grp) {
   const int hkv = blockIdx.x;
   const int split = blockIdx.y;
-  const int r0 = blockIdx.z * RB;
-  const int nr = min(RB, rows - r0);
-  // Multi-sequence rows (RB == 1): row r0 is its own sequence at position
-  // row_pos[r0] with row table row_pt[r0]; base is chosen so that the shared
-  // per-row formula base + r0 + 1 is that row's causal length.
+  // row_grp (multi-sequence rows): block z owns rows [r0, r0 + nr) of ONE
+  // sequence at consecutive positions (encoded r0 | nr << 8, nr <= RB).
+  const int gd = row_grp != nullptr ? row_grp[blockIdx.z] : 0;
+  const int r0 = row_grp != nullptr ? (gd & 0xff) : blockIdx.z * RB;
+  const int nr = row_grp != nullptr ? (gd >> 8) : min(RB, rows - r0);
+  // Multi-sequence rows: row r0 is at position row_pos[r0] with row table
+  // row_pt[r0] (a group's rows continue it); base is chosen so that the
+  // shared per-row formula base + r0 + rr + 1 is each row's causal length.
   const int base = row_pos != nullptr ? row_pos[r0] - r0
                                       : (d_pos != nullptr ? *d_pos : kv_base);
   const int t_begin = split * tps * kTile;
@@ -323,7 +327,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const std::int8_t* cache_v8, const float* cache_k_scale,
                const float* cache_v_scale, bool int8, const std::uint8_t* cache_k4,
                const std::uint8_t* cache_v4, bool int4, const int* d_pt, int max_len,
-               const int* row_pos, const int* const* row_pt) {
+               const int* row_pos, const int* const* row_pt, const int* row_grp,
+               int ngroups) {
   // `stride` addresses the cache arena; the split layout follows the longest
   // logical sequence (== stride for a private, contiguous cache).
   const int ml = max_len > 0 ? max_len : stride;
@@ -332,6 +337,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
       rows <= 0 || rows > kMaxVerifyRows || stride <= 0 || ml > stride ||
       (d_pos == nullptr && row_pos == nullptr && kv_base + rows > ml) ||
       ((row_pos == nullptr) != (row_pt == nullptr)) ||
+      (row_grp != nullptr && (row_pos == nullptr || ngroups <= 0 || ngroups > rows)) ||
       (int8 && int4) ||
       (int8 && (cache_k8 == nullptr || cache_v8 == nullptr ||
                 cache_k_scale == nullptr || cache_v_scale == nullptr)) ||
@@ -345,31 +351,38 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
   float* const po = reinterpret_cast<float*>(pml + static_cast<std::size_t>(rows) * Hq * splits);
   // One block per (kv head, split, group of RB rows). Decode (rows == 1) uses
   // the single-row instance (smallest shared-memory footprint).
-  auto launch = [&](auto rbtag) {
+  auto launch = [&](auto rbtag, const int* grp, int nz) {
     constexpr int RB = decltype(rbtag)::value;
-    const dim3 grid(Hk, splits, (rows + RB - 1) / RB);
+    const dim3 grid(Hk, splits, nz);
     if (int8)
       attn_split_kernel<true, false, RB><<<grid, kThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
-          cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr, d_pt, row_pos, row_pt);
+          cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr, d_pt, row_pos, row_pt,
+          grp);
     else if (int4)
       attn_split_kernel<false, true, RB><<<grid, kThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
-          nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt, row_pos, row_pt);
+          nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt, row_pos, row_pt,
+          grp);
     else
       attn_split_kernel<false, false, RB><<<grid, kThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
-          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, d_pt, row_pos, row_pt);
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, d_pt, row_pos, row_pt, grp);
   };
+  using One = std::integral_constant<int, 1>;
+  using Many = std::integral_constant<int, kRowsPerBlock>;
   // Short contexts (a few tiles per row) have too few blocks to fill the
   // card when rows share a block, and the KV re-read is cheap there, so they
   // keep one row per block; past ~1K positions sharing the tiles wins.
   const bool short_ctx = d_pos == nullptr && kv_base + rows <= kShortCtx;
-  // Rows of different sequences never share a tile: one row per block.
-  if (rows == 1 || short_ctx || row_pos != nullptr)
-    launch(std::integral_constant<int, 1>{});
+  // Rows of different sequences never share a tile: one row per block, or
+  // one same-sequence row group per block when the caller passes groups.
+  if (row_grp != nullptr)
+    launch(Many{}, row_grp, ngroups);
+  else if (rows == 1 || short_ctx || row_pos != nullptr)
+    launch(One{}, nullptr, rows);
   else
-    launch(std::integral_constant<int, kRowsPerBlock>{});
+    launch(Many{}, nullptr, (rows + kRowsPerBlock - 1) / kRowsPerBlock);
   attn_combine_kernel<<<dim3(Hq, rows), kD>>>(pml, po, Hq, kv_base, d_pos, tps, splits, out,
                                               row_pos);
   const cudaError_t e = cudaGetLastError();
