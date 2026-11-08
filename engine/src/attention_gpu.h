@@ -33,6 +33,13 @@ std::size_t attn_split_scratch_bytes(int Hq, int rows, int stride);
 // grid and the scratch are sized from max_len instead, so a pool much larger
 // than any one sequence does not widen the launch. max_len <= stride.
 //
+// row_pos / row_pt (default null; both or neither): multi-sequence rows. Row r
+// is its own sequence at position row_pos[r] (attending to [0, row_pos[r]])
+// through its own position -> arena-row table row_pt[r]; kv_base, d_pos and
+// d_pt are ignored. Device arrays of `rows` entries. Used to decode several
+// sessions of one shared KV arena in one step; each row's arithmetic is that
+// of a single-row call at its position.
+//
 // KV8 (Q8_0): when int8 is true the persistent cache is read as int8 codes
 // int4, the KV cache is read as int4 codes (cache_k4/cache_v4,
 // [Hk][stride][d/2], two per byte) plus a per-row scale
@@ -48,7 +55,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const float* cache_v_scale = nullptr, bool int8 = false,
                const std::uint8_t* cache_k4 = nullptr,
                const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
-               const int* d_pt = nullptr, int max_len = 0);
+               const int* d_pt = nullptr, int max_len = 0,
+               const int* row_pos = nullptr, const int* const* row_pt = nullptr);
 
 }  // namespace granite4
 
