@@ -53,3 +53,15 @@ def test_shipped_reference_is_well_formed():
     assert ref["prompt_ids"] == [791, 6864, 315, 9822, 374]
     assert len(ref["tokens"]) == 24 and all(isinstance(t, int) for t in ref["tokens"])
     assert len(ref["checkpoint_sha"]) == 16
+
+def test_gate_env_pins_bf16_kv(monkeypatch):
+    # The gate validates bf16 arithmetic: it must run its engine subprocesses
+    # on the bf16 KV path even when the surrounding environment (the NixOS
+    # unit env for a kv8 = true deploy) requests int8 KV.
+    monkeypatch.setenv("G4_KV8", "1")
+    assert parity_gate._gate_env()["G4_KV8"] == "0"
+    monkeypatch.delenv("G4_KV8")
+    assert parity_gate._gate_env()["G4_KV8"] == "0"
+    # The pin is scoped to G4_KV8, not a clean-room env.
+    monkeypatch.setenv("PATH", "/usr/bin")
+    assert parity_gate._gate_env()["PATH"] == "/usr/bin"

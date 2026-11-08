@@ -127,10 +127,11 @@ static void test_alloc_and_locate() {
                                    static_cast<std::size_t>(-1),
                                    static_cast<std::size_t>(-1)}),
          "locate out-of-range token");
-  // capacity: a 17th token needs a 4th page that is free (still fits).
+  // 11 tokens (page 3 = tokens 8..11): the 11th token lands in the existing
+  // partial page 2, so no new page is allocated.
   auto toks11 = seq_tokens(100, 11);
-  expect(pool.reserve(s, 11, toks11), "grow to 11 tokens (uses last page)");
-  expect(pool.free_pages() == 0, "all 4 pages now used");
+  expect(pool.reserve(s, 11, toks11), "grow to 11 tokens (fills partial page)");
+  expect(pool.free_pages() == 1, "11th token fills partial page 2, no new page");
   auto toks17 = seq_tokens(100, 17);  // would need a 5th page
   expect(!pool.reserve(s, 17, toks17), "reserve beyond capacity fails");
   expect(pool.sequence_tokens(s) == 11, "sequence size unchanged on failure");
@@ -243,6 +244,66 @@ static void test_block_table() {
   expect(pool.block_table(999).empty(), "invalid seq block_table empty");
 }
 
+static void test_row_table() {
+  PagedKV pool(small_pool());  // 4 pages, 4 tokens/page
+
+  // A sequence with a *non-contiguous* layout: pages allocated from the free
+  // list are not adjacent, so the position->row table is a real (non-linear)
+  // mapping rather than the identity.
+  int a = pool.create_sequence();
+  pool.reserve(a, 4, seq_tokens(0, 4));  // 1 page
+  pool.release(a);                        // free page -> returned to free list
+
+  int b = pool.create_sequence();
+  pool.reserve(b, 8, seq_tokens(10, 8));  // 2 pages
+  const auto& bt = pool.block_table(b);
+  const std::size_t rows_per_page = pool.page_rows();
+  expect(rows_per_page == 4, "page_rows == tokens_per_page");
+
+  int tbl[8];
+  expect(pool.row_table(b, 8, tbl), "row_table within filled tokens");
+  // Contiguous within a page, page id * B + token_local across pages.
+  for (std::size_t p = 0; p < 8; ++p)
+    expect(tbl[p] == static_cast<int>(bt[p / 4] * rows_per_page + p % 4),
+           "row = page_id*B + token_local");
+  // Within-page contiguity: rows for one page are consecutive.
+  expect(tbl[0] + 1 == tbl[1] && tbl[1] + 1 == tbl[2] && tbl[2] + 1 == tbl[3],
+         "page 0 rows contiguous");
+  expect(tbl[4] == static_cast<int>(bt[1] * rows_per_page), "page 1 base row");
+
+  // Out-of-range and invalid-seq row_table return false.
+  int buf[8];
+  expect(!pool.row_table(b, 9, buf), "row_table beyond filled tokens fails");
+  expect(!pool.row_table(-1, 1, buf), "invalid seq row_table fails");
+
+  // A sequence whose *first* page is a shared cached prefix (reused, non-
+  // contiguous with the private tail) maps the prefix to that shared page's
+  // rows and the tail to its own private page.
+  pool.clear();
+  int p0 = pool.create_sequence();
+  pool.reserve(p0, 4, seq_tokens(50, 4));
+  pool.mark_written(p0, 0);  // cache the prefix page
+  pool.release(p0);          // retained (cached), refcount 0
+
+  int r = pool.create_sequence();
+  const std::size_t matched = pool.match_prefix(r, seq_tokens(50, 12));
+  expect(matched == 4, "match_prefix reuses the cached page");
+  pool.reserve(r, 12, seq_tokens(50, 12));
+  const auto& rt = pool.block_table(r);
+  expect(rt.size() == 3, "3 pages: 1 shared + 2 private");
+  int rtbl[12];
+  expect(pool.row_table(r, 12, rtbl), "row_table for shared+private seq");
+  // The prefix rows are the shared page's base; the tail rows are private.
+  expect(rtbl[0] == static_cast<int>(rt[0] * rows_per_page), "prefix -> shared page row");
+  for (std::size_t p = 4; p < 12; ++p)
+    expect(rtbl[p] == static_cast<int>(rt[p / 4] * rows_per_page + p % 4),
+           "tail -> private page rows");
+  // The shared prefix page row differs from the first private page row
+  // (the two are not physically adjacent in this tiny pool).
+  expect(rtbl[0] != rtbl[4], "shared and private rows are distinct pages");
+  pool.release(r);
+}
+
 static void test_release_frees() {
   PagedKV pool(small_pool());
   const int a = pool.create_sequence();
@@ -300,6 +361,7 @@ int main() {
   test_release_frees();
   test_clear_and_bounds();
   test_block_table();
+  test_row_table();
   if (g_failures) {
     std::printf("kv_pool: %d check(s) FAILED\n", g_failures);
     return 1;

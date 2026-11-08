@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "device_math.cuh"
@@ -46,7 +47,14 @@ extern "C" int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::ui
 extern "C" int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k,
                                          const std::uint16_t* d_v, float att_scale, int Hq,
                                          int Hk, int d, int kv_len, int k_stride,
-                                         std::uint16_t* d_out);
+                                         std::uint16_t* d_out, const int* d_pt = nullptr);
+extern "C" int granite4_kernel_gqa_fused_pos(const std::uint16_t* d_q,
+                                             const std::uint16_t* d_k,
+                                             const std::uint16_t* d_v, float att_scale,
+                                             int Hq, int Hk, int d, int kv_len,
+                                             int k_stride, const int* d_pos,
+                                             std::uint16_t* d_out,
+                                             const int* d_pt = nullptr);
 extern "C" int granite4_kernel_silu_gate_up(const std::uint8_t* d_wg, const std::uint8_t* d_wu,
                                            const std::uint16_t* d_x, float scale_g, float scale_u,
                                            int N, int K, std::uint16_t* d_out);
@@ -114,38 +122,39 @@ extern "C" int granite4_kernel_verify_qkv_stage(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
     const float* d_cos, const float* d_sin, int base_pos, int rows, int Hq, int Hk,
     int d, int cache_stride, std::uint16_t* d_q_rot, std::uint16_t* d_k_rot,
-    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v);
+    std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
+     const int* d_pt = nullptr);
 extern "C" int granite4_kernel_verify_attention_stage(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
     const float* d_cos, const float* d_sin, float att_scale, int base_pos, int rows,
     int Hq, int Hk, int d, int cache_stride, std::uint16_t* d_q_rot,
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
-    std::uint16_t* d_out);
+    std::uint16_t* d_out, const int* d_pt = nullptr);
 extern "C" int granite4_kernel_kv_append_batched(
     const std::uint16_t* d_src_k, const std::uint16_t* d_src_v,
     std::uint16_t* d_cache_k, std::uint16_t* d_cache_v, int base_pos, int rows,
-    int stride, int Hk, int d);
+    int stride, int Hk, int d, const int* d_pt);
 namespace granite4 {
 int gpu_verify_attention_layer(
     const std::uint16_t*, const std::uint8_t*, const std::uint8_t*, const std::uint8_t*,
     float, float, float, const float*, const float*, float, int, int, int, int, int,
     int, int, std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*,
-    std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*);
+    std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*, const int*);
 int gpu_verify_attention_layer_batched(
     const std::uint16_t*, const std::uint8_t*, const std::uint8_t*, const std::uint8_t*,
     float, float, float, const float*, const float*, float, int, int, int, int, int,
     int, int, std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*,
-    std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*);
+    std::uint16_t*, std::uint16_t*, std::uint16_t*, std::uint16_t*, const int*);
 }
 extern "C" int granite4_kernel_gqa_fused_batched(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
     float att_scale, int Hq, int Hk, int d, int base_kv, int rows, int k_stride,
-    std::uint16_t* d_out);
+    std::uint16_t* d_out, const int* d_pt = nullptr);
 
 extern "C" int granite4_kernel_gqa_fused_rows(
     const std::uint16_t* d_q, const std::uint16_t* d_k, const std::uint16_t* d_v,
     float att_scale, int Hq, int Hk, int d, int base_kv, int rows, int k_stride,
-    std::uint16_t* d_out);
+    std::uint16_t* d_out, const int* d_pt = nullptr);
 extern "C" int granite4_prefill_gemm_bf16(const std::uint16_t* d_a, const std::uint8_t* d_w,
                                           float scale, int M, int N, int K,
                                           std::uint16_t* d_c);
@@ -154,10 +163,22 @@ std::size_t attn_split_scratch_bytes(int Hq, int rows, int stride);
 int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                int kv_base, const int* d_pos, int rows, int stride, void* scratch,
-               std::uint16_t* out);
+               std::uint16_t* out, const std::int8_t* cache_k8 = nullptr,
+               const std::int8_t* cache_v8 = nullptr,
+               const float* cache_k_scale = nullptr,
+               const float* cache_v_scale = nullptr, bool int8 = false,
+               const std::uint8_t* cache_k4 = nullptr,
+               const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
+               const int* d_pt = nullptr, int max_len = 0);
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
-                      int base_pos, int rows, int stride, std::uint16_t* out);
+                      int base_pos, int rows, int stride, std::uint16_t* out,
+                      const std::int8_t* cache_k8 = nullptr,
+                      const std::int8_t* cache_v8 = nullptr,
+                      const float* k_scale = nullptr, const float* v_scale = nullptr,
+                      bool int8 = false, const std::uint8_t* cache_k4 = nullptr,
+                      const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
+                      const int* d_pt = nullptr);
 }
 
 namespace {
@@ -287,6 +308,356 @@ static void test_fp8_hw_decode() {
   CUDA_CHECK(cudaMemcpy(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaFree(d_bad));
   expect(bad == 0, "fp8x4_to_f32 hardware decode bit-exact on all finite codes");
+}
+
+// ---------------------------------------------------------------------------
+// KV8 (Q8_0) int8 KV cache: the device quantize/dequant (dev::kv8_*) must match
+// the host twin bit-for-bit (identical int codes, identical dequant) and the
+// row round-trip must stay within half a quantization step.
+// ---------------------------------------------------------------------------
+
+// One thread per row: quantize a bf16 row (amax -> scale -> codes) on the
+// device and write codes + scale. The host recomputes the same and compares.
+__global__ void kv8_row_quant_kernel(const std::uint16_t* x, std::int8_t* q,
+                                    float* scale, int rows, int d) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  const std::uint16_t* row = x + static_cast<std::size_t>(r) * d;
+  float amax = 0.0f;
+  for (int i = 0; i < d; ++i)
+    amax = fmaxf(amax, fabsf(granite4::dev::bf16_to_f32(row[i])));
+  const float s = granite4::dev::kv8_scale(amax);
+  scale[r] = s;
+  std::int8_t* codes = q + static_cast<std::size_t>(r) * d;
+  for (int i = 0; i < d; ++i)
+    codes[i] = granite4::dev::kv8_quant(granite4::dev::bf16_to_f32(row[i]), s);
+}
+
+static void test_kv8_device() {
+  const int rows = 256, d = 128;  // head_dim of the model
+  Xorshift64 rng(0x8abc);
+  // A mix of magnitudes so the scale is exercised across its range: small,
+  // typical (O(1)) and large, plus an all-zero row (scale == 0) and a
+  // near-tie row.
+  std::vector<std::uint16_t> hx(static_cast<std::size_t>(rows) * d);
+  for (int r = 0; r < rows; ++r) {
+    float scale = 1.0f;
+    if (r == 0) scale = 0.0f;                        // all-zero row
+    else if (r == 1) scale = 1e-5f;                  // subnormal-ish amax
+    else if (r % 4 == 0) scale = 0.25f;
+    else if (r % 4 == 1) scale = 3.0f;
+    else if (r % 4 == 2) scale = 32.0f;
+    else scale = 256.0f;
+    for (int i = 0; i < d; ++i) {
+      const float v = rng.next_float_range(scale);
+      hx[static_cast<std::size_t>(r) * d + i] = f32_to_bf16_host(v);
+    }
+  }
+  std::uint16_t* d_x = nullptr;
+  std::int8_t* d_q = nullptr;
+  float* d_s = nullptr;
+  if (cudaMalloc(&d_x, hx.size() * 2) != cudaSuccess ||
+      cudaMalloc(&d_q, hx.size()) != cudaSuccess ||
+      cudaMalloc(&d_s, rows * sizeof(float)) != cudaSuccess ||
+      cudaMemcpy(d_x, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice) !=
+          cudaSuccess) {
+    ++g_failures;
+    if (d_x) cudaFree(d_x);
+    if (d_q) cudaFree(d_q);
+    if (d_s) cudaFree(d_s);
+    return;
+  }
+  kv8_row_quant_kernel<<<(rows + 255) / 256, 256>>>(d_x, d_q, d_s, rows, d);
+  std::vector<std::int8_t> hq(hx.size());
+  std::vector<float> hs(rows);
+  CUDA_CHECK(cudaMemcpy(hq.data(), d_q, hx.size(), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hs.data(), d_s, rows * sizeof(float), cudaMemcpyDeviceToHost));
+  cudaFree(d_x);
+  cudaFree(d_q);
+  cudaFree(d_s);
+
+  int bad_code = 0, bad_scale = 0, bad_dequant = 0, bad_bound = 0;
+  float worst_step_frac = 0.0f;
+  for (int r = 0; r < rows; ++r) {
+    float amax = 0.0f;
+    for (int i = 0; i < d; ++i)
+      amax = std::max(amax, std::fabs(bf16_to_f32_host(hx[static_cast<std::size_t>(r) * d + i])));
+    const float s_ref = kv8_scale_host(amax);
+    if (hs[r] != s_ref && bad_scale < 4) {
+      std::printf("  kv8 scale mismatch row=%d dev=%a ref=%a\n", r, hs[r], s_ref);
+      ++bad_scale;
+    }
+    for (int i = 0; i < d; ++i) {
+      const float x = bf16_to_f32_host(hx[static_cast<std::size_t>(r) * d + i]);
+      const std::int8_t q_ref = kv8_quant_host(x, s_ref);
+      const std::int8_t q_dev = hq[static_cast<std::size_t>(r) * d + i];
+      if (q_dev != q_ref && bad_code < 8) {
+        std::printf("  kv8 code mismatch row=%d i=%d x=%a dev=%d ref=%d\n", r, i, x,
+                    q_dev, q_ref);
+        ++bad_code;
+      }
+      // dequant bit-exact + round-trip error bound.
+      const float dq_dev = hs[r] * static_cast<float>(q_dev);
+      const float dq_ref = kv8_dequant_host(q_ref, s_ref);
+      std::uint32_t bits_dev, bits_ref;
+      std::memcpy(&bits_dev, &dq_dev, 4);
+      std::memcpy(&bits_ref, &dq_ref, 4);
+      if (bits_dev != bits_ref) {
+        if (bad_dequant < 8)
+          std::printf("  kv8 dequant mismatch row=%d i=%d dev=%a ref=%a\n", r, i, dq_dev,
+                      dq_ref);
+        ++bad_dequant;
+      }
+      // Absolute error is bounded by half a quantization step (s/2) plus one
+      // ULP of the dequant product (s*q) for the multiplication rounding.
+      if (hs[r] != 0.0f) {
+        const float err = std::fabs(x - dq_dev);
+        const float half_step = hs[r] * 0.5f;
+        worst_step_frac = std::max(worst_step_frac, err / half_step);
+        // Tolerance: s/2 + one ULP at the dequant magnitude (s * 127).
+        const float tol = half_step + hs[r] * 127.0f * 1.19e-7f;  // 2^-23
+        if (err > tol) ++bad_bound;
+      }
+    }
+  }
+  expect(bad_code == 0, "kv8 int8 quantize codes bit-exact device vs host");
+  expect(bad_scale == 0, "kv8 row scale bit-exact device vs host");
+  expect(bad_dequant == 0, "kv8 dequant bit-exact device vs host");
+  expect(bad_bound == 0, "kv8 round-trip within half a step (abs error)");
+  if (g_failures == 0)
+    std::printf("  kv8 worst abs error = %.4f of a half step (bound 1.0)\n",
+                worst_step_frac);
+}
+
+// ---------------------------------------------------------------------------
+// KV4 (Q4_0) int4 KV cache: same guarantee as KV8 - the device quantize
+// (dev::q4_*) must match the host twin bit-for-bit and the row round-trip must
+// stay within half a quantization step. The packing differs (two codes per
+// byte), so the device kernel emits a d/2-byte row.
+// ---------------------------------------------------------------------------
+
+// One thread per row: quantize a bf16 row into packed int4 codes (two per
+// byte, even dim = lower nibble) + a per-row scale. The host recomputes and
+// compares. d must be even.
+__global__ void kv4_row_quant_kernel(const std::uint16_t* x, std::uint8_t* q,
+                                    float* scale, int rows, int d) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  const std::uint16_t* row = x + static_cast<std::size_t>(r) * d;
+  float amax = 0.0f;
+  for (int i = 0; i < d; ++i)
+    amax = fmaxf(amax, fabsf(granite4::dev::bf16_to_f32(row[i])));
+  const float s = granite4::dev::q4_scale(amax);
+  scale[r] = s;
+  std::uint8_t* codes = q + static_cast<std::size_t>(r) * (d / 2);
+  for (int w = 0; w < d / 2; ++w) {
+    const float x0 = granite4::dev::bf16_to_f32(row[2 * w]);
+    const float x1 = granite4::dev::bf16_to_f32(row[2 * w + 1]);
+    codes[w] = static_cast<std::uint8_t>(
+        (granite4::dev::q4_quant(x0, s) & 0x0fu) |
+        (granite4::dev::q4_quant(x1, s) << 4));
+  }
+}
+
+static void test_kv4_device() {
+  const int rows = 256, d = 128;  // head_dim of the model
+  Xorshift64 rng(0x4e8a);
+  std::vector<std::uint16_t> hx(static_cast<std::size_t>(rows) * d);
+  for (int r = 0; r < rows; ++r) {
+    float scale = 1.0f;
+    if (r == 0) scale = 0.0f;                        // all-zero row
+    else if (r == 1) scale = 1e-5f;                  // subnormal-ish amax
+    else if (r % 4 == 0) scale = 0.25f;
+    else if (r % 4 == 1) scale = 3.0f;
+    else if (r % 4 == 2) scale = 32.0f;
+    else scale = 256.0f;
+    for (int i = 0; i < d; ++i) {
+      const float v = rng.next_float_range(scale);
+      hx[static_cast<std::size_t>(r) * d + i] = f32_to_bf16_host(v);
+    }
+  }
+  const std::size_t codes = static_cast<std::size_t>(rows) * (d / 2);
+  std::uint16_t* d_x = nullptr;
+  std::uint8_t* d_q = nullptr;
+  float* d_s = nullptr;
+  if (cudaMalloc(&d_x, hx.size() * 2) != cudaSuccess ||
+      cudaMalloc(&d_q, codes) != cudaSuccess ||
+      cudaMalloc(&d_s, rows * sizeof(float)) != cudaSuccess ||
+      cudaMemcpy(d_x, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice) !=
+          cudaSuccess) {
+    ++g_failures;
+    if (d_x) cudaFree(d_x);
+    if (d_q) cudaFree(d_q);
+    if (d_s) cudaFree(d_s);
+    return;
+  }
+  kv4_row_quant_kernel<<<(rows + 255) / 256, 256>>>(d_x, d_q, d_s, rows, d);
+  std::vector<std::uint8_t> hq(codes);
+  std::vector<float> hs(rows);
+  CUDA_CHECK(cudaMemcpy(hq.data(), d_q, codes, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hs.data(), d_s, rows * sizeof(float), cudaMemcpyDeviceToHost));
+  cudaFree(d_x);
+  cudaFree(d_q);
+  cudaFree(d_s);
+
+  int bad_code = 0, bad_scale = 0, bad_dequant = 0, bad_bound = 0;
+  float worst_step_frac = 0.0f;
+  for (int r = 0; r < rows; ++r) {
+    float amax = 0.0f;
+    for (int i = 0; i < d; ++i)
+      amax = std::max(amax, std::fabs(bf16_to_f32_host(hx[static_cast<std::size_t>(r) * d + i])));
+    const float s_ref = q4_scale_host(amax);
+    if (hs[r] != s_ref && bad_scale < 4) {
+      std::printf("  kv4 scale mismatch row=%d dev=%a ref=%a\n", r, hs[r], s_ref);
+      ++bad_scale;
+    }
+    for (int w = 0; w < d / 2; ++w) {
+      const std::size_t i0 = static_cast<std::size_t>(r) * d + 2 * w;
+      const float x0 = bf16_to_f32_host(hx[i0]);
+      const float x1 = bf16_to_f32_host(hx[i0 + 1]);
+      const unsigned char byte_ref =
+          static_cast<unsigned char>((q4_quant_host(x0, s_ref) & 0x0fu) |
+                                     (q4_quant_host(x1, s_ref) << 4));
+      const unsigned char byte_dev = hq[static_cast<std::size_t>(r) * (d / 2) + w];
+      if (byte_dev != byte_ref && bad_code < 8) {
+        std::printf("  kv4 code mismatch row=%d w=%d byte dev=%02x ref=%02x\n", r, w,
+                    byte_dev, byte_ref);
+        ++bad_code;
+      }
+      // dequant bit-exact + round-trip error bound (even + odd dim in the byte).
+      float lo_dev, hi_dev, lo_ref, hi_ref;
+      q4_dequant_pair_host(byte_dev, hs[r], lo_dev, hi_dev);
+      q4_dequant_pair_host(byte_ref, s_ref, lo_ref, hi_ref);
+      std::uint32_t bl, bh, brl, brh;
+      std::memcpy(&bl, &lo_dev, 4);
+      std::memcpy(&bh, &hi_dev, 4);
+      std::memcpy(&brl, &lo_ref, 4);
+      std::memcpy(&brh, &hi_ref, 4);
+      if (bl != brl || bh != brh) {
+        if (bad_dequant < 8)
+          std::printf("  kv4 dequant mismatch row=%d w=%d\n", r, w);
+        ++bad_dequant;
+      }
+      const float half_step = hs[r] * 0.5f;
+      if (hs[r] != 0.0f) {
+        const float tol = half_step + hs[r] * 7.0f * 1.19e-7f;  // 2^-23
+        const float e0 = std::fabs(x0 - lo_dev);
+        const float e1 = std::fabs(x1 - hi_dev);
+        if (e0 > tol || e1 > tol) ++bad_bound;
+        worst_step_frac = std::max(worst_step_frac,
+                                   std::max(e0, e1) / half_step);
+      }
+    }
+  }
+  expect(bad_code == 0, "kv4 int4 quantize codes bit-exact device vs host");
+  expect(bad_scale == 0, "kv4 row scale bit-exact device vs host");
+  expect(bad_dequant == 0, "kv4 dequant bit-exact device vs host");
+  expect(bad_bound == 0, "kv4 round-trip within half a step (abs error)");
+  if (g_failures == 0)
+    std::printf("  kv4 worst abs error = %.4f of a half step (bound 1.0)\n",
+                worst_step_frac);
+}
+
+// KV4 attention on the persistent int4 cache: quantize a bf16 K/V cache to the
+// int4 layout (two codes/byte + a per-row scale, dev::q4_*/q4_*_host), run the
+// split-KV attention with int4 dequant-on-load, and check it stays within the
+// int4 dequantization noise of the bf16 fused-GQA reference. (The int8 path
+// has no attention-level test; this is the KV4 analogue of test_attn_split
+// exercised on the quantized cache.)
+static void test_kv4_attn_split_device() {
+  const int Hq = 8, Hk = 2, d = 128, stride = 512, base = 200, rows = 8;
+  Xorshift64 rng(0x4a11);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+
+  // Build the int4 cache from the bf16 K/V on the host (the host twin of the
+  // device append), keeping the per-row scales so the attention test reads
+  // exactly what the device wrote.
+  std::vector<std::uint8_t> c4k(Hk * stride * (d / 2)), c4v(Hk * stride * (d / 2));
+  std::vector<float> sk(Hk * stride), sv(Hk * stride);
+  for (int h = 0; h < Hk; ++h)
+    for (int p = 0; p < stride; ++p) {
+      const std::size_t row = static_cast<std::size_t>(h) * stride + p;
+      const std::size_t src = row * d;
+      float ak = 0.0f, av = 0.0f;
+      for (int i = 0; i < d; ++i) {
+        ak = std::max(ak, std::fabs(bf16_to_f32_host(ck[src + i])));
+        av = std::max(av, std::fabs(bf16_to_f32_host(cv[src + i])));
+      }
+      const float sks = q4_scale_host(ak), svs = q4_scale_host(av);
+      sk[row] = sks;
+      sv[row] = svs;
+      for (int w = 0; w < d / 2; ++w) {
+        c4k[row * (d / 2) + w] =
+            static_cast<std::uint8_t>((q4_quant_host(bf16_to_f32_host(ck[src + 2 * w]),
+                                                    sks) &
+                                       0x0fu) |
+                                      (q4_quant_host(bf16_to_f32_host(ck[src + 2 * w + 1]),
+                                                     sks) <<
+                                       4));
+        c4v[row * (d / 2) + w] =
+            static_cast<std::uint8_t>((q4_quant_host(bf16_to_f32_host(cv[src + 2 * w]),
+                                                    svs) &
+                                       0x0fu) |
+                                      (q4_quant_host(bf16_to_f32_host(cv[src + 2 * w + 1]),
+                                                     svs) <<
+                                       4));
+      }
+    }
+
+  std::uint16_t *dq, *dk, *dv, *dref, *dgot;
+  std::uint8_t *dc4k, *dc4v;
+  float *dsk, *dsv;
+  void* scratch;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dk, cn * 2) || cudaMalloc(&dv, cn * 2) ||
+      cudaMalloc(&dref, qn * 2) || cudaMalloc(&dgot, qn * 2) ||
+      cudaMalloc(&dc4k, c4k.size()) || cudaMalloc(&dc4v, c4v.size()) ||
+      cudaMalloc(&dsk, sk.size() * sizeof(float)) ||
+      cudaMalloc(&dsv, sv.size() * sizeof(float)) ||
+      cudaMalloc(&scratch, granite4::attn_split_scratch_bytes(Hq, rows, stride))) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dc4k, c4k.data(), c4k.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dc4v, c4v.data(), c4v.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsk, sk.data(), sk.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsv, sv.data(), sv.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+  const float scale = 0.0078125f;  // model's attention scale (smoother softmax)
+  expect(granite4_kernel_gqa_fused_rows(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride,
+                                        dref) == 0,
+         "kv4 attention: reference launch");
+  expect(granite4::attn_split(dq, nullptr, nullptr, scale, Hq, Hk, d, base, nullptr, rows,
+                             stride, scratch, dgot, nullptr, nullptr, dsk, dsv, false, dc4k,
+                             dc4v, true) == 0,
+         "kv4 attention: launch");
+  std::vector<std::uint16_t> ref(qn), got(qn);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got.data(), dgot, qn * 2, cudaMemcpyDeviceToHost));
+  double max_err = 0.0;
+  for (std::size_t i = 0; i < qn; ++i)
+    max_err = std::max(
+        max_err,
+        static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) - bf16_to_f32_host(ref[i]))));
+  std::printf("  kv4 split-KV attention: max |delta| = %.5f\n", max_err);
+  expect(max_err < 0.5, "kv4 attention: int4 dequant noise within bound");
+  cudaFree(dq);
+  cudaFree(dk);
+  cudaFree(dv);
+  cudaFree(dref);
+  cudaFree(dgot);
+  cudaFree(dc4k);
+  cudaFree(dc4v);
+  cudaFree(dsk);
+  cudaFree(dsv);
+  cudaFree(scratch);
 }
 
 static void test_rmsnorm_device() {
@@ -1021,6 +1392,250 @@ static void test_prefill_attention_device() {
   cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dref); cudaFree(dgot);
 }
 
+// Paged prefill: the tensor-core causal attention gathers each tile row
+// through the same position->row table the split and fused kernels use, so a
+// physically permuted arena must read bit-identically to the contiguous one.
+// All three KV formats are checked because the quantized paths also dequantize
+// with the row's scale - the scale travels with the physical row, not the
+// logical position, so a kernel that reads it at the logical position is
+// bit-correct only under an identity table.
+static void test_paged_prefill_device() {
+  const int Hq = 8, Hk = 2, d = 128, base = 37, rows = 75, stride = 128;
+  Xorshift64 rng(0x51f3);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  const float scale = 0.0078125f * 8.0f;  // sharp, exercises the softmax
+
+  // A fixed permutation of the arena rows: perm[pos] is the physical row
+  // holding logical position pos. Fisher-Yates makes it a real bijection.
+  std::vector<int> perm(stride);
+  for (int p = 0; p < stride; ++p) perm[p] = p;
+  for (int i = stride - 1; i > 0; --i) {
+    const int j = static_cast<int>(rng.next() % (i + 1));
+    std::swap(perm[i], perm[j]);
+  }
+
+  std::uint16_t *dq, *dref, *dgotp;
+  int *dpt;
+  std::uint16_t *dk, *dv, *dkp, *dvp;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dref, qn * 2) ||
+      cudaMalloc(&dgotp, qn * 2) || cudaMalloc(&dpt, sizeof(int) * stride) ||
+      cudaMalloc(&dk, cn * 2) || cudaMalloc(&dv, cn * 2) ||
+      cudaMalloc(&dkp, cn * 2) || cudaMalloc(&dvp, cn * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dpt, perm.data(), sizeof(int) * stride, cudaMemcpyHostToDevice));
+
+  // ---- bf16: permuted arena, d_pt, must equal the contiguous reference ----
+  std::vector<std::uint16_t> ckp(cn), cvp(cn);
+  for (int hkv = 0; hkv < Hk; ++hkv)
+    for (int pos = 0; pos < stride; ++pos) {
+      const std::size_t src = static_cast<std::size_t>(hkv) * stride * d + pos * d;
+      const std::size_t dst =
+          static_cast<std::size_t>(hkv) * stride * d + static_cast<std::size_t>(perm[pos]) * d;
+      std::copy(ck.begin() + src, ck.begin() + src + d, ckp.begin() + dst);
+      std::copy(cv.begin() + src, cv.begin() + src + d, cvp.begin() + dst);
+    }
+  CUDA_CHECK(cudaMemcpy(dkp, ckp.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dvp, cvp.data(), cn * 2, cudaMemcpyHostToDevice));
+  expect(granite4::prefill_attention(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride,
+                                     dref) == 0,
+         "paged prefill: contiguous bf16 reference");
+  expect(granite4::prefill_attention(dq, dkp, dvp, scale, Hq, Hk, d, base, rows, stride,
+                                     dgotp, nullptr, nullptr, nullptr, nullptr, false,
+                                     nullptr, nullptr, false, dpt) == 0,
+         "paged prefill: permuted bf16 launch");
+  std::vector<std::uint16_t> ref(qn), got(qn);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got.data(), dgotp, qn * 2, cudaMemcpyDeviceToHost));
+  double max_err = 0.0;
+  for (std::size_t i = 0; i < qn; ++i)
+    max_err = std::max(max_err,
+                       static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) -
+                                                    bf16_to_f32_host(ref[i]))));
+  expect(max_err == 0.0, "paged prefill (bf16): bit-identical to contiguous");
+
+  // ---- KV8: codes + scales travel with the row; d_pt must pick up both ----
+  {
+    std::vector<std::int8_t> c8k(cn), c8v(cn);
+    std::vector<float> sk(Hk * stride), sv(Hk * stride);
+    for (int h = 0; h < Hk; ++h)
+      for (int p = 0; p < stride; ++p) {
+        const std::size_t row = static_cast<std::size_t>(h) * stride + p;
+        const std::size_t src = row * d;
+        float ak = 0.0f, av = 0.0f;
+        for (int i = 0; i < d; ++i) {
+          ak = std::max(ak, std::fabs(bf16_to_f32_host(ck[src + i])));
+          av = std::max(av, std::fabs(bf16_to_f32_host(cv[src + i])));
+        }
+        const float sks = kv8_scale_host(ak), svs = kv8_scale_host(av);
+        sk[row] = sks;
+        sv[row] = svs;
+        for (int i = 0; i < d; ++i) {
+          c8k[row * d + i] = kv8_quant_host(bf16_to_f32_host(ck[src + i]), sks);
+          c8v[row * d + i] = kv8_quant_host(bf16_to_f32_host(cv[src + i]), svs);
+        }
+      }
+    // permuted: code rows and their scales both move to perm[pos].
+    std::vector<std::int8_t> c8kp(cn), c8vp(cn);
+    std::vector<float> skp(Hk * stride), svp(Hk * stride);
+    for (int hkv = 0; hkv < Hk; ++hkv)
+      for (int pos = 0; pos < stride; ++pos) {
+        const std::size_t src = static_cast<std::size_t>(hkv) * stride + pos;
+        const std::size_t dst =
+            static_cast<std::size_t>(hkv) * stride + static_cast<std::size_t>(perm[pos]);
+        std::copy(c8k.begin() + src * d, c8k.begin() + src * d + d, c8kp.begin() + dst * d);
+        std::copy(c8v.begin() + src * d, c8v.begin() + src * d + d, c8vp.begin() + dst * d);
+        skp[dst] = sk[src];
+        svp[dst] = sv[src];
+      }
+    std::int8_t *dc8k, *dc8v, *dc8kp, *dc8vp;
+    float *dsk, *dsv, *dskp, *dsvp;
+    if (cudaMalloc(&dc8k, cn) || cudaMalloc(&dc8v, cn) ||
+        cudaMalloc(&dc8kp, cn) || cudaMalloc(&dc8vp, cn) ||
+        cudaMalloc(&dsk, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dsv, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dskp, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dsvp, sizeof(float) * Hk * stride)) {
+      ++g_failures;
+      return;
+    }
+    CUDA_CHECK(cudaMemcpy(dc8k, c8k.data(), cn, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc8v, c8v.data(), cn, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc8kp, c8kp.data(), cn, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc8vp, c8vp.data(), cn, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsk, sk.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsv, sv.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dskp, skp.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsvp, svp.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    expect(granite4::prefill_attention(dq, nullptr, nullptr, scale, Hq, Hk, d, base, rows,
+                                       stride, dref, dc8k, dc8v, dsk, dsv, true,
+                                       nullptr, nullptr, false) == 0,
+           "paged prefill: contiguous kv8 reference");
+    expect(granite4::prefill_attention(dq, nullptr, nullptr, scale, Hq, Hk, d, base, rows,
+                                       stride, dgotp, dc8kp, dc8vp, dskp, dsvp, true,
+                                       nullptr, nullptr, false, dpt) == 0,
+           "paged prefill: permuted kv8 launch");
+    CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(got.data(), dgotp, qn * 2, cudaMemcpyDeviceToHost));
+    double max_err8 = 0.0;
+    for (std::size_t i = 0; i < qn; ++i)
+      max_err8 = std::max(max_err8,
+                           static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) -
+                                                       bf16_to_f32_host(ref[i]))));
+    expect(max_err8 == 0.0, "paged prefill (kv8): bit-identical to contiguous");
+    cudaFree(dc8k);
+    cudaFree(dc8v);
+    cudaFree(dc8kp);
+    cudaFree(dc8vp);
+    cudaFree(dsk);
+    cudaFree(dsv);
+    cudaFree(dskp);
+    cudaFree(dsvp);
+  }
+
+  // ---- KV4: same contract, two codes per byte ----
+  {
+    std::vector<std::uint8_t> c4k(Hk * stride * (d / 2)), c4v(Hk * stride * (d / 2));
+    std::vector<float> sk(Hk * stride), sv(Hk * stride);
+    for (int h = 0; h < Hk; ++h)
+      for (int p = 0; p < stride; ++p) {
+        const std::size_t row = static_cast<std::size_t>(h) * stride + p;
+        const std::size_t src = row * d;
+        float ak = 0.0f, av = 0.0f;
+        for (int i = 0; i < d; ++i) {
+          ak = std::max(ak, std::fabs(bf16_to_f32_host(ck[src + i])));
+          av = std::max(av, std::fabs(bf16_to_f32_host(cv[src + i])));
+        }
+        const float sks = q4_scale_host(ak), svs = q4_scale_host(av);
+        sk[row] = sks;
+        sv[row] = svs;
+        for (int w = 0; w < d / 2; ++w) {
+          c4k[row * (d / 2) + w] = static_cast<std::uint8_t>(
+              (q4_quant_host(bf16_to_f32_host(ck[src + 2 * w]), sks) & 0x0fu) |
+              (q4_quant_host(bf16_to_f32_host(ck[src + 2 * w + 1]), sks) << 4));
+          c4v[row * (d / 2) + w] = static_cast<std::uint8_t>(
+              (q4_quant_host(bf16_to_f32_host(cv[src + 2 * w]), svs) & 0x0fu) |
+              (q4_quant_host(bf16_to_f32_host(cv[src + 2 * w + 1]), svs) << 4));
+        }
+      }
+    std::vector<std::uint8_t> c4kp(Hk * stride * (d / 2)), c4vp(Hk * stride * (d / 2));
+    std::vector<float> skp(Hk * stride), svp(Hk * stride);
+    for (int hkv = 0; hkv < Hk; ++hkv)
+      for (int pos = 0; pos < stride; ++pos) {
+        const std::size_t src = static_cast<std::size_t>(hkv) * stride + pos;
+        const std::size_t dst =
+            static_cast<std::size_t>(hkv) * stride + static_cast<std::size_t>(perm[pos]);
+        std::copy(c4k.begin() + src * (d / 2), c4k.begin() + src * (d / 2) + d / 2,
+                  c4kp.begin() + dst * (d / 2));
+        std::copy(c4v.begin() + src * (d / 2), c4v.begin() + src * (d / 2) + d / 2,
+                  c4vp.begin() + dst * (d / 2));
+        skp[dst] = sk[src];
+        svp[dst] = sv[src];
+      }
+    std::uint8_t *dc4k, *dc4v, *dc4kp, *dc4vp;
+    float *dsk, *dsv, *dskp, *dsvp;
+    if (cudaMalloc(&dc4k, c4k.size()) || cudaMalloc(&dc4v, c4v.size()) ||
+        cudaMalloc(&dc4kp, c4kp.size()) || cudaMalloc(&dc4vp, c4vp.size()) ||
+        cudaMalloc(&dsk, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dsv, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dskp, sizeof(float) * Hk * stride) ||
+        cudaMalloc(&dsvp, sizeof(float) * Hk * stride)) {
+      ++g_failures;
+      return;
+    }
+    CUDA_CHECK(cudaMemcpy(dc4k, c4k.data(), c4k.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc4v, c4v.data(), c4v.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc4kp, c4kp.data(), c4kp.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dc4vp, c4vp.data(), c4vp.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsk, sk.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsv, sv.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dskp, skp.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dsvp, svp.data(), sizeof(float) * Hk * stride, cudaMemcpyHostToDevice));
+    expect(granite4::prefill_attention(dq, nullptr, nullptr, scale, Hq, Hk, d, base, rows,
+                                       stride, dref, nullptr, nullptr, dsk, dsv, false,
+                                       dc4k, dc4v, true) == 0,
+           "paged prefill: contiguous kv4 reference");
+    expect(granite4::prefill_attention(dq, nullptr, nullptr, scale, Hq, Hk, d, base, rows,
+                                       stride, dgotp, nullptr, nullptr, dskp, dsvp, false,
+                                       dc4kp, dc4vp, true, dpt) == 0,
+           "paged prefill: permuted kv4 launch");
+    CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(got.data(), dgotp, qn * 2, cudaMemcpyDeviceToHost));
+    double max_err4 = 0.0;
+    for (std::size_t i = 0; i < qn; ++i)
+      max_err4 = std::max(max_err4,
+                           static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) -
+                                                       bf16_to_f32_host(ref[i]))));
+    expect(max_err4 == 0.0, "paged prefill (kv4): bit-identical to contiguous");
+    cudaFree(dc4k);
+    cudaFree(dc4v);
+    cudaFree(dc4kp);
+    cudaFree(dc4vp);
+    cudaFree(dsk);
+    cudaFree(dsv);
+    cudaFree(dskp);
+    cudaFree(dsvp);
+  }
+
+  cudaFree(dq);
+  cudaFree(dref);
+  cudaFree(dgotp);
+  cudaFree(dpt);
+  cudaFree(dk);
+  cudaFree(dv);
+  cudaFree(dkp);
+  cudaFree(dvp);
+}
+
 // Split-KV attention vs fused GQA on long prefixes (several splits), both
 // with a host kv_base and with the position read from device memory; the
 // device-position single row must equal the corresponding batched row
@@ -1077,6 +1692,225 @@ static void test_attn_split_device() {
   cudaFree(dpos); cudaFree(scratch);
 }
 
+// Phase 4: paged decode attention. The KV arena need not be contiguous per
+// sequence - shared-prefix pages can sit anywhere in the arena, so the row
+// holding a logical position is gathered from a device position->row table
+// (d_pt). With d_pt null the kernel is the contiguous identity layout; with
+// a permutation d_pt the SAME logical cache is read out of a physically
+// permuted arena. The paged and contiguous results are bit-identical (same
+// split-KV kernel, same logical K/V in the same order), and both match the
+// fused-GQA reference within bf16 tolerance (the split path has a per-split
+// combine pass, so it is not bit-identical to the fused one).
+static void test_paged_attn_split_device() {
+  const int Hq = 8, Hk = 2, d = 128, stride = 1500, base = 1203, rows = 4;
+  Xorshift64 rng(0x9e57);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  const float scale = 0.0078125f * 8.0f;
+
+  // A fixed permutation of the arena rows: perm[pos] is the physical row that
+  // holds logical position pos. Fisher-Yates makes it a real (non-identity)
+  // bijection, so the permuted arena is not trivially re-sorted.
+  std::vector<int> perm(stride);
+  for (int p = 0; p < stride; ++p) perm[p] = p;
+  for (int i = stride - 1; i > 0; --i) {
+    const int j = static_cast<int>(rng.next() % (i + 1));
+    std::swap(perm[i], perm[j]);
+  }
+
+  std::uint16_t *dq, *dref, *dgot, *dgotp;
+  int *dpos, *dpt;
+  void* scratch;
+  if (cudaMalloc(&dq, qn * 2) ||
+      cudaMalloc(&dref, qn * 2) || cudaMalloc(&dgot, qn * 2) ||
+      cudaMalloc(&dgotp, qn * 2) || cudaMalloc(&dpos, sizeof(int)) ||
+      cudaMalloc(&dpt, sizeof(int) * stride) ||
+      cudaMalloc(&scratch, granite4::attn_split_scratch_bytes(Hq, rows, stride))) {
+    ++g_failures;
+    return;
+  }
+
+  // Contiguous reference: the original arena, no row table.
+  std::uint16_t *dk, *dv;
+  if (cudaMalloc(&dk, cn * 2) || cudaMalloc(&dv, cn * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  expect(granite4_kernel_gqa_fused_rows(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride,
+                                         dref) == 0,
+         "paged attention: reference launch");
+  expect(granite4::attn_split(dq, dk, dv, scale, Hq, Hk, d, base, nullptr, rows, stride,
+                               scratch, dgot) == 0,
+         "paged attention: contiguous launch");
+
+  // Build the permuted arena: physical row perm[pos] holds logical position pos.
+  std::vector<std::uint16_t> ckp(cn), cvp(cn);
+  for (int hkv = 0; hkv < Hk; ++hkv)
+    for (int pos = 0; pos < stride; ++pos) {
+      const std::size_t src = static_cast<std::size_t>(hkv) * stride * d + static_cast<std::size_t>(pos) * d;
+      const std::size_t dst = static_cast<std::size_t>(hkv) * stride * d +
+                              static_cast<std::size_t>(perm[pos]) * d;
+      std::copy(ck.begin() + src, ck.begin() + src + d, ckp.begin() + dst);
+      std::copy(cv.begin() + src, cv.begin() + src + d, cvp.begin() + dst);
+    }
+  std::uint16_t *dkp, *dvp;
+  if (cudaMalloc(&dkp, cn * 2) || cudaMalloc(&dvp, cn * 2)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dkp, ckp.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dvp, cvp.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dpt, perm.data(), sizeof(int) * stride, cudaMemcpyHostToDevice));
+
+  // Paged: the permuted arena read through the row table must match the
+  // contiguous reference bit-for-bit.
+  expect(granite4::attn_split(dq, dkp, dvp, scale, Hq, Hk, d, base, nullptr, rows, stride,
+                               scratch, dgotp, nullptr, nullptr, nullptr, nullptr, false,
+                               nullptr, nullptr, false, dpt) == 0,
+         "paged attention: paged launch");
+
+  // The split-KV path and the fused-GQA reference are different algorithms
+  // (the split path has a per-split max/sum combine), so they are only
+  // bf16-close, not bit-identical - same tolerance as test_attn_split_device.
+  // The paged-vs-contiguous comparison, however, is between two calls of the
+  // SAME split kernel (one with a null row table, one with a permutation), so
+  // it must be bit-identical: permuting the arena through d_pt gathers the
+  // same logical K/V rows in the same order, with the same arithmetic.
+  std::vector<std::uint16_t> ref(qn), got(qn), gotp(qn);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got.data(), dgot, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(gotp.data(), dgotp, qn * 2, cudaMemcpyDeviceToHost));
+  double max_err = 0.0;
+  bool paged_ok = true;
+  for (std::size_t i = 0; i < qn; ++i) {
+    max_err = std::max(max_err, static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) -
+                                                              bf16_to_f32_host(ref[i]))));
+    if (gotp[i] != got[i]) paged_ok = false;
+  }
+  std::printf("  paged attention: contiguous vs fused max |delta| = %.5f\n", max_err);
+  expect(max_err < 0.03, "paged attention: contiguous split matches fused GQA (bf16 tolerance)");
+  expect(paged_ok, "paged attention: permuted arena via d_pt == contiguous (bit-identical)");
+
+  cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dkp); cudaFree(dvp);
+  cudaFree(dref); cudaFree(dgot); cudaFree(dgotp); cudaFree(dpos); cudaFree(dpt);
+  cudaFree(scratch);
+}
+
+static void test_paged_gqa_fused_device() {
+  // Phase 4: the fused-GQA kernels read KV rows through the same row table
+  // (d_pt) the split attention and the batched append use, so a paged KV pool
+  // can be read by EITHER attention path. The arena is physically permuted
+  // (physical row perm[pos] holds logical position pos) and the row table maps
+  // logical position -> physical row. The kernel then gathers the same logical
+  // K/V rows in the same order as the contiguous launch, so paged vs
+  // contiguous must be bit-identical (same kernel, same arithmetic; the only
+  // difference is an extra load from the table). If d_pt were ignored the
+  // permuted arena would read different rows and this would fail.
+  const int Hq = 8, Hk = 2, d = 128, stride = 1500, base = 1203, rows = 4;
+  Xorshift64 rng(0xf1a2);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  const float scale = 0.0078125f * 8.0f;
+
+  std::vector<int> perm(stride);
+  for (int p = 0; p < stride; ++p) perm[p] = p;
+  for (int i = stride - 1; i > 0; --i) {
+    const int j = static_cast<int>(rng.next() % (i + 1));
+    std::swap(perm[i], perm[j]);
+  }
+
+  std::uint16_t *dq, *dref, *dgotp;
+  std::uint16_t *dk, *dv, *dkp, *dvp;
+  int *dpt, *dpos;
+  int pos_h = base;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dref, qn * 2) ||
+      cudaMalloc(&dgotp, qn * 2) || cudaMalloc(&dk, cn * 2) ||
+      cudaMalloc(&dv, cn * 2) || cudaMalloc(&dkp, cn * 2) ||
+      cudaMalloc(&dvp, cn * 2) || cudaMalloc(&dpt, sizeof(int) * stride) ||
+      cudaMalloc(&dpos, sizeof(int))) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dpt, perm.data(), sizeof(int) * stride, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dpos, &pos_h, sizeof(int), cudaMemcpyHostToDevice));
+  expect(granite4_kernel_gqa_fused_rows(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride,
+                                        dref) == 0,
+         "paged fused: contiguous reference launch");
+
+  // Build the permuted arena, same construction as the paged split test.
+  std::vector<std::uint16_t> ckp(cn), cvp(cn);
+  for (int hkv = 0; hkv < Hk; ++hkv)
+    for (int pos = 0; pos < stride; ++pos) {
+      const std::size_t src = static_cast<std::size_t>(hkv) * stride * d +
+                              static_cast<std::size_t>(pos) * d;
+      const std::size_t dst = static_cast<std::size_t>(hkv) * stride * d +
+                              static_cast<std::size_t>(perm[pos]) * d;
+      std::copy(ck.begin() + src, ck.begin() + src + d, ckp.begin() + dst);
+      std::copy(cv.begin() + src, cv.begin() + src + d, cvp.begin() + dst);
+    }
+  CUDA_CHECK(cudaMemcpy(dkp, ckp.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dvp, cvp.data(), cn * 2, cudaMemcpyHostToDevice));
+  expect(granite4_kernel_gqa_fused_rows(dq, dkp, dvp, scale, Hq, Hk, d, base, rows, stride,
+                                        dgotp, dpt) == 0,
+         "paged fused: paged launch (rows)");
+
+  std::vector<std::uint16_t> ref(qn), gotp(qn);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(gotp.data(), dgotp, qn * 2, cudaMemcpyDeviceToHost));
+  bool paged_ok = true;
+  for (std::size_t i = 0; i < qn; ++i)
+    if (gotp[i] != ref[i]) paged_ok = false;
+  expect(paged_ok,
+         "paged fused: permuted arena via d_pt == contiguous (bit-identical, rows)");
+
+  // Single-row decode form (d_pos + d_pt): the captured-graph replay path.
+  // One query row at position base; kv_len bounds the shared memory.
+  std::uint16_t *dref1, *dgot1;
+  if (cudaMalloc(&dref1, static_cast<std::size_t>(Hq) * d * 2) ||
+      cudaMalloc(&dgot1, static_cast<std::size_t>(Hq) * d * 2)) {
+    cudaFree(dq); cudaFree(dref); cudaFree(dgotp);
+    cudaFree(dk); cudaFree(dv); cudaFree(dkp); cudaFree(dvp);
+    cudaFree(dpt); cudaFree(dpos);
+    ++g_failures;
+    return;
+  }
+  const int kv1 = base + 1;
+  expect(granite4_kernel_gqa_fused(dq, dk, dv, scale, Hq, Hk, d, kv1, stride,
+                                   dref1) == 0,
+         "paged fused: single-row contiguous launch");
+  expect(granite4_kernel_gqa_fused_pos(dq, dkp, dvp, scale, Hq, Hk, d, kv1, stride,
+                                       dpos, dgot1, dpt) == 0,
+         "paged fused: single-row paged launch (d_pos + d_pt)");
+  const std::size_t n1 = static_cast<std::size_t>(Hq) * d;
+  std::vector<std::uint16_t> ref1(n1), got1(n1);
+  CUDA_CHECK(cudaMemcpy(ref1.data(), dref1, n1 * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got1.data(), dgot1, n1 * 2, cudaMemcpyDeviceToHost));
+  bool paged1_ok = true;
+  for (std::size_t i = 0; i < n1; ++i)
+    if (got1[i] != ref1[i]) paged1_ok = false;
+  expect(paged1_ok,
+         "paged fused: permuted arena via d_pt == contiguous (bit-identical, d_pos)");
+
+  cudaFree(dq); cudaFree(dref); cudaFree(dgotp);
+  cudaFree(dref1); cudaFree(dgot1);
+  cudaFree(dk); cudaFree(dv); cudaFree(dkp); cudaFree(dvp);
+  cudaFree(dpt); cudaFree(dpos);
+}
+
 static void test_batched_verify_attention_device() {
   // P4: the batched verify kernels must be bit-identical, row by row, to the
   // single-row path. Row r appends its KV at position base+r and attends the
@@ -1127,13 +1961,13 @@ static void test_batched_verify_attention_device() {
   CUDA_CHECK(cudaMemcpy(drv, ev.data(), ev.size() * 2, cudaMemcpyHostToDevice));
 
   expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, rows,
-                                           stride, Hk, d) == 0,
+                                           stride, Hk, d, nullptr) == 0,
          "batched kv append: launch");
   expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, 17, stride + 64,
-                                           Hk, d) == -1,
+                                           Hk, d, nullptr) == -1,
          "batched kv append: rejects rows > 16");
   expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, rows,
-                                           base + rows - 1, Hk, d) == -1,
+                                           base + rows - 1, Hk, d, nullptr) == -1,
          "batched kv append: rejects stride < base+rows");
 
   std::vector<std::uint16_t> gak(ck.size()), gav(cv.size());
@@ -1175,6 +2009,88 @@ static void test_batched_verify_attention_device() {
   cudaFree(dout);
   cudaFree(dref);
 }
+
+static void test_paged_kv_append_batched_device() {
+   // Phase 4: batched append must write into arena rows d_pt[pos] (not the
+   // contiguous pos), so that a paged KV pool can share a physical arena
+   // across sequences while the logical cache remains a contiguous view
+   // through the row table. The row table is the same one attention reads
+   // through, so the append lands where a later read looks.
+   //
+   // We compare two launches of the SAME batched kernel on the SAME source
+   // KV:
+   //   (a) d_pt == nullptr (contiguous identity layout)
+   //   (b) d_pt == perm (a physical permutation)
+   // The kernel writes logical position pos to arena row d_pt[pos] == perm[pos],
+   // so the paged cache's physical row perm[pos] must equal the contiguous
+   // cache's physical row pos. Un-permuting the paged result via the same
+   // table yields a bit-identical result.
+   const int Hk = 8, d = 128, base = 5, rows = 4, stride = 64;
+   Xorshift64 rng(0x5050);
+   const std::size_t src_elems = static_cast<std::size_t>(rows) * Hk * d;
+   std::vector<std::uint16_t> sk(src_elems), sv(src_elems);
+   for (auto& t : sk) t = f32_to_bf16_host(rng.next_float_range(2.0));
+   for (auto& t : sv) t = f32_to_bf16_host(rng.next_float_range(2.0));
+
+   const int max_pos = 64;
+   std::vector<int> perm(max_pos);
+   for (int r = 0; r < max_pos; ++r) perm[r] = r;
+   std::swap(perm[base], perm[base + rows - 1]);
+   std::swap(perm[base + 1], perm[base + rows - 2]);
+
+   const std::size_t cache_elems = static_cast<std::size_t>(Hk) * max_pos * d;
+   std::vector<std::uint16_t> host_c_contig(cache_elems, 0), host_c_paged(cache_elems, 0);
+   std::vector<std::uint16_t> host_c_contig_v(cache_elems, 0), host_c_paged_v(cache_elems, 0);
+   std::uint16_t *dsk, *dsv, *dak, *dav, *dcp, *dcp_v;
+   int* dperm;
+   const std::size_t bytes = cache_elems * sizeof(std::uint16_t);
+   CUDA_CHECK(cudaMalloc(&dsk, src_elems * sizeof(std::uint16_t)));
+   CUDA_CHECK(cudaMalloc(&dsv, src_elems * sizeof(std::uint16_t)));
+   CUDA_CHECK(cudaMalloc(&dak, bytes));
+   CUDA_CHECK(cudaMalloc(&dav, bytes));
+   CUDA_CHECK(cudaMalloc(&dcp, bytes));
+   CUDA_CHECK(cudaMalloc(&dcp_v, bytes));
+   CUDA_CHECK(cudaMalloc(&dperm, max_pos * sizeof(int)));
+   CUDA_CHECK(cudaMemset(dak, 0, bytes));
+   CUDA_CHECK(cudaMemset(dav, 0, bytes));
+   CUDA_CHECK(cudaMemset(dcp, 0, bytes));
+   CUDA_CHECK(cudaMemset(dcp_v, 0, bytes));
+   CUDA_CHECK(cudaMemcpy(dsk, sk.data(), src_elems * 2, cudaMemcpyHostToDevice));
+   CUDA_CHECK(cudaMemcpy(dsv, sv.data(), src_elems * 2, cudaMemcpyHostToDevice));
+   CUDA_CHECK(cudaMemcpy(dperm, perm.data(), max_pos * sizeof(int),
+                         cudaMemcpyHostToDevice));
+
+   expect(granite4_kernel_kv_append_batched(dsk, dsv, dak, dav, base, rows, stride,
+                                            Hk, d, nullptr) == 0,
+          "paged append: contiguous launch");
+   expect(granite4_kernel_kv_append_batched(dsk, dsv, dcp, dcp_v, base, rows, stride,
+                                            Hk, d, dperm) == 0,
+          "paged append: paged launch");
+
+   CUDA_CHECK(cudaMemcpy(host_c_contig.data(), dak, bytes, cudaMemcpyDeviceToHost));
+   CUDA_CHECK(cudaMemcpy(host_c_contig_v.data(), dav, bytes, cudaMemcpyDeviceToHost));
+   CUDA_CHECK(cudaMemcpy(host_c_paged.data(), dcp, bytes, cudaMemcpyDeviceToHost));
+   CUDA_CHECK(cudaMemcpy(host_c_paged_v.data(), dcp_v, bytes, cudaMemcpyDeviceToHost));
+   bool ok = true;
+   for (int hkv = 0; hkv < Hk; ++hkv) {
+     for (int pos = 0; pos < stride; ++pos) {
+       const int phys = perm[pos];
+       const std::size_t ci = static_cast<std::size_t>(hkv) * stride * d +
+                              static_cast<std::size_t>(pos) * d;
+       const std::size_t pi = static_cast<std::size_t>(hkv) * stride * d +
+                              static_cast<std::size_t>(phys) * d;
+       for (int i = 0; i < d; ++i) {
+         if (host_c_paged[pi + i] != host_c_contig[ci + i]) ok = false;
+         if (host_c_paged_v[pi + i] != host_c_contig_v[ci + i]) ok = false;
+       }
+     }
+   }
+   expect(ok,
+          "paged append: permuted arena via d_pt == contiguous (bit-identical)");
+
+   cudaFree(dsk); cudaFree(dsv); cudaFree(dak); cudaFree(dav);
+   cudaFree(dcp); cudaFree(dcp_v); cudaFree(dperm);
+ }
 
 static void test_batched_silu_gate_up_device() {
   const int N = 257, K = 4096, rows = 4;
@@ -1686,6 +2602,323 @@ static void test_batched_forward_range_parity_device() {
   gpu_ctx_free(batch_ctx);
 }
 
+// Two sessions on ONE shared KV arena (P4): each context's KV lives in
+// interleaved, non-contiguous rows of the same pool, the contexts are driven
+// alternately (prefill, decode, a batched verify width), and every logits row
+// must equal - bit for bit - what a private [max_pos] cache produces for the
+// same tokens. Covers all three persistent-KV formats (bf16, KV8, KV4), the
+// unmapped-row guard, row-table validation, and a shared prefill scratch.
+static void test_shared_arena_sessions_device() {
+  ModelConfig model;
+  model.num_layers = 2;
+  model.hidden_size = 512;  // == Hq * d, as the synthetic q projection assumes
+  model.intermediate_size = 256;
+  model.num_attention_heads = 4;
+  model.num_key_value_heads = 1;
+  model.head_dim = 128;  // split-KV attention shape (d == 128, Hq == 4 * Hk)
+  model.vocab_size = 512;
+  model.max_context_length = 131072;
+  ForwardSpec spec;
+  const int L = 2, H = 512, I = 256, Hq = 4, Hk = 1, d = 128, V = 512;
+  const int max_pos = 64, arena_rows = 192;
+  const auto z = [](int v) { return static_cast<std::size_t>(v); };
+  const GpuWeightsLayout lay{z(H), z(I), z(V), z(L), z(Hq), z(Hk), z(d)};
+  Xorshift64 rng(0xA7E4A);
+  std::vector<std::uint8_t> weights(lay.total_bytes());
+  auto fill_bf16 = [&](std::size_t off, std::size_t elems) {
+    for (std::size_t i = 0; i < elems; ++i) {
+      const std::uint16_t v = gen_bf16(rng);
+      weights[off + 2 * i] = static_cast<std::uint8_t>(v & 0xffu);
+      weights[off + 2 * i + 1] = static_cast<std::uint8_t>(v >> 8);
+    }
+  };
+  auto fill_fp8 = [&](std::size_t off, std::size_t elems) {
+    for (std::size_t i = 0; i < elems; ++i)
+      weights[off + i] = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  };
+  fill_bf16(0, z(V) * H);
+  for (int layer = 0; layer < L; ++layer) {
+    const std::size_t base = lay.embed_bytes() + z(layer) * lay.layer_bytes();
+    fill_bf16(base + lay.off_attn_norm(), H);
+    fill_bf16(base + lay.off_ffn_norm(), H);
+    fill_fp8(base + lay.off_q(), z(H) * H);
+    fill_fp8(base + lay.off_k(), z(Hk) * d * H);
+    fill_fp8(base + lay.off_v(), z(Hk) * d * H);
+    fill_fp8(base + lay.off_o(), z(H) * H);
+    fill_fp8(base + lay.off_gate(), z(I) * H);
+    fill_fp8(base + lay.off_up(), z(I) * H);
+    fill_fp8(base + lay.off_down(), z(H) * I);
+  }
+  fill_bf16(lay.final_norm_off(), H);
+  fill_fp8(lay.lm_head_off(), z(V) * H);
+  std::vector<float> scales(lay.num_scales());
+  for (auto& s : scales) s = 0.1f + 0.9f * rng.next_float_range(1.0);
+
+  const int seq_len = 32;
+  std::vector<std::int32_t> tok[2];
+  for (int s = 0; s < 2; ++s) {
+    tok[s].resize(seq_len);
+    for (int i = 0; i < seq_len; ++i) tok[s][i] = (i * (s == 0 ? 97 : 57) + (s == 0 ? 13 : 201)) % V;
+  }
+  std::int32_t* d_tok[2] = {nullptr, nullptr};
+  std::uint16_t* d_logits = nullptr;
+  bool alloc_ok = cudaMalloc(&d_logits, z(max_pos) * V * 2) == cudaSuccess;
+  for (int s = 0; s < 2; ++s) {
+    alloc_ok = alloc_ok && cudaMalloc(&d_tok[s], z(seq_len) * 4) == cudaSuccess;
+    if (alloc_ok)
+      CUDA_CHECK(cudaMemcpy(d_tok[s], tok[s].data(), z(seq_len) * 4, cudaMemcpyHostToDevice));
+  }
+  if (!alloc_ok) {
+    ++g_failures;
+    return;
+  }
+  // 20-row prefill, two single decodes, an 8-row batched verify, a decode.
+  const int ends[] = {20, 21, 22, 30, 31};
+  constexpr int kSteps = 5;
+  char err[256];
+  const char* const modes[] = {"0", "1", "4"};
+  const char* const mode_name[] = {"bf16", "KV8", "KV4"};
+  for (int m = 0; m < 3; ++m) {
+    setenv("G4_KV8", modes[m], 1);
+    std::string tag = std::string("shared arena [") + mode_name[m] + "]: ";
+    // Reference: one private-cache context, run once per token sequence.
+    GpuCtx* ref = gpu_ctx_create(model, spec, max_pos);
+    expect(ref != nullptr, (tag + "ref ctx").c_str());
+    if (ref == nullptr ||
+        gpu_weights_load(ref, weights.data(), weights.size(), scales.data(), scales.size(), err,
+                         sizeof(err)) != 0) {
+      ++g_failures;
+      gpu_ctx_free(ref);
+      continue;
+    }
+    std::vector<std::uint16_t> want[2];
+    for (int s = 0; s < 2; ++s) {
+      expect(gpu_ctx_truncate(ref, 0) == 0, (tag + "ref reset").c_str());
+      for (int e = 0; e < kSteps; ++e) {
+        const int prev = e > 0 ? ends[e - 1] : 0;
+        const bool ok = gpu_forward_range(ref, d_tok[s], ends[e], d_logits, err, sizeof(err)) == 0;
+        expect(ok, (tag + "ref forward").c_str());
+        if (!ok) break;
+        std::vector<std::uint16_t> rows(z(ends[e] - prev) * V);
+        CUDA_CHECK(cudaMemcpy(rows.data(), d_logits + z(prev) * V, rows.size() * 2,
+                              cudaMemcpyDeviceToHost));
+        want[s].insert(want[s].end(), rows.begin(), rows.end());
+      }
+    }
+    gpu_ctx_free(ref);
+    // The shared arena, one weight object, and two contexts on them.
+    GpuKvArena* arena = gpu_kv_arena_create(model, arena_rows, err, sizeof(err));
+    GpuWeights* wobj = gpu_weights_create();
+    expect(arena != nullptr && wobj != nullptr, (tag + "arena + weights").c_str());
+    if (arena == nullptr || wobj == nullptr ||
+        gpu_weights_load(wobj, weights.data(), weights.size(), scales.data(), scales.size(), err,
+                         sizeof(err)) != 0) {
+      ++g_failures;
+      gpu_kv_arena_free(arena);
+      gpu_weights_free_obj(wobj);
+      continue;
+    }
+    expect(gpu_ctx_create_paged(model, spec, arena_rows + 1, arena) == nullptr,
+           (tag + "a context longer than the pool is rejected").c_str());
+    GpuCtx* c[2];
+    for (int s = 0; s < 2; ++s) {
+      c[s] = gpu_ctx_create_paged(model, spec, max_pos, arena);
+      expect(c[s] != nullptr && gpu_ctx_use_weights(c[s], wobj) == 0,
+             (tag + "paged ctx").c_str());
+    }
+    if (c[0] == nullptr || c[1] == nullptr) {
+      ++g_failures;
+      gpu_ctx_free(c[0]);
+      gpu_ctx_free(c[1]);
+      gpu_kv_arena_free(arena);
+      gpu_weights_free_obj(wobj);
+      continue;
+    }
+    expect(gpu_ctx_share_prefill_scratch(c[1], c[0]) == 0, (tag + "share prefill scratch").c_str());
+    // Unmapped contexts must refuse to run.
+    expect(gpu_forward_range(c[0], d_tok[0], 5, d_logits, err, sizeof(err)) != 0,
+           (tag + "forward before mapping rows is rejected").c_str());
+    // Row tables: A on the even rows, B on the odd rows in descending order -
+    // interleaved and non-contiguous inside one arena.
+    std::vector<int> rows_a(max_pos), rows_b(max_pos);
+    for (int i = 0; i < max_pos; ++i) {
+      rows_a[i] = 2 * i;
+      rows_b[i] = 2 * (max_pos - 1 - i) + 1;
+    }
+    std::vector<int> dup = rows_a;
+    dup[7] = dup[3];
+    std::vector<int> oob = rows_a;
+    oob[5] = arena_rows;
+    expect(gpu_ctx_set_kv_rows_n(c[0], dup.data(), max_pos) != 0,
+           (tag + "duplicate rows rejected").c_str());
+    expect(gpu_ctx_set_kv_rows_n(c[0], oob.data(), max_pos) != 0,
+           (tag + "out-of-pool row rejected").c_str());
+    expect(gpu_ctx_set_kv_rows_n(c[0], rows_a.data(), max_pos + 1) != 0,
+           (tag + "more rows than max_pos rejected").c_str());
+    expect(gpu_ctx_mapped_rows(c[0]) == 0, (tag + "failed maps leave it unmapped").c_str());
+    expect(gpu_ctx_set_kv_rows_n(c[0], rows_a.data(), max_pos) == 0 &&
+               gpu_ctx_set_kv_rows_n(c[1], rows_b.data(), 40) == 0,
+           (tag + "map rows").c_str());
+    expect(gpu_forward_range(c[1], d_tok[1], 41, d_logits, err, sizeof(err)) != 0,
+           (tag + "forward past the mapped rows is rejected").c_str());
+    expect(gpu_ctx_set_kv_rows_n(c[1], rows_b.data(), max_pos) == 0, (tag + "remap B").c_str());
+    // Alternate the two sessions step by step; capture each fresh logits row
+    // block right after the forward that wrote it.
+    std::vector<std::uint16_t> got[2];
+    bool ran = true;
+    for (int e = 0; e < kSteps && ran; ++e) {
+      const int prev = e > 0 ? ends[e - 1] : 0;
+      for (int s = 0; s < 2; ++s) {
+        ran = gpu_forward_range(c[s], d_tok[s], ends[e], d_logits, err, sizeof(err)) == 0;
+        expect(ran, (tag + "paged forward").c_str());
+        if (!ran) break;
+        std::vector<std::uint16_t> rows(z(ends[e] - prev) * V);
+        CUDA_CHECK(cudaMemcpy(rows.data(), d_logits + z(prev) * V, rows.size() * 2,
+                              cudaMemcpyDeviceToHost));
+        got[s].insert(got[s].end(), rows.begin(), rows.end());
+      }
+    }
+    bool all_same = true;
+    for (int s = 0; s < 2; ++s) {
+      const bool same = got[s].size() == want[s].size() && !want[s].empty() &&
+                        std::memcmp(got[s].data(), want[s].data(), want[s].size() * 2) == 0;
+      expect(same, (tag + "session " + std::to_string(s) +
+                    " logits are bit-identical to a private cache").c_str());
+      all_same = all_same && same;
+    }
+    if (all_same)
+      std::printf("  shared arena [%s]: 2 interleaved sessions (%zu logits each) "
+                  "bit-identical to private caches\n",
+                  mode_name[m], got[0].size());
+    // Rollback + recompute on a shared arena (the draft-loop rejection path):
+    // truncate A, re-forward the same range, and B's rows must be untouched.
+    if (ran) {
+      std::vector<std::uint16_t> before(z(V)), after(z(V));
+      expect(gpu_ctx_truncate(c[0], 25) == 0, (tag + "truncate A").c_str());
+      expect(gpu_forward_range(c[0], d_tok[0], 31, d_logits, err, sizeof(err)) == 0,
+             (tag + "recompute A").c_str());
+      CUDA_CHECK(cudaMemcpy(after.data(), d_logits + z(30) * V, z(V) * 2, cudaMemcpyDeviceToHost));
+      std::vector<std::uint16_t> want_last(want[0].end() - V, want[0].end());
+      expect(std::memcmp(after.data(), want_last.data(), z(V) * 2) == 0,
+             (tag + "recompute after truncate matches").c_str());
+      expect(gpu_ctx_truncate(c[1], 25) == 0, (tag + "truncate B").c_str());
+      expect(gpu_forward_range(c[1], d_tok[1], 31, d_logits, err, sizeof(err)) == 0,
+             (tag + "recompute B").c_str());
+      CUDA_CHECK(cudaMemcpy(after.data(), d_logits + z(30) * V, z(V) * 2, cudaMemcpyDeviceToHost));
+      std::vector<std::uint16_t> want_last_b(want[1].end() - V, want[1].end());
+      expect(std::memcmp(after.data(), want_last_b.data(), z(V) * 2) == 0,
+             (tag + "B unaffected by A's recompute").c_str());
+    }
+    gpu_ctx_free(c[1]);  // sharer before the scratch owner
+    gpu_ctx_free(c[0]);
+    gpu_kv_arena_free(arena);
+    gpu_weights_free_obj(wobj);
+  }
+  unsetenv("G4_KV8");
+  cudaFree(d_logits);
+  cudaFree(d_tok[0]);
+  cudaFree(d_tok[1]);
+}
+// Multi-row split attention == per-row single-row calls, bit for bit. The
+// batched verify (EAGLE / draft-lookup) is only exact if every verify row
+// equals the decode step at that position, so a K-row attn_split must equal K
+// rows=1 calls - in every KV format, through a paged row table, on a pool
+// wider than the sequence bound (max_len < stride), across row groups.
+static void test_attn_split_rows_bit_identical_device() {
+  const int Hq = 8, Hk = 2, d = 128, stride = 3000, max_len = 2100;
+  Xorshift64 rng(0x5eed7);
+  const std::size_t rowsz = static_cast<std::size_t>(Hk) * stride;  // (head, row) slots
+  std::vector<std::uint16_t> ck(rowsz * d), cv(rowsz * d);
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  std::vector<std::int8_t> k8(rowsz * d), v8(rowsz * d);
+  for (auto& x : k8) x = static_cast<std::int8_t>(static_cast<int>(rng.next() % 255) - 127);
+  for (auto& x : v8) x = static_cast<std::int8_t>(static_cast<int>(rng.next() % 255) - 127);
+  std::vector<std::uint8_t> k4(rowsz * d / 2), v4(rowsz * d / 2);
+  for (auto& x : k4) x = static_cast<std::uint8_t>(rng.next() & 0xffu);
+  for (auto& x : v4) x = static_cast<std::uint8_t>(rng.next() & 0xffu);
+  std::vector<float> ks(rowsz), vs(rowsz);
+  for (auto& x : ks) x = 0.002f + 0.02f * rng.next_float_range(1.0);
+  for (auto& x : vs) x = 0.002f + 0.02f * rng.next_float_range(1.0);
+  // Paged table: logical positions scattered over the wider pool.
+  std::vector<int> pool(stride);
+  for (int i = 0; i < stride; ++i) pool[i] = i;
+  for (int i = stride - 1; i > 0; --i) std::swap(pool[i], pool[rng.next() % (i + 1)]);
+  std::vector<int> pt(pool.begin(), pool.begin() + max_len);
+  const int kMaxR = 13;
+  const std::size_t qn = static_cast<std::size_t>(kMaxR) * Hq * d;
+  std::vector<std::uint16_t> q(qn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  std::uint16_t *dk, *dv, *dq, *dmulti, *dsingle;
+  std::int8_t *dk8, *dv8;
+  std::uint8_t *dk4, *dv4;
+  float *dks, *dvs;
+  int* dpt;
+  void* scratch;
+  const std::size_t scr = granite4::attn_split_scratch_bytes(Hq, kMaxR, max_len);
+  if (cudaMalloc(&dk, ck.size() * 2) || cudaMalloc(&dv, cv.size() * 2) ||
+      cudaMalloc(&dk8, k8.size()) || cudaMalloc(&dv8, v8.size()) ||
+      cudaMalloc(&dk4, k4.size()) || cudaMalloc(&dv4, v4.size()) ||
+      cudaMalloc(&dks, ks.size() * 4) || cudaMalloc(&dvs, vs.size() * 4) ||
+      cudaMalloc(&dq, qn * 2) || cudaMalloc(&dmulti, qn * 2) || cudaMalloc(&dsingle, qn * 2) ||
+      cudaMalloc(&dpt, pt.size() * 4) || cudaMalloc(&scratch, scr)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), ck.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cv.size() * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk8, k8.data(), k8.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv8, v8.data(), v8.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk4, k4.data(), k4.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv4, v4.data(), v4.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dks, ks.data(), ks.size() * 4, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dvs, vs.data(), vs.size() * 4, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dpt, pt.data(), pt.size() * 4, cudaMemcpyHostToDevice));
+  const float scale = 0.0078125f * 8.0f;
+  const char* const names[] = {"bf16", "KV8", "KV4"};
+  for (int fmt = 0; fmt < 3; ++fmt) {
+    for (const int base : {100, 1777}) {  // short (one row per block) and long contexts
+    for (const int R : {2, 7, 13}) {
+      for (const bool paged : {false, true}) {
+        const int* t = paged ? dpt : nullptr;
+        auto call = [&](const std::uint16_t* qp, int kvb, int rows, std::uint16_t* out) {
+          if (fmt == 0)
+            return granite4::attn_split(qp, dk, dv, scale, Hq, Hk, d, kvb, nullptr, rows, stride,
+                                        scratch, out, nullptr, nullptr, nullptr, nullptr, false,
+                                        nullptr, nullptr, false, t, max_len);
+          if (fmt == 1)
+            return granite4::attn_split(qp, nullptr, nullptr, scale, Hq, Hk, d, kvb, nullptr,
+                                        rows, stride, scratch, out, dk8, dv8, dks, dvs, true,
+                                        nullptr, nullptr, false, t, max_len);
+          return granite4::attn_split(qp, nullptr, nullptr, scale, Hq, Hk, d, kvb, nullptr, rows,
+                                      stride, scratch, out, nullptr, nullptr, dks, dvs, false,
+                                      dk4, dv4, true, t, max_len);
+        };
+        const std::string tag = std::string("attn_split rows [") + names[fmt] + " R=" +
+                                std::to_string(R) + " base=" + std::to_string(base) +
+                                (paged ? " paged" : "") + "]: ";
+        expect(call(dq, base, R, dmulti) == 0, (tag + "multi-row launch").c_str());
+        bool launches = true;
+        for (int r = 0; r < R; ++r)
+          launches = launches &&
+                     call(dq + static_cast<std::size_t>(r) * Hq * d, base + r, 1,
+                          dsingle + static_cast<std::size_t>(r) * Hq * d) == 0;
+        expect(launches, (tag + "single-row launches").c_str());
+        std::vector<std::uint16_t> a(static_cast<std::size_t>(R) * Hq * d), b(a.size());
+        CUDA_CHECK(cudaMemcpy(a.data(), dmulti, a.size() * 2, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(b.data(), dsingle, b.size() * 2, cudaMemcpyDeviceToHost));
+        expect(std::memcmp(a.data(), b.data(), a.size() * 2) == 0,
+               (tag + "R-row call bit-identical to R single-row calls").c_str());
+      }
+    }
+    }
+  }
+  std::printf("  attn_split rows: multi-row == single-row (bf16/KV8/KV4, R=2/7/13, paged)\n");
+  cudaFree(dk); cudaFree(dv); cudaFree(dk8); cudaFree(dv8); cudaFree(dk4); cudaFree(dv4);
+  cudaFree(dks); cudaFree(dvs); cudaFree(dq); cudaFree(dmulti); cudaFree(dsingle);
+  cudaFree(dpt); cudaFree(scratch);
+}
 int main() {
   int n = 0;
   if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -1695,6 +2928,9 @@ int main() {
   test_arch_probe();
   test_fp8_decode_all();
   test_fp8_hw_decode();
+  test_kv8_device();
+  test_kv4_device();
+  test_kv4_attn_split_device();
   test_rmsnorm_device();
   test_rope_device();
   test_softmax_device();
@@ -1713,11 +2949,17 @@ int main() {
   test_batched_verify_attention_device();
   test_prefill_gemm_device();
   test_prefill_attention_device();
+  test_paged_prefill_device();
   test_attn_split_device();
+  test_paged_attn_split_device();
+  test_paged_gqa_fused_device();
+  test_paged_kv_append_batched_device();
   test_batched_silu_gate_up_device();
   test_batched_rmsnorm_device();
   test_batched_rope_device();
   test_batched_forward_range_parity_device();
+  test_shared_arena_sessions_device();
+  test_attn_split_rows_bit_identical_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();

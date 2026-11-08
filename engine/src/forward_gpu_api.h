@@ -65,6 +65,62 @@ GpuCtx* gpu_ctx_create(const ModelConfig& model, const ForwardSpec& spec,
 // Free a context and all its device memory.
 void gpu_ctx_free(GpuCtx* ctx);
 
+// ---------------------------------------------------------------------------
+// Shared paged KV arena (P4). One allocation holds the persistent KV cache of
+// every resident sequence; each context addresses it through its own
+// position -> arena-row table, so N sessions share one pool instead of each
+// owning a private [max_positions] cache.
+// ---------------------------------------------------------------------------
+struct GpuKvArena;
+// Allocate an arena of `rows` positions per (layer, kv head), in the format
+// G4_KV8 selects (unset/0 bf16, 1 int8, 4 int4). Needs split-KV attention
+// (d == 128, Hq == 4 * Hk). nullptr + `error` on failure.
+GpuKvArena* gpu_kv_arena_create(const ModelConfig& model, int rows, char* error,
+                                std::size_t error_size);
+void gpu_kv_arena_free(GpuKvArena* arena);
+std::size_t gpu_kv_arena_bytes(const GpuKvArena* arena);
+int gpu_kv_arena_rows(const GpuKvArena* arena);
+// Like gpu_ctx_create, but the context's KV lives in `arena` (not owned: the
+// caller keeps the arena alive for every context on it). max_positions is the
+// longest sequence the context may hold, <= the arena's rows. The context has
+// NO row mapping until gpu_ctx_set_kv_rows_n; forwards past the mapped
+// positions are rejected.
+GpuCtx* gpu_ctx_create_paged(const ModelConfig& model, const ForwardSpec& spec,
+                             int max_positions, GpuKvArena* arena);
+// Map the first n logical positions to arena rows (each in [0, arena rows) and
+// distinct within the table). 0 on success; -1 leaves the table untouched.
+int gpu_ctx_set_kv_rows_n(GpuCtx* ctx, const int* h_rows, int n);
+// Positions [0, mapped) of the context have a valid row.
+int gpu_ctx_mapped_rows(const GpuCtx* ctx);
+// Rows per (layer, head) of the context's KV cache (the arena's pool size).
+int gpu_ctx_kv_stride(const GpuCtx* ctx);
+// The context's device position -> row table (stable address for its life),
+// for kernels outside the forward pass (the EAGLE draft head) that must
+// address the same rows.
+const int* gpu_ctx_kv_rows_device(const GpuCtx* ctx);
+// Borrow `owner`'s prefill scratch (~0.8 GiB) instead of allocating one. Valid
+// only for contexts that never prefill concurrently (the serve loop runs one
+// request at a time). Call before the context's first prefill.
+int gpu_ctx_share_prefill_scratch(GpuCtx* ctx, GpuCtx* owner);
+// The context's tensor-core prefill scratch (allocated on first use), for
+// kernels outside the forward pass that run a prefill-shaped batch between
+// two forwards - the EAGLE head's prompt catch-up. Valid until the next
+// forward on any context that shares it. 0 on success, -1 when it cannot be
+// allocated.
+struct GpuPrefillScratch {
+  std::uint16_t* hidden;  // [rows][H]
+  std::uint16_t* normed;  // [rows][H]
+  std::uint16_t* qkv;     // [rows][(Hq + 2Hk) d]
+  std::uint16_t* q_rot;   // [rows][Hq d]
+  std::uint16_t* attn;    // [rows][Hq d]
+  std::uint16_t* act;     // [rows][I]
+  float* gu;              // [rows][2I] (16-byte aligned; f32 GEMM output)
+  float* ws;              // split-K workspace
+  std::size_t ws_bytes;
+  int rows;               // capacity in rows
+};
+int gpu_ctx_prefill_scratch(GpuCtx* ctx, GpuPrefillScratch* out);
+
 // (See gpu_weights_load above for the weight-object upload; the
 // legacy per-ctx signatures below delegate to it.)
 
@@ -91,6 +147,26 @@ int gpu_ctx_written(GpuCtx* ctx);
 // new watermark are stale and must be overwritten before they are read.
 // Returns 0 on success, -1 for an invalid/null context or forward position.
 int gpu_ctx_truncate(GpuCtx* ctx, int written);
+
+// True when the persistent KV cache is stored as int8 codes + per-row float
+// scale (Q8_0). Reports the *resolved* mode - i.e. after the split-attention
+// capability check in gpu_ctx_create - so a config that requested KV8 but
+// fell back to bf16 reports false.
+bool gpu_ctx_is_kv8(const GpuCtx* ctx);
+
+// True when the persistent KV cache is stored as int4 (Q4_0: two 4-bit codes
+// per byte + per-row float scale). Same ground-truth semantics as
+// gpu_ctx_is_kv8() - reports the resolved mode after the split-attention
+// capability check, so a config that requested int4 KV but fell back to bf16
+// reports false.
+bool gpu_ctx_is_kv4(const GpuCtx* ctx);
+
+// True when the split-KV attention (decode / verify / prefill) is the active
+// path. Implied by gpu_ctx_is_kv8() in the current implementation (KV8 can
+// only use split-KV), but exposed separately because the bf16 mode may use
+// either split-KV or the fused GQA depending on the model shape and
+// G4_SPLIT_ATTN.
+bool gpu_ctx_is_split_attn(const GpuCtx* ctx);
 
 // Compatibility helper: discard the entire KV watermark.
 void gpu_ctx_reset(GpuCtx* ctx);
@@ -165,7 +241,8 @@ int gpu_verify_attention_stage(
     float attention_scale, int base_pos, int rows, int q_heads, int kv_heads,
     int head_dim, int cache_stride, std::uint16_t* d_q_rot,
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k,
-    std::uint16_t* d_cache_v, std::uint16_t* d_out);
+    std::uint16_t* d_cache_v, std::uint16_t* d_out,
+    const int* d_pt = nullptr);
 
 // Project normalized speculative rows and run one transformer's attention block.
 // This compatibility name delegates to the explicitly batched helper below.
@@ -178,7 +255,7 @@ int gpu_verify_attention_layer(
     int head_dim, int hidden_size, int cache_stride, std::uint16_t* d_q,
     std::uint16_t* d_k, std::uint16_t* d_v, std::uint16_t* d_q_rot,
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
-    std::uint16_t* d_attn_out);
+    std::uint16_t* d_attn_out, const int* d_pt = nullptr);
 
 // Batched speculative attention block for already-normalized rows. This is
 // intentionally limited to one transformer attention block; it does not yet
@@ -195,7 +272,7 @@ int gpu_verify_attention_layer_batched(
     int head_dim, int hidden_size, int cache_stride, std::uint16_t* d_q,
     std::uint16_t* d_k, std::uint16_t* d_v, std::uint16_t* d_q_rot,
     std::uint16_t* d_k_rot, std::uint16_t* d_cache_k, std::uint16_t* d_cache_v,
-    std::uint16_t* d_attn_out);
+    std::uint16_t* d_attn_out, const int* d_pt = nullptr);
 
 }  // namespace granite4
 

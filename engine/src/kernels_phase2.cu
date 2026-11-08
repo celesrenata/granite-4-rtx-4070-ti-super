@@ -267,7 +267,7 @@ __device__ __forceinline__ void gqa_fused_row(const std::uint16_t* q_row,
                                               const std::uint16_t* k,
                                               const std::uint16_t* v, float att_scale,
                                               int hq, int hkv, int d, int kv_len,
-                                              int k_stride, std::uint16_t* out_row) {
+                                              int k_stride, const int* d_pt, std::uint16_t* out_row) {
   const int t = threadIdx.x;
   const int nt = blockDim.x;  // blockDim.x == d
 
@@ -291,9 +291,12 @@ __device__ __forceinline__ void gqa_fused_row(const std::uint16_t* q_row,
 
   // Phase A: bf16 logits[kv] = att_scale * dot(q, k[hkv, kv]), plus the
   // per-thread running max of what this thread wrote.
+  // Logical position kv lives in arena row d_pt[kv] (identity when d_pt is
+  // null, the contiguous layout); k_stride is the arena row stride.
   float m = -std::numeric_limits<float>::infinity();
   for (int kv = t; kv < kv_len; kv += nt) {
-    const int kbase = (hkv * k_stride + kv) * d;
+    const int row = (d_pt != nullptr) ? d_pt[kv] : kv;
+    const int kbase = (hkv * k_stride + row) * d;
     float acc = 0.0f;
     for (int i = 0; i < d; ++i)
       acc += bf16_to_f32(k[kbase + i]) * bf16_to_f32(sq[i]);
@@ -348,8 +351,10 @@ __device__ __forceinline__ void gqa_fused_row(const std::uint16_t* q_row,
   // Phase C: out[hq, i] = sum_kv p[kv] * v[hkv, kv, i] (ascending kv).
   const int i = t;
   float acc = 0.0f;
-  for (int kv = 0; kv < kv_len; ++kv)
-    acc += bf16_to_f32(sp[kv]) * bf16_to_f32(v[(hkv * k_stride + kv) * d + i]);
+  for (int kv = 0; kv < kv_len; ++kv) {
+    const int row = (d_pt != nullptr) ? d_pt[kv] : kv;
+    acc += bf16_to_f32(sp[kv]) * bf16_to_f32(v[(hkv * k_stride + row) * d + i]);
+  }
   out_row[hq * d + i] = f32_to_bf16(acc);
 }
 
@@ -359,10 +364,12 @@ __device__ __forceinline__ void gqa_fused_row(const std::uint16_t* q_row,
 __global__ void gqa_fused_kernel(const std::uint16_t* q, const std::uint16_t* k,
                                  const std::uint16_t* v, float att_scale, int Hq,
                                  int Hk, int d, int kv_len, int k_stride,
-                                 const int* d_pos, std::uint16_t* out) {
+                                 const int* d_pos, const int* d_pt,
+                                 std::uint16_t* out) {
   if (d_pos != nullptr) kv_len = *d_pos + 1;
   const int hq = blockIdx.x;
-  gqa_fused_row(q, k, v, att_scale, hq, hq / (Hq / Hk), d, kv_len, k_stride, out);
+  gqa_fused_row(q, k, v, att_scale, hq, hq / (Hq / Hk), d, kv_len, k_stride, d_pt,
+                out);
 }
 
 // ---------------------------------------------------------------------------
@@ -376,18 +383,133 @@ __global__ void kv_append_batched_kernel(const std::uint16_t* src_k,
                                          std::uint16_t* cache_k,
                                          std::uint16_t* cache_v,
                                          int base_pos, int rows, int stride,
-                                         int Hk, int d) {
+                                         int Hk, int d,
+                                         const int* __restrict__ d_pt) {
   const int r = blockIdx.y;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= rows || idx >= Hk * d) return;
   const int hkv = idx / d;
   const int i = idx % d;
   const int pos = base_pos + r;
+  const int row = (d_pt != nullptr) ? d_pt[pos] : pos;
   const std::size_t cache_row = static_cast<std::size_t>(hkv) * stride * d;
   const std::size_t src_off =
       static_cast<std::size_t>(r) * Hk * d + static_cast<std::size_t>(idx);
-  cache_k[cache_row + static_cast<std::size_t>(pos) * d + i] = src_k[src_off];
-  cache_v[cache_row + static_cast<std::size_t>(pos) * d + i] = src_v[src_off];
+  cache_k[cache_row + static_cast<std::size_t>(row) * d + i] = src_k[src_off];
+  cache_v[cache_row + static_cast<std::size_t>(row) * d + i] = src_v[src_off];
+}
+
+// KV8 (Q8_0): int8 form of the batched verify append - `rows` consecutive KV
+// positions, one block per (KV head, row), blockDim.x == d so the row amax is
+// a block reduce. Quantized per row with dev::kv8_* (the committed math).
+__global__ void kv_append_int8_batched_kernel(
+    const std::uint16_t* __restrict__ src_k, const std::uint16_t* __restrict__ src_v,
+    std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
+    float* __restrict__ cache_k_scale, float* __restrict__ cache_v_scale,
+    int base_pos, int rows, int stride, int Hk, int d,
+    const int* __restrict__ d_pt) {
+  const int hkv = blockIdx.x;
+  const int r = blockIdx.y;
+  const int i = threadIdx.x;  // blockDim.x == d
+  const int pos = base_pos + r;
+  const int row = (d_pt != nullptr) ? d_pt[pos] : pos;
+  const std::size_t src = (static_cast<std::size_t>(r) * Hk + hkv) * d + i;
+  const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + row) * d + i;
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + row;
+  const float x = bf16_to_f32(src_k[src]);
+  const float y = bf16_to_f32(src_v[src]);
+  __shared__ float smax[2];
+  const int lane = i & 31;
+  float ax = fabsf(x), ay = fabsf(y);
+  for (int off = 16; off > 0; off >>= 1) {
+    ax = fmaxf(ax, __shfl_down_sync(0xffffffffu, ax, off));
+    ay = fmaxf(ay, __shfl_down_sync(0xffffffffu, ay, off));
+  }
+  __shared__ float wmax[2][32];
+  if (lane == 0) {
+    wmax[0][i >> 5] = ax;
+    wmax[1][i >> 5] = ay;
+  }
+  __syncthreads();
+  float mk = 0.0f, mv = 0.0f;
+  for (int w = 0; w < (d + 31) >> 5; ++w) {
+    mk = fmaxf(mk, wmax[0][w]);
+    mv = fmaxf(mv, wmax[1][w]);
+  }
+  if (i == 0) {
+    const float sk = dev::kv8_scale(mk);
+    const float sv = dev::kv8_scale(mv);
+    smax[0] = sk;
+    smax[1] = sv;
+    cache_k_scale[sc] = sk;
+    cache_v_scale[sc] = sv;
+  }
+  __syncthreads();
+  cache_k[cache] = dev::kv8_quant(x, smax[0]);
+  cache_v[cache] = dev::kv8_quant(y, smax[1]);
+}
+
+// KV4 (Q4_0): int4 form of the batched verify append - `rows` consecutive KV
+// positions, one block per (KV head, row). Each thread owns a dim-pair (two
+// adjacent dims packed into one byte); the row amax is a block reduce over
+// blockDim.x threads, matching the int8 layout. d must be even (128).
+__global__ void kv_append_int4_batched_kernel(
+    const std::uint16_t* __restrict__ src_k, const std::uint16_t* __restrict__ src_v,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    float* __restrict__ cache_k_scale, float* __restrict__ cache_v_scale,
+    int base_pos, int rows, int stride, int Hk, int d,
+    const int* __restrict__ d_pt) {
+  const int hkv = blockIdx.x;
+  const int r = blockIdx.y;
+  const int w = threadIdx.x;  // blockDim.x == d/2
+  const int pos = base_pos + r;
+  const int row = (d_pt != nullptr) ? d_pt[pos] : pos;
+  const int d0 = 2 * w;       // even dim (lower nibble)
+  const int d1 = d0 + 1;      // odd dim (upper nibble)
+  const std::size_t src0 = (static_cast<std::size_t>(r) * Hk + hkv) * d + d0;
+  const std::size_t src1 = (static_cast<std::size_t>(r) * Hk + hkv) * d + d1;
+  const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + row) * (d / 2) + w;
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + row;
+  const float x0 = bf16_to_f32(src_k[src0]);
+  const float x1 = bf16_to_f32(src_k[src1]);
+  const float y0 = bf16_to_f32(src_v[src0]);
+  const float y1 = bf16_to_f32(src_v[src1]);
+  __shared__ float smax[2];
+  const int lane = w & 31;
+  float ax = fmaxf(fabsf(x0), fabsf(x1));
+  float ay = fmaxf(fabsf(y0), fabsf(y1));
+  for (int off = 16; off > 0; off >>= 1) {
+    ax = fmaxf(ax, __shfl_down_sync(0xffffffffu, ax, off));
+    ay = fmaxf(ay, __shfl_down_sync(0xffffffffu, ay, off));
+  }
+  __shared__ float wmax[2][32];
+  if (lane == 0) {
+    wmax[0][w >> 5] = ax;
+    wmax[1][w >> 5] = ay;
+  }
+  __syncthreads();
+  float mk = 0.0f, mv = 0.0f;
+  for (int wp = 0; wp < ((d / 2) + 31) >> 5; ++wp) {
+    mk = fmaxf(mk, wmax[0][wp]);
+    mv = fmaxf(mv, wmax[1][wp]);
+  }
+  if (w == 0) {
+    const float sk = dev::q4_scale(mk);
+    const float sv = dev::q4_scale(mv);
+    smax[0] = sk;
+    smax[1] = sv;
+    cache_k_scale[sc] = sk;
+    cache_v_scale[sc] = sv;
+  }
+  __syncthreads();
+  const unsigned char ck =
+      static_cast<unsigned char>((dev::q4_quant(x0, smax[0]) & 0x0fu) |
+                                 (dev::q4_quant(x1, smax[0]) << 4));
+  const unsigned char cv =
+      static_cast<unsigned char>((dev::q4_quant(y0, smax[1]) & 0x0fu) |
+                                 (dev::q4_quant(y1, smax[1]) << 4));
+  cache_k[cache] = ck;
+  cache_v[cache] = cv;
 }
 
 // Row blockIdx.y attends to its causal prefix [0, base_kv + row + 1).
@@ -396,12 +518,12 @@ __global__ void gqa_fused_batched_kernel(const std::uint16_t* q,
                                          const std::uint16_t* v,
                                          float att_scale, int Hq, int Hk, int d,
                                          int base_kv, int rows, int k_stride,
-                                         std::uint16_t* out) {
+                                         const int* d_pt, std::uint16_t* out) {
   const int hq = blockIdx.x;
   const int row = blockIdx.y;
   const std::size_t off = static_cast<std::size_t>(row) * Hq * d;
   gqa_fused_row(q + off, k, v, att_scale, hq, hq / (Hq / Hk), d, base_kv + row + 1,
-                k_stride, out + off);
+                k_stride, d_pt, out + off);
 }
 
 // ---------------------------------------------------------------------------
@@ -655,12 +777,14 @@ extern "C" {
 int granite4_kernel_gqa_fused_pos(const std::uint16_t* d_q, const std::uint16_t* d_k,
                                   const std::uint16_t* d_v, float att_scale, int Hq,
                                   int Hk, int d, int kv_len, int k_stride,
-                                  const int* d_pos, std::uint16_t* d_out);
+                                  const int* d_pos, std::uint16_t* d_out,
+                                  const int* d_pt = nullptr);
 int granite4_kernel_gqa_fused_rows(const std::uint16_t* d_q,
                                    const std::uint16_t* d_k,
                                    const std::uint16_t* d_v, float att_scale,
                                    int Hq, int Hk, int d, int base_kv, int rows,
-                                   int k_stride, std::uint16_t* d_out);
+                                   int k_stride, std::uint16_t* d_out,
+                                   const int* d_pt = nullptr);
 
 int granite4_fp8_decode_all(float** d_out) {
   if (d_out == nullptr) return -1;
@@ -821,9 +945,9 @@ int granite4_kernel_gqa_value(const std::uint16_t* d_p, const std::uint16_t* d_v
 int granite4_kernel_gqa_fused(const std::uint16_t* d_q, const std::uint16_t* d_k,
                               const std::uint16_t* d_v, float att_scale, int Hq,
                               int Hk, int d, int kv_len, int k_stride,
-                              std::uint16_t* d_out) {
+                              std::uint16_t* d_out, const int* d_pt = nullptr) {
   return granite4_kernel_gqa_fused_pos(d_q, d_k, d_v, att_scale, Hq, Hk, d, kv_len,
-                                       k_stride, nullptr, d_out);
+                                       k_stride, nullptr, d_out, d_pt);
 }
 
 std::size_t granite4_gqa_fused_smem_bytes(int d, int kv_len_max) {
@@ -877,7 +1001,8 @@ int granite4_gqa_fused_smem_limit() {
 int granite4_kernel_gqa_fused_pos(const std::uint16_t* d_q, const std::uint16_t* d_k,
                                   const std::uint16_t* d_v, float att_scale, int Hq,
                                   int Hk, int d, int kv_len, int k_stride,
-                                  const int* d_pos, std::uint16_t* d_out) {
+                                  const int* d_pos, std::uint16_t* d_out,
+                                  const int* d_pt) {
   // With d_pos, kv_len is the upper bound the shared memory is sized for.
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_out == nullptr ||
       !std::isfinite(att_scale) || Hq <= 0 || Hk <= 0 || d <= 0 || kv_len <= 0 ||
@@ -890,7 +1015,8 @@ int granite4_kernel_gqa_fused_pos(const std::uint16_t* d_q, const std::uint16_t*
   const std::size_t smem_bytes = granite4_gqa_fused_smem_bytes(d, kv_len);
   if (smem_bytes > static_cast<std::size_t>(granite4_gqa_fused_smem_limit())) return -1;
   granite4::gqa_fused_kernel<<<Hq, d, smem_bytes>>>(d_q, d_k, d_v, att_scale, Hq, Hk,
-                                                     d, kv_len, k_stride, d_pos, d_out);
+                                                     d, kv_len, k_stride, d_pos, d_pt,
+                                                     d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
@@ -899,7 +1025,8 @@ int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
                                       const std::uint16_t* d_src_v,
                                       std::uint16_t* d_cache_k,
                                       std::uint16_t* d_cache_v, int base_pos,
-                                      int rows, int stride, int Hk, int d) {
+                                      int rows, int stride, int Hk, int d,
+                                      const int* d_pt) {
   if (d_src_k == nullptr || d_src_v == nullptr || d_cache_k == nullptr ||
       d_cache_v == nullptr || base_pos < 0 || rows <= 0 || rows > granite4::kMaxVerifyRows ||
       Hk <= 0 || d <= 0 || base_pos > INT_MAX - rows ||
@@ -909,7 +1036,59 @@ int granite4_kernel_kv_append_batched(const std::uint16_t* d_src_k,
   granite4::kv_append_batched_kernel<<<
       dim3(static_cast<unsigned int>((static_cast<std::size_t>(Hk) * d + 255u) / 256u),
            static_cast<unsigned int>(rows)),
-      256>>>(d_src_k, d_src_v, d_cache_k, d_cache_v, base_pos, rows, stride, Hk, d);
+      256>>>(d_src_k, d_src_v, d_cache_k, d_cache_v, base_pos, rows, stride, Hk, d, d_pt);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
+int granite4_kernel_kv_append_int8_batched(const std::uint16_t* d_src_k,
+                                           const std::uint16_t* d_src_v,
+                                           std::int8_t* d_cache_k,
+                                           std::int8_t* d_cache_v,
+                                           float* d_cache_k_scale,
+                                           float* d_cache_v_scale, int base_pos,
+                                           int rows, int stride, int Hk, int d,
+                                           const int* d_pt) {
+  if (d_src_k == nullptr || d_src_v == nullptr || d_cache_k == nullptr ||
+      d_cache_v == nullptr || d_cache_k_scale == nullptr ||
+      d_cache_v_scale == nullptr || base_pos < 0 || rows <= 0 ||
+      rows > granite4::kMaxVerifyRows || Hk <= 0 || d <= 0 || d > 1024 ||
+      base_pos > INT_MAX - rows || stride < base_pos + rows ||
+      static_cast<long long>(Hk) * d > INT_MAX || stride > INT_MAX / std::max(Hk, 1))
+    return -1;
+  // One block per (KV head, row); blockDim.x == d so the row amax is a block
+  // reduce (the bf16 form uses a flat per-element grid).
+  granite4::kv_append_int8_batched_kernel<<<dim3(static_cast<unsigned int>(Hk),
+                                                 static_cast<unsigned int>(rows)),
+                                             static_cast<unsigned int>(d)>>>
+      (d_src_k, d_src_v, d_cache_k, d_cache_v, d_cache_k_scale, d_cache_v_scale,
+       base_pos, rows, stride, Hk, d, d_pt);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
+int granite4_kernel_kv_append_int4_batched(const std::uint16_t* d_src_k,
+                                           const std::uint16_t* d_src_v,
+                                           std::uint8_t* d_cache_k,
+                                           std::uint8_t* d_cache_v,
+                                           float* d_cache_k_scale,
+                                           float* d_cache_v_scale, int base_pos,
+                                           int rows, int stride, int Hk, int d,
+                                           const int* d_pt) {
+  if (d_src_k == nullptr || d_src_v == nullptr || d_cache_k == nullptr ||
+      d_cache_v == nullptr || d_cache_k_scale == nullptr ||
+      d_cache_v_scale == nullptr || base_pos < 0 || rows <= 0 ||
+      rows > granite4::kMaxVerifyRows || Hk <= 0 || d <= 0 || d % 2 != 0 || d > 1024 ||
+      base_pos > INT_MAX - rows || stride < base_pos + rows ||
+      static_cast<long long>(Hk) * d > INT_MAX || stride > INT_MAX / std::max(Hk, 1))
+    return -1;
+  // One block per (KV head, row); blockDim.x == d/2 (one thread per code
+  // byte / dim-pair), so the row amax is a block reduce.
+  granite4::kv_append_int4_batched_kernel<<<dim3(static_cast<unsigned int>(Hk),
+                                                static_cast<unsigned int>(rows)),
+                                            static_cast<unsigned int>(d / 2)>>>
+      (d_src_k, d_src_v, d_cache_k, d_cache_v, d_cache_k_scale, d_cache_v_scale,
+       base_pos, rows, stride, Hk, d, d_pt);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }
@@ -918,18 +1097,19 @@ int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
                                       const std::uint16_t* d_k,
                                       const std::uint16_t* d_v, float att_scale,
                                       int Hq, int Hk, int d, int base_kv,
-                                      int rows, int k_stride,
-                                      std::uint16_t* d_out) {
+                                      int rows, int k_stride, std::uint16_t* d_out,
+                                      const int* d_pt = nullptr) {
   if (rows > granite4::kMaxVerifyRows) return -1;
   return granite4_kernel_gqa_fused_rows(d_q, d_k, d_v, att_scale, Hq, Hk, d, base_kv,
-                                        rows, k_stride, d_out);
+                                        rows, k_stride, d_out, d_pt);
 }
 
 int granite4_kernel_gqa_fused_rows(const std::uint16_t* d_q,
                                    const std::uint16_t* d_k,
                                    const std::uint16_t* d_v, float att_scale,
                                    int Hq, int Hk, int d, int base_kv, int rows,
-                                   int k_stride, std::uint16_t* d_out) {
+                                   int k_stride, std::uint16_t* d_out,
+                                   const int* d_pt) {
   if (d_q == nullptr || d_k == nullptr || d_v == nullptr || d_out == nullptr ||
       !std::isfinite(att_scale) || rows <= 0 || rows > 65535 || Hq <= 0 || Hk <= 0 ||
       d <= 0 || base_kv < 0 || Hq < Hk || Hq % Hk != 0 ||
@@ -943,7 +1123,7 @@ int granite4_kernel_gqa_fused_rows(const std::uint16_t* d_q,
   const std::size_t smem_bytes = granite4_gqa_fused_smem_bytes(d, base_kv + rows);
   if (smem_bytes > static_cast<std::size_t>(granite4_gqa_fused_smem_limit())) return -1;
   granite4::gqa_fused_batched_kernel<<<dim3(Hq, rows), d, smem_bytes>>>(
-      d_q, d_k, d_v, att_scale, Hq, Hk, d, base_kv, rows, k_stride, d_out);
+      d_q, d_k, d_v, att_scale, Hq, Hk, d, base_kv, rows, k_stride, d_pt, d_out);
   G4_CUDA_CHECK(cudaGetLastError());
   return 0;
 }

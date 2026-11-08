@@ -501,6 +501,59 @@ module passes it to the resident CUDA engine. The frontend sends the per-request
 K only when a head is loaded. `GRANITE4_EAGLE_K=0` or an unset head disables
 speculation.
 
+### P4 — KV8 int8 KV-cache A/B (2026-11-04, gremlin-1)
+
+Live measurement of the KV8 (Q8_0 int8) persistent KV cache in the forward
+pass (`G4_KV8=1`) versus the bf16 cache, same card, checkpoint, and build.
+`granite4-infer kv-bench` loads, prefills N deterministic pseudo-tokens
+(LCG, `--seed 1234`), then runs a device-side greedy decode chain of D
+tokens (the same `gpu_decode_greedy` path `generate` uses). Both timings
+are `cudaDeviceSynchronize`d (without the sync the decode number is the host
+time to enqueue D async graph replays, not GPU time - the first revision of
+this table reported that and was wrong). Free device memory is read right
+after load, so the cross-run delta isolates the persistent KV pool
+(activation scratch is identical in both modes). Both modes run split-KV
+attention (`gpu_ctx_is_split_attn` true in both; a KV8 config that fell back
+to bf16 would report `kv8:false` and is rejected by the bench).
+
+| ctx / decode | bf16 prefill | int8 prefill | bf16 decode tps | int8 decode tps | int8 pool saving |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2048 / 256 | 520.3 ms | 542.9 ms | 68.4 | 67.2 | 184.0 MiB |
+| 4096 / 256 | 1063.7 ms | 1146.3 ms | 65.6 | 64.1 | 348.0 MiB |
+| 8192 / 128 | 2303.4 ms | 2627.4 ms | 60.6 | 58.5 | 664.0 MiB |
+
+(lowest of 3 runs per cell; `scripts/kv8-ab-bench.sh`). The pool saving is
+81.7 KiB/position, matching the theory (bf16 K+V 160 KiB/pos → int8 codes
+80 KiB + scales 2.5 KiB = 82.5 KiB; the bf16 path additionally carries no
+compact-prefix scratch, worth ~0.25 KiB/pos). At a 32K pool the int8 cache
+is ~512 MiB smaller per session - enough to double reader slots on the 16 GB
+card.
+
+Result: **KV8 is near-free on speed.** Decode is on par (0.96-0.98x; the
+per-step device time is identical - 14.83 ms/step int8 vs 14.89 bf16 at 3 K
+context, `G4_GRAPH=1 G4_TIMESTEP=1`). Prefill was 0.49-0.78x slower at
+8-2 K context before this round; the int8 tile-fill read the codes as
+2-byte scalar loads and dequantized them one at a time (256 scalar loads
+per 128-dim row) while the bf16 path vectorized 16-byte loads. Reading the
+codes as aligned uint64 (8 per lane) and dequantizing the register copies
+took int8 prefill to 0.88-0.96x of bf16 - the residual gap is the dequant
+ALU itself, which is proportional to the KV history read and is the price
+of not keeping the codes resident in bf16.
+
+Bit-exact: the vectorized int8 prefill emits the identical token sequence
+to the scalar one (same 512-token prompt, 40-token greedy comparison). The
+decode int8 tile-fill stayed scalar: decode is already on par with bf16
+(per-step device time 14.83 vs 14.89 ms), so its tile-fill is not worth the
+change. The int8 cache is *not* token-identical to bf16: on the same 512-
+prompt, greedy diverges after ~15 tokens (argmax flips on near-ties -
+expected for per-row-scale int8; kernel unit tests pass at max |Δ| 0.00098
+vs a bf16 reference). KV8 trades a small quality delta for ~50% less KV
+memory at near-parity speed.
+
+Repro: `scripts/kv8-gremlin-build.sh` then
+`G4_KV8=0 granite4-infer kv-bench --checkpoint CKPT --gpu 1 --bench-ctx
+2048 --bench-decode 256 --seed 1234` (and `G4_KV8=1`).
+
 ### P4 round 2 — end-to-end speed (2026-11-03, gremlin-1)
 
 Same card and checkpoint as above (RTX 4070 Ti SUPER, CUDA 12.9 toolchain
@@ -707,6 +760,62 @@ every cell, which they were not at K ≥ 6 before):
 few percent, because lookup proposes rarely there and each miss costs a
 verify round. A model drafter (EAGLE-style head) is the next step; it can
 now verify chains of up to 8 tokens at ~0.4 ms per extra row.
+
+### P4 round 4 — long-context attention + adaptive EAGLE (2026-11-07, gremlin-1)
+
+Context: 2 resident sessions x 32768 positions with EAGLE r8 (k=6) on one
+shared KV8 pool. Profiling at 13-30K context found three causes:
+
+1. **Verify attention re-read the KV once per row.** `attn_split` ran one
+   block per (kv head, split, row), so a 7-row EAGLE verify streamed the whole
+   context 7 times (42.2 ms/round at 13.5K vs a 19.6 ms decode step). Blocks
+   now hold up to 8 rows and stage each K/V tile once for all of them
+   (one row per block below 1K positions, where the grid would be too small).
+   Every row keeps its exact per-row arithmetic: `test_attn_split_rows_bit_identical_device`
+   checks R-row == R single-row calls bit for bit (bf16/KV8/KV4, paged, R=2/7/13).
+2. **The int8/int4 tile fills were scalar.** The split-KV KV8 fill read one
+   byte per thread; it now loads 16 codes (int8) / 32 codes (int4) per thread.
+   The prefill KV8/KV4 V-tile fill mapped consecutive threads along head dims,
+   putting a whole warp on one shared-memory bank (Vt pitch is a multiple of
+   128 B); it now maps them along positions like the bf16 fill, and
+   quantized prefill uses 8 warps per block to amortize the dequant
+   (`G4_PREFILL_ATTN_WARPS=4|8` overrides).
+3. **EAGLE acceptance is text-dependent.** The same binary accepts 75-81% of
+   drafts on the serve_styles prompts the head was trained on but ~8% on novel
+   prose (also on the pre-P4 production binary - not a regression). At long
+   context a round costs ~2.2 decode steps, so drafting lost there. An
+   adaptive policy (`EaglePolicy`, `G4_EAGLE_MIN_ACCEPT`, 0 disables) times
+   4 probe rounds against a timed 8-token plain burst and keeps the faster
+   path; a conversation that switches off stays off. The EAGLE prompt
+   catch-up (>= 64 rows) also runs on the tensor-core prefill GEMMs now
+   (`G4_EAGLE_PREFILL=0` restores the GEMV path).
+
+| Measurement (KV8 unless noted) | Before | After |
+|---|---:|---:|
+| `kv-bench` 30000 ctx prefill | 18.0 s | 14.8 s |
+| `kv-bench` 30000 ctx decode | 39.1 tok/s | 48.3 tok/s (bf16: 43.7) |
+| plain decode, 13.5K chat prompt | 46.5 tok/s | 59.9 tok/s |
+| EAGLE k=6 verify round, 13.5K | 42.2 ms | 26.8 ms |
+| serve smoke, fresh 12K prompt + 96 tok (2 sessions, EAGLE) | 8.2 s | 5.8 s |
+| serve smoke, resumed turn | 2.9-3.7 s | 1.8 s |
+| serve smoke, fresh 30K prompt | 28.2 s | 17.2 s |
+
+Warm serve, fresh requests, eos stop, max 256 tokens, tok/s incl. prefill:
+
+| Family | plain | EAGLE always (old) | EAGLE adaptive (new) |
+|---|---:|---:|---:|
+| serve_styles (20 prompts) | 67.9 | 146.9 | 146.9 |
+| novel prose (5 prompts) | 69.5 | 82.8 | 76.4 |
+| long 8-13K chat (2 prompts) | 34.3 | 22.6 | 32.5 |
+
+All variants are token-identical to plain greedy (kernel tests, `generate`
+on long/novel/serve_style prompts, `scripts/serve_pool_smoke.py` with
+`G4_FORCE_REPREFILL=1`, and the warm-serve outputs). Resumed turns can differ
+from a full re-prefill: the KV of earlier generated tokens came from the
+decode path, and re-forwarding them through prefill rounds bf16 differently
+(confirmed: the new build matches the old build exactly whenever both take
+the same resume path). Known gap: the policy decides once per request, so a
+reply whose acceptance rises late stays plain (novel: -9% vs always-on).
 
 ## Rules across phases
 

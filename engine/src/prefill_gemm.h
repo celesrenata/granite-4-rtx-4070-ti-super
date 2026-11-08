@@ -48,15 +48,48 @@ int prefill_embed_rows(const std::int32_t* d_tokens, int start, int rows,
 int prefill_rope_split_append(const std::uint16_t* qkv, const float* cos_tbl,
                               const float* sin_tbl, int base_pos, int rows, int Hq,
                               int Hk, int d, int stride, std::uint16_t* q_rot,
-                              std::uint16_t* cache_k, std::uint16_t* cache_v);
+                              std::uint16_t* cache_k, std::uint16_t* cache_v,
+                               const int* d_pt = nullptr);
+
+// KV8: append the prefill chunk's K/V to the int8 persistent cache - K is
+// rotated then quantized per (head, position) row, V is quantized as-is - with
+// a per-row float scale (Q8_0). Q is rotated to bf16 as in the bf16 path.
+// Requires d == 128. Returns -1 on bad args or a launch error.
+int prefill_rope_split_append_int8(const std::uint16_t* qkv, const float* cos_tbl,
+                                   const float* sin_tbl, int base_pos, int rows,
+                                   int Hq, int Hk, int d, int stride,
+                                   std::uint16_t* q_rot, std::int8_t* cache_k,
+                                   std::int8_t* cache_v, float* cache_k_scale,
+                                   float* cache_v_scale,
+                                   const int* d_pt = nullptr);
+
+// KV4: append the prefill chunk's K/V to the int4 persistent cache - K is
+// rotated then quantized per (head, position) row as two-per-byte int4
+// codes, V is quantized as-is - with a per-row float scale (Q4_0). Q is
+// rotated to bf16 as in the bf16 path. Requires d == 128. Returns -1 on
+// bad args or a launch error.
+int prefill_rope_split_append_int4(const std::uint16_t* qkv, const float* cos_tbl,
+                                   const float* sin_tbl, int base_pos, int rows,
+                                   int Hq, int Hk, int d, int stride,
+                                   std::uint16_t* q_rot, std::uint8_t* cache_k,
+                                   std::uint8_t* cache_v, float* cache_k_scale,
+                                   float* cache_v_scale,
+                                   const int* d_pt = nullptr);
 
 // Causal attention for query rows at positions [base_pos, base_pos + rows)
 // (q_rot [rows][Hq*d]) over the cache positions [0, position]; out is
 // [rows][Hq*d]. Tensor cores; head_dim 128 and Hq / Hk == 4 only (-1
-// otherwise, so the caller can fall back to the fused GQA kernel).
+// otherwise, so the caller can fall back to the fused GQA kernel). With
+// int8/int4, the KV cache is read as int8/int4 codes + per-row scales
+// (cache_k8/cache_v8 [Hk][stride][d], cache_k4/cache_v4 [Hk][stride][d/2],
+// *_scale [Hk][stride]) and dequantized on load.
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
-                      const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
-                      int base_pos, int rows, int stride, std::uint16_t* out);
+                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
+                       int base_pos, int rows, int stride, std::uint16_t* out,
+                       const std::int8_t* cache_k8, const std::int8_t* cache_v8,
+                       const float* k_scale, const float* v_scale, bool int8,
+                       const std::uint8_t* cache_k4, const std::uint8_t* cache_v4,
+                       bool int4, const int* d_pt = nullptr);
 
 // act[r][i] = bf16(silu(gu[r][i]) * gu[r][I + i]).
 int prefill_silu_mul(const float* gu, int I, int rows, std::uint16_t* act);

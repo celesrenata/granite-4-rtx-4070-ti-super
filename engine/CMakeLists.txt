@@ -18,6 +18,8 @@ set(GRANITE_ENGINE_SOURCES
   src/checkpoint_main.cc
   src/kv_pool.h
   src/kv_pool.cc
+  src/kv_pool_controller.h
+  src/kv_pool_controller.cc
   src/draft_lookup.h
   src/draft_lookup.cc
   src/speculative_verify.h
@@ -105,6 +107,15 @@ add_test(NAME kernel_math COMMAND granite4-kernel-math-test)
 add_executable(granite4-kv-pool-test tests/test_kv_pool.cc)
 target_link_libraries(granite4-kv-pool-test PRIVATE granite4_static)
 add_test(NAME kv_pool COMMAND granite4-kv-pool-test)
+
+# Phase 4 (Integration): host controller that drives the pool for the serve
+# loop (session slots, prefill/commit lifecycle, device row table). Host-only,
+# no CUDA.
+add_executable(granite4-kv-pool-controller-test
+               tests/test_kv_pool_controller.cc)
+target_link_libraries(granite4-kv-pool-controller-test
+                      PRIVATE granite4_static)
+add_test(NAME kv_pool_controller COMMAND granite4-kv-pool-controller-test)
 
 # Speculative drafters (host-only): prompt-lookup proposals are verified by
 # the target model, so they carry no weights and no GPU dependency.

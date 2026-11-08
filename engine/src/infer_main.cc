@@ -86,6 +86,7 @@
 #include "forward_gpu.h"
 #include "forward_gpu_api.h"
 #include "gpu_pack.h"
+#include "kv_pool_controller.h"
 #include "serve_resume.h"
 #include <cuda_runtime.h>
 #endif
@@ -101,7 +102,10 @@ struct Args {
   long seed = 0;
   long eos = -1;  // stop token (-1: none)
   int max_context = 8192;  // serve: positions per request
-  int sessions = 1;        // serve: number of concurrent sessions sharing weights
+  int sessions = 1;        // serve: number of resident sessions sharing weights + one KV pool
+  int kv_pool_tokens = 0;  // serve: shared KV pool size in positions (0 = sessions x max_context)
+  int bench_ctx = 0;       // kv-bench: prefill token count
+  int bench_decode = 0;    // kv-bench: decode token count
 
   bool is_eos(std::int32_t tok) const { return eos >= 0 && tok == eos; }
 };
@@ -109,7 +113,8 @@ struct Args {
 bool parse_args(int argc, char** argv, Args* a) {
   for (int i = 1; i < argc; ++i) {
     const std::string s = argv[i];
-    if (s == "forward" || s == "generate" || s == "serve" || s == "dump-hidden") {
+    if (s == "forward" || s == "generate" || s == "serve" || s == "dump-hidden" ||
+        s == "kv-bench") {
       a->sub = s;
     } else if (s == "--checkpoint" && i + 1 < argc) {
       a->dir = argv[++i];
@@ -134,6 +139,12 @@ bool parse_args(int argc, char** argv, Args* a) {
       a->max_context = std::atoi(argv[++i]);
     } else if (s == "--sessions" && i + 1 < argc) {
       a->sessions = std::atoi(argv[++i]);
+    } else if (s == "--kv-pool-tokens" && i + 1 < argc) {
+      a->kv_pool_tokens = std::atoi(argv[++i]);
+    } else if (s == "--bench-ctx" && i + 1 < argc) {
+      a->bench_ctx = std::atoi(argv[++i]);
+    } else if (s == "--bench-decode" && i + 1 < argc) {
+      a->bench_decode = std::atoi(argv[++i]);
     } else if (s == "--eagle" && i + 1 < argc) {
       a->eagle = argv[++i];
     } else if (s == "--eagle-k" && i + 1 < argc) {
@@ -150,6 +161,8 @@ bool parse_args(int argc, char** argv, Args* a) {
     return !a->dir.empty() && a->max_context > 0 && a->sessions > 0;
   if (a->sub == "dump-hidden")
     return !a->dir.empty() && !a->in.empty() && !a->out.empty() && a->max_context > 0;
+  if (a->sub == "kv-bench")
+    return !a->dir.empty() && a->bench_ctx >= 2 && a->bench_decode > 0;
   return !a->sub.empty() && !a->dir.empty() && !a->tokens.empty();
 }
 
@@ -267,8 +280,12 @@ class GpuSession {
   // uploading its own copy. The caller owns `weights` and keeps it alive
   // for the lifetime of every session using it - this is what lets N
   // sessions coexist in VRAM at 9.4 + N x 1.5 GiB instead of N x 9.5 GiB.
+  //
+  // With `arena`, the session's KV lives in that shared paged arena instead of
+  // a private [max_pos] cache; it has no rows until map_rows() gives it some.
   bool open_shared(const std::string& dir, int max_pos, int logit_rows,
-                   GpuWeights* weights, std::string* error) {
+                   GpuWeights* weights, std::string* error,
+                   GpuKvArena* arena = nullptr) {
     dir_ = dir;
     ModelConfig cfg;
     if (!load_model_config(dir, &cfg, error, /*enforce_spec=*/true)) return false;
@@ -276,7 +293,8 @@ class GpuSession {
     vocab_ = static_cast<int>(cfg.vocab_size);
     hidden_ = static_cast<int>(cfg.hidden_size);
     logit_rows_ = logit_rows;
-    ctx_ = gpu_ctx_create(cfg, kForwardSpec, max_pos);
+    ctx_ = arena != nullptr ? gpu_ctx_create_paged(cfg, kForwardSpec, max_pos, arena)
+                            : gpu_ctx_create(cfg, kForwardSpec, max_pos);
     if (ctx_ == nullptr) {
       *error = "gpu_ctx_create failed";
       return false;
@@ -293,12 +311,33 @@ class GpuSession {
     return true;
   }
 
+  // Borrow `owner`'s prefill scratch and draft-feature buffers (~1 GiB at 32k)
+  // instead of allocating a second set. Valid because the serve loop runs one
+  // request at a time; call before this session's first forward.
+  bool share_scratch_from(GpuSession* owner, std::string* error) {
+    if (gpu_ctx_share_prefill_scratch(ctx_, owner->ctx_) != 0) {
+      *error = "gpu_ctx_share_prefill_scratch failed";
+      return false;
+    }
+    feat_owner_ = owner;
+    return true;
+  }
+  // Publish the first n arena rows of this session's KV (see
+  // gpu_ctx_set_kv_rows_n); positions past n cannot be forwarded.
+  bool map_rows(const int* rows, int n) { return gpu_ctx_set_kv_rows_n(ctx_, rows, n) == 0; }
+  int mapped() const { return gpu_ctx_mapped_rows(ctx_); }
   int vocab() const { return vocab_; }
   int hidden() const { return hidden_; }
   int max_pos() const { return max_pos_; }
   int logit_rows() const { return logit_rows_; }
   int written() const { return gpu_ctx_written(ctx_); }
   bool truncate(int written) { return gpu_ctx_truncate(ctx_, written) == 0; }
+  // Resolved KV-cache mode (after the split-attention capability check in
+  // gpu_ctx_create) and active attention path - so callers can report ground
+  // truth instead of trusting G4_KV8.
+  bool kv8() const { return gpu_ctx_is_kv8(ctx_); }
+  bool kv4() const { return gpu_ctx_is_kv4(ctx_); }
+  bool split_attn() const { return gpu_ctx_is_split_attn(ctx_); }
 
 
   bool upload(const std::vector<std::int32_t>& seq, int from, int to, std::string* error) {
@@ -397,6 +436,7 @@ class GpuSession {
   // [kMaxVerifyRows][hidden] (verify rows, chain); allocated on first use.
   bool feature_buffers(std::uint16_t** prompt, std::uint16_t** verify, std::uint16_t** chain,
                        std::string* error) {
+    if (feat_owner_ != nullptr) return feat_owner_->feature_buffers(prompt, verify, chain, error);
     if (d_feat_ == nullptr) {
       const std::size_t H = static_cast<std::size_t>(hidden_);
       G4_HOST_CUDA_CHECK(cudaMalloc(&d_feat_, 2 * H * (max_pos_ + 2 * kMaxVerifyRows)));
@@ -420,6 +460,7 @@ class GpuSession {
   std::uint16_t* d_logits_ = nullptr;  // [logit_rows][vocab]
   std::int32_t* d_argmax_ = nullptr;   // [logit_rows]
   std::uint16_t* d_feat_ = nullptr;    // draft-head features (feature_buffers)
+  GpuSession* feat_owner_ = nullptr;   // borrowed feature buffers (share_scratch_from)
   std::string dir_;
   int max_pos_ = 0, vocab_ = 0, hidden_ = 0, logit_rows_ = 0;
 };
@@ -686,6 +727,39 @@ bool generate_draft(GpuSession& s, const Args& a, Generation* out, std::string* 
   return true;
 }
 
+// Adaptive drafting. EAGLE pays only while its rounds produce tokens faster
+// than plain chained greedy decode, and both sides of that move with the
+// context: a round is the head steps plus a (k + 1)-row verify (~1.5 decode
+// steps at short context, ~2.2 at 13k on the RTX 4070 Ti SUPER), and the
+// head's acceptance depends on the text (75-80% on the serving styles it was
+// trained on, ~8% on novel prose). So the policy measures instead of guessing:
+// after kEagleProbeRounds timed rounds (the first round, which carries the
+// prompt catch-up, is not timed), a request
+//   - keeps drafting if it averages >= kEagleKeepAccept accepted tokens/round,
+//   - stops if it averages < G4_EAGLE_MIN_ACCEPT (default 0.35),
+//   - otherwise decodes a timed plain burst of 8 tokens and keeps whichever is
+//     faster in tokens per millisecond (host-timed; both paths sync on their
+//     readback). Winning EAGLE re-syncs the head with one hidden-only forward
+//     over the burst rows - verify rows are bit-identical to decode rows, so
+//     the KV and the output are unchanged.
+// Stopping finishes the request on the chained greedy decode and the
+// conversation remembers it: later turns skip the head (and its catch-up).
+// Output is identical in every case (the verify is exact greedy).
+// G4_EAGLE_MIN_ACCEPT=0 disables the policy (always draft).
+struct EaglePolicy {
+  bool off = false;  // drafting disabled for this conversation
+};
+double eagle_min_accept() {
+  static const double v = [] {
+    const char* e = std::getenv("G4_EAGLE_MIN_ACCEPT");
+    return e != nullptr ? std::atof(e) : 0.35;
+  }();
+  return v;
+}
+constexpr int kEagleProbeRounds = 4;
+constexpr double kEagleKeepAccept = 2.0;
+constexpr int kEagleBurst = 8;
+
 // EAGLE draft-verify loop. Invariants at the top of a round: the target KV
 // holds positions [0, L); the anchor (the target's greedy token at L, already
 // emitted) is in d_tokens[L]; head entries [0, hq) are valid and `feat`
@@ -696,7 +770,7 @@ bool generate_draft(GpuSession& s, const Args& a, Generation* out, std::string* 
 // gate accepts the prefix d_i == t_{i-1}; t_a is the new anchor. Everything
 // up to the read-back of t and d is enqueued without a host round trip.
 bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* out,
-                    std::string* error) {
+                    std::string* error, int prefix = -1, EaglePolicy* policy = nullptr) {
   if (head == nullptr) {
     *error = "eagle: no head loaded (start with --eagle HEAD)";
     return false;
@@ -709,17 +783,36 @@ bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* o
   std::uint16_t *f_prompt, *f_verify, *f_chain;
   if (!s.feature_buffers(&f_prompt, &f_verify, &f_chain, error)) return false;
   std::vector<std::int32_t> ids;
-  if (!s.truncate(0) || !s.upload(seq, 0, plen, error) ||
-      !s.forward(plen, plen - 1, error, f_prompt, 0) || !s.argmax(1, &ids, error))
+  // Resume from the session's cached conversation. The target KV holds
+  // [0, prefix); the head holds entries [0, eagle_written) (built from true
+  // target features, so valid whenever they lie inside the cached prefix).
+  // The head's catch-up needs the target's features for [hq0, plen), so the
+  // target re-forwards from hq0 = min(prefix, head entries): a handful of
+  // positions after a normal turn (the head trails the target by one round),
+  // not the whole prompt. prefix < 0 (or no head history): from scratch.
+  // At least one row is always forwarded - it yields the first token.
+  int hq0 = 0;
+  if (prefix > 0) hq0 = std::max(0, std::min({prefix, eagle_written(head), plen - 1}));
+  if (!s.truncate(hq0) || !s.upload(seq, 0, plen, error) ||
+      !s.forward(plen, plen - 1, error, f_prompt, hq0) || !s.argmax(1, &ids, error))
     return false;
-  eagle_truncate(head, 0);
+  eagle_truncate(head, hq0);
+  // Head entries [0, head_valid) were built from true target features. On any
+  // exit (done, failed) drop the chain entries past it - they came from the
+  // head's own predicted features - so the next turn resumes from truth.
+  int head_valid = hq0;
+  struct HeadTrunc {
+    EagleHead* h;
+    const int* valid;
+    ~HeadTrunc() { eagle_truncate(h, *valid); }
+  } head_trunc{head, &head_valid};
   auto emit = [&](std::int32_t tok) {
     seq.push_back(tok);
     generated.push_back(tok);
     return a.is_eos(tok) || static_cast<int>(generated.size()) >= a.max_tokens;
   };
   if (emit(ids[0])) return true;
-  int L = plen, hq = 0;
+  int L = plen, hq = hq0;
   std::uint16_t* feat = f_prompt;  // features of positions [hq, L); outputs overwrite them
   std::int32_t* const d_tok = s.d_tokens();
   const std::size_t H = static_cast<std::size_t>(s.hidden());
@@ -733,8 +826,14 @@ bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* o
   struct Ev { cudaEvent_t a, b; };
   std::vector<Ev> h_ev, v_ev;
   long et_rounds = 0, et_acc = 0, et_prop = 0;
+  // Adaptive drafting (see EaglePolicy): timed probe rounds, then one decision.
+  const double min_accept = eagle_min_accept();
+  int rounds_seen = 0, probe_acc = 0, probe_tok = 0;
+  double probe_ms = 0.0;
+  bool decided = min_accept <= 0.0, go_plain = false;
   const auto et_t0 = std::chrono::steady_clock::now();
   auto round = [&](std::string* out_err) -> bool {
+    const auto r_t0 = std::chrono::steady_clock::now();
     const int remaining = a.max_tokens - static_cast<int>(generated.size());
     const int k = std::max(0, std::min({a.eagle_k, remaining - 1, s.max_pos() - L - 2}));
     Ev h0, v0;
@@ -752,6 +851,7 @@ bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* o
         *out_err = "eagle: head forward failed";
         return true;
       }
+      head_valid = L;  // entries [hq, L) came from true target features
     }
     // Target verify over anchor + drafts: greedy ids t_0..t_k and features.
     if (et) cudaEventCreate(&v0.a), cudaEventCreate(&v0.b);
@@ -767,6 +867,15 @@ bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* o
     report.accepted += acc;
     ++report.steps;
     if (et) { et_rounds++; et_acc += acc; et_prop += k; }
+    if (!decided && k > 0) {
+      if (rounds_seen > 0) {  // round 0 carries the head's prompt catch-up
+        probe_acc += acc;
+        probe_tok += acc + 1;
+        probe_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - r_t0).count();
+      }
+      ++rounds_seen;
+    }
     bool stop = false;
     for (int i = 0; i < acc && !stop; ++i) stop = emit(drafts[static_cast<std::size_t>(i)]);
     if (!stop) stop = emit(ids[static_cast<std::size_t>(acc)]);
@@ -779,14 +888,76 @@ bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* o
       return true;
     }
     eagle_truncate(head, L);
+    head_valid = std::min(head_valid, L);
     hq = L;
     feat = f_verify;
     L = nl;
-    return false;
+    if (!decided && rounds_seen > kEagleProbeRounds) {
+      decided = true;
+      const double avg = static_cast<double>(probe_acc) / kEagleProbeRounds;
+      const int left = a.max_tokens - static_cast<int>(generated.size());
+      // The burst plus the rows already pending for the head ([hq, L)) must
+      // fit one verify-sized hidden forward for the re-sync.
+      const int burst = std::min({kEagleBurst, left, kMaxVerifyRows - (L - hq)});
+      if (avg < min_accept) {
+        go_plain = true;
+      } else if (avg < kEagleKeepAccept && burst >= 2) {
+        const auto b0 = std::chrono::steady_clock::now();
+        std::vector<std::int32_t> bt;
+        if (!s.decode_greedy(burst, error) || !s.tokens(L + 1, L + 1 + burst, &bt, error))
+          return true;
+        const double plain_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0)
+                .count();
+        const double plain_rate = burst / std::max(plain_ms, 1e-3);
+        const double eagle_rate = probe_tok / std::max(probe_ms, 1e-3);
+        if (std::getenv("G4_SERVE_DEBUG") != nullptr || et)
+          std::fprintf(stderr, "G4_EAGLE probe: %.2f accepted/round, eagle %.1f tok/s, "
+                       "plain %.1f tok/s -> %s\n", avg, 1000.0 * eagle_rate,
+                       1000.0 * plain_rate, plain_rate >= eagle_rate ? "plain" : "eagle");
+        bool stop2 = false;
+        for (std::int32_t t : bt)
+          if ((stop2 = emit(t))) break;
+        if (stop2) return true;
+        if (plain_rate >= eagle_rate) {
+          go_plain = true;  // the anchor already sits at d_tokens[written]
+        } else {
+          // Re-sync: features of [hq, L + burst) for the head's next catch-up
+          // (rows [hq, L) were verified, rows [L, L + burst) decoded; both are
+          // recomputed bit-identically by the verify-shaped forward).
+          if (!s.truncate(hq) || !s.forward_hidden(L + burst, hq, f_verify, error)) return true;
+          L += burst;
+        }
+      }
+    }
+    return go_plain;  // drafting is not paying: leave the loop, finish greedily
   };
   bool stop = false;
   do stop = round(error); while (!stop && error->empty());
   if (!error->empty()) return false;
+  if (go_plain && static_cast<int>(generated.size()) < a.max_tokens &&
+      !(a.eos >= 0 && !generated.empty() && a.is_eos(generated.back()))) {
+    // The anchor (last emitted token) sits at d_tokens[L], the target KV holds
+    // [0, L): continue as plain chained greedy decode, 8 tokens per readback.
+    if (policy != nullptr) policy->off = true;
+    if (std::getenv("G4_SERVE_DEBUG") != nullptr || et)
+      std::fprintf(stderr, "G4_EAGLE drafting off after %d rounds (%.2f accepted/round)\n",
+                   rounds_seen, static_cast<double>(probe_acc) / kEagleProbeRounds);
+    constexpr int kChunk = 8;
+    std::vector<std::int32_t> ids2;
+    bool done = false;
+    while (!done && static_cast<int>(generated.size()) < a.max_tokens) {
+      const int pos = s.written();
+      const int steps = std::min(kChunk, a.max_tokens - static_cast<int>(generated.size()));
+      if (!s.decode_greedy(steps, error) || !s.tokens(pos + 1, pos + 1 + steps, &ids2, error))
+        return false;
+      for (std::int32_t t : ids2)
+        if (emit(t)) {
+          done = true;
+          break;
+        }
+    }
+  }
   const double et_wall =
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - et_t0).count();
   if (et) {
@@ -811,9 +982,12 @@ bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* o
 }
 
 bool gpu_generate(GpuSession& s, const Args& a, Generation* out, std::string* error,
-                  EagleHead* head = nullptr, int prefix = -1) {
+                  EagleHead* head = nullptr, int prefix = -1, EaglePolicy* policy = nullptr) {
   if (!check_request(s, a, prefix, error)) return false;
-  if (a.eagle_k > 0) return generate_eagle(s, head, a, out, error);
+  // A conversation whose drafts were not paying decodes plainly (same tokens).
+  if (a.eagle_k > 0 && policy != nullptr && policy->off)
+    return generate_greedy(s, a, out, error, prefix);
+  if (a.eagle_k > 0) return generate_eagle(s, head, a, out, error, prefix, policy);
   if (a.draft_k > 0) return generate_draft(s, a, out, error, prefix);
   return a.seed == 0 ? generate_greedy(s, a, out, error, prefix)
                      : generate_sampled(s, a, out, error, prefix);
@@ -847,8 +1021,105 @@ int gpu_generate_cmd(const Args& a) {
   return 0;
 }
 
-// `dump-hidden`: final-normed hidden states for every position of every
-// input record (see the file header).
+// `kv-bench`: load, time prefill (a.bench_ctx tokens from 0 to N), then time
+// decode (a.bench_decode greedy tokens from N to N + D). Emits one JSON
+// object per run on stdout:
+//   {"prefill_ms":..., "decode_ms":..., "kv_free_before":...,
+//    "kv_free_after":..., "tokens_generated":..., "decode_tps":...}
+//
+// Memory is measured with cudaMemGetInfo around the GPU forward calls, so
+// "kv_free_before/after" reports the *free* device memory at each phase —
+// the difference between runs (bf16 vs int8) is the persistent KV pool
+// delta on the same GPU with weights already resident.
+int gpu_kv_bench_cmd(const Args& a) {
+  std::string err;
+  const int N = a.bench_ctx;
+  const int D = a.bench_decode;
+  if (N < 2 || D <= 0) return fail("kv-bench: need --bench-ctx N>=2 --bench-decode D");
+  // max_pos must hold the prompt plus every generated token plus one (the
+  // decode chain writes d_tokens[written..written+steps], written = N after
+  // prefill, steps = D; gpu_decode_greedy requires written + steps + 1 <= max_pos).
+  const int max_pos = N + D + 1;
+  GpuSession s;
+  if (!s.open(a.dir, max_pos, 1, &err)) return fail(err);
+
+  // Deterministic pseudo-tokens so bf16 and int8 runs process identical ids.
+  const int V = s.vocab();
+  std::vector<std::int32_t> tokens(static_cast<std::size_t>(N));
+  std::uint64_t r = a.seed != 0 ? static_cast<std::uint64_t>(a.seed)
+                                : 0x9E3779B97F4A7C15ull;
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    r = r * 6364136223846793005ull + 1442695040888963407ull;
+    tokens[i] = static_cast<std::int32_t>(
+        (r >> 16) % static_cast<std::uint64_t>(V > 0 ? V : 1));
+  }
+  if (!s.upload(tokens, 0, N, &err)) return fail(err);
+
+  const char* kv8_env = std::getenv("G4_KV8");
+  const bool kv8_requested = kv8_env != nullptr && kv8_env[0] == '1';
+  const bool kv4_requested = kv8_env != nullptr && kv8_env[0] == '4';
+  const bool kv8 = s.kv8();  // resolved (after the split-attention check)
+  const bool kv4 = s.kv4();
+  if (kv8_requested && !kv8)
+    std::fprintf(stderr,
+                 "kv-bench: WARNING G4_KV8=1 requested but the session fell "
+                 "back to bf16 (config not split-attention capable: needs "
+                 "d==128 and Hq==4*Hk)\n");
+  if (kv4_requested && !kv4)
+    std::fprintf(stderr,
+                 "kv-bench: WARNING G4_KV8=4 requested but the session fell "
+                 "back to bf16 (config not split-attention capable: needs "
+                 "d==128 and Hq==4*Hk)\n");
+
+  // Free memory right after the session is fully open (weights + KV pool +
+  // fixed scratch are resident; the KV pool is the only thing that differs
+  // between bf16 and int8). Measuring here — not around the forward calls,
+  // which allocate transient activation scratch that is identical in both
+  // modes — isolates the persistent KV cache footprint.
+  long long free_after_load = 0;
+  {
+    std::size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
+      free_after_load = static_cast<long long>(free_b);
+  }
+
+  // Prefill: forward all N prompt positions; the argmax for the last prompt
+  // row (position N-1) is placed at d_tokens[N] via argmax_to_token.
+  // Same convention as generate_greedy. cudaDeviceSynchronize makes this GPU
+  // time, not the host time to enqueue the kernels.
+  const auto t0 = std::chrono::steady_clock::now();
+  if (!s.forward(N, N - 1, &err)) return fail(err);
+  if (!s.argmax_to_token(N, &err)) return fail(err);
+  cudaDeviceSynchronize();
+  const auto t1 = std::chrono::steady_clock::now();
+
+  // Decode: device-side greedy chain — same path as generate_greedy.
+  // Reads d_tokens[N] as the first token; writes tokens N+1..N+D. Sync on the
+  // stream before stopping the clock so this is GPU time, not the host time
+  // to enqueue D async graph replays.
+  const auto t2 = std::chrono::steady_clock::now();
+  if (!s.decode_greedy(D, &err)) return fail(err);
+  cudaDeviceSynchronize();
+  const auto t3 = std::chrono::steady_clock::now();
+
+  const double prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  const double decode_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+  const double tps = D > 0 ? 1000.0 * static_cast<double>(D) / decode_ms : 0.0;
+
+  // Report the persistent KV-pool footprint as the free-memory difference
+  // between this run (bf16 / int8 / int4 pool) measured right after load. The
+  // cross-run delta is the KV cache size difference at the same max_pos.
+  std::fprintf(stdout,
+      "{\"kv8\":%s,\"kv4\":%s,\"split_attn\":%s,\"prefill_ms\":%.3f,\"decode_ms\":%.3f,"
+      "\"decode_tps\":%.3f,\"free_after_load\":%lld,\"max_pos\":%d,"
+      "\"ctx\":%d,\"decode\":%d}\n",
+      kv8 ? "true" : "false",
+      kv4 ? "true" : "false",
+      s.split_attn() ? "true" : "false",
+      prefill_ms, decode_ms, tps, free_after_load, max_pos, N, D);
+  std::fflush(stdout);
+  return 0;
+}
 int gpu_dump_hidden_cmd(const Args& a) {
   std::string err;
   GpuSession s;
@@ -901,12 +1172,12 @@ int gpu_dump_hidden_cmd(const Args& a) {
 // ({"error": "..."}) and do not end the loop; EOF on stdin does.
 int gpu_serve_cmd(const Args& cli) {
   constexpr int kServeLogitRows = 16;  // draft_lookup <= 15
+  constexpr int kPoolPage = 64;        // rows per KV page (the attention tile)
   const int n_sessions = std::max(1, cli.sessions);
   std::string err;
-
   // 1. Load and upload the weight object ONCE (the ~9.5 GiB blob lives
   //    once per device); every session attaches to it via
-  //    gpu_ctx_use_weights, so VRAM is 9.4 + N x 1.5 GiB, not N x 9.5.
+  //    gpu_ctx_use_weights.
   ModelConfig cfg;
   if (!load_model_config(cli.dir, &cfg, &err, /*enforce_spec=*/true))
     return fail(err);
@@ -926,36 +1197,119 @@ int gpu_serve_cmd(const Args& cli) {
     GpuWeights* w;
     ~WtGuard() { gpu_weights_free_obj(w); }
   } wt_guard{weights};
-
-  // 2. Create N sessions (a stack array: GpuSession must never be
-  //    copied/moved - it owns CUDA pointers), each sharing the weights.
   constexpr int kMaxSessions = 16;
   if (n_sessions > kMaxSessions)
     return fail("--sessions exceeds " + std::to_string(kMaxSessions));
+  // 2. ONE shared KV pool for every session (qwen3-27b-5090's plan-once,
+  //    allocate-once pool): a single arena of pool_rows positions per
+  //    (layer, kv head), cut into 64-row pages that the KvPoolController
+  //    hands to sessions on demand. A session's context addresses its pages
+  //    through a position -> row table, so a conversation costs only the
+  //    pages it actually holds and an idle one gives the rest back. The
+  //    default pool lets every session fill --max-context at once.
+  const long want_tokens = cli.kv_pool_tokens > 0
+                               ? static_cast<long>(cli.kv_pool_tokens)
+                               : static_cast<long>(n_sessions) * cli.max_context;
+  const int pool_pages = static_cast<int>((want_tokens + kPoolPage - 1) / kPoolPage);
+  const int pool_rows = pool_pages * kPoolPage;
+  if (pool_rows < cli.max_context)
+    return fail("--kv-pool-tokens (" + std::to_string(pool_rows) +
+                ") is smaller than --max-context (" + std::to_string(cli.max_context) + ")");
+  char aerr[256] = "";
+  GpuKvArena* arena = gpu_kv_arena_create(cfg, pool_rows, aerr, sizeof aerr);
+  if (arena == nullptr) return fail(std::string("kv arena: ") + aerr);
+  struct ArenaGuard {
+    GpuKvArena* a;
+    ~ArenaGuard() { gpu_kv_arena_free(a); }
+  } arena_guard{arena};
+  KvPoolConfig pool_cfg;
+  pool_cfg.layout = KvLayout::from_config(cfg);
+  pool_cfg.tokens_per_page = kPoolPage;
+  pool_cfg.page_bytes = pool_cfg.tokens_per_page * pool_cfg.layout.bytes_per_token;
+  pool_cfg.num_pages = static_cast<std::size_t>(pool_pages);
+  pool_cfg.budget_bytes = pool_cfg.num_pages * pool_cfg.page_bytes;
+  KvPoolController pool(pool_cfg);
+  // 3. N sessions on the shared weights and the shared pool (a stack array:
+  //    GpuSession must never be copied/moved - it owns CUDA pointers).
+  //    Requests run one at a time, so sessions 1.. borrow session 0's prefill
+  //    scratch and feature buffers instead of each holding ~1 GiB of its own.
   GpuSession sessions[kMaxSessions];
+  int slot[kMaxSessions];
   for (int i = 0; i < n_sessions; ++i) {
     if (!sessions[i].open_shared(cli.dir, cli.max_context, kServeLogitRows,
-                                 weights, &err))
+                                 weights, &err, arena))
       return fail("open_shared[" + std::to_string(i) + "]: " + err);
+    if (i > 0 && !sessions[i].share_scratch_from(&sessions[0], &err))
+      return fail("share_scratch[" + std::to_string(i) + "]: " + err);
+    slot[i] = pool.open_slot();
+    if (slot[i] < 0) return fail("kv pool: no slot for session " + std::to_string(i));
   }
-
-  // 3. EAGLE head: the head carries its own scratch + KV cache + decode
-  //    watermark, so one head cannot be safely shared across sessions.
-  //    Fail fast instead of silently corrupting state; N>1 without
-  //    --eagle is the intended shared-weight serve shape.
-  EagleHead* head = nullptr;
-  if (!cli.eagle.empty()) {
-    if (n_sessions > 1)
-      return fail("--eagle requires --sessions 1 (the head's scratch/KV "
-                  "are per-session; shared-weight serving is greedy)");
-    if (!open_eagle(sessions[0], cli.eagle, &head, &err)) return fail(err);
-  }
+  // 4. EAGLE: ONE draft-KV pool in the same row space as the main pool (the
+  //    head's draft KV for a position sits at the same arena row as the main
+  //    KV, so one row table per session addresses both), the head weights
+  //    loaded once, and a per-session head (scratch + watermark) forked from
+  //    the base so every session speculates.
+  EagleHead* heads[kMaxSessions] = {};
   struct HeadGuard {
-    EagleHead* h;
-    ~HeadGuard() { eagle_free(h); }
-  } head_guard{head};
-
-  // 4. Warm-up: load the lazily loaded kernels and capture the decode
+    EagleHead** h;
+    int n;
+    ~HeadGuard() {
+      for (int i = n - 1; i >= 0; --i) eagle_free(h[i]);  // forks before the base
+    }
+  } head_guard{heads, n_sessions};
+  if (!cli.eagle.empty()) {
+    heads[0] = eagle_load(cli.eagle, sessions[0].ctx(), cfg, kForwardSpec, cli.max_context,
+                          &err, pool_rows);
+    if (heads[0] == nullptr) return fail(err);
+    for (int i = 1; i < n_sessions; ++i) {
+      heads[i] = eagle_fork(heads[0], sessions[i].ctx(), &err);
+      if (heads[i] == nullptr) return fail("eagle_fork[" + std::to_string(i) + "]: " + err);
+    }
+  }
+  const bool have_eagle = heads[0] != nullptr;
+  // Per-session conversation state: the tokens whose KV the session holds,
+  // and when it last served a request (LRU for pool eviction).
+  std::vector<std::vector<std::int32_t>> hist(n_sessions);
+  std::vector<long> last_used(n_sessions, 0);
+  std::vector<EaglePolicy> policy(n_sessions);  // per conversation
+  long tick = 0;
+  // Give session i enough pool pages for `need` positions and publish its row
+  // table. Its resident pages never move, so a resumed conversation's KV stays
+  // valid. If the pool is short, the least-recently-used OTHER session's
+  // resident KV is dropped (it just re-prefills next time) until it fits.
+  auto prepare = [&](int i, long need, std::string* e) -> bool {
+    const std::size_t want =
+        ((static_cast<std::size_t>(need) + kPoolPage - 1) / kPoolPage) * kPoolPage;
+    while (pool.pages_missing(slot[i], want) > pool.free_pages()) {
+      int victim = -1;
+      for (int j = 0; j < n_sessions; ++j)
+        if (j != i && pool.slot_pages(slot[j]) > 0 &&
+            (victim < 0 || last_used[j] < last_used[victim]))
+          victim = j;
+      if (victim < 0) {
+        *e = "kv pool exhausted: need " + std::to_string(want) + " positions, pool holds " +
+             std::to_string(pool_rows);
+        return false;
+      }
+      pool.drop(slot[victim]);
+      policy[victim] = EaglePolicy{};
+      hist[victim].clear();
+      sessions[victim].truncate(0);
+      eagle_truncate(heads[victim], 0);
+    }
+    if (!pool.ensure(slot[i], want)) {
+      *e = "kv pool: could not reserve " + std::to_string(want) + " positions";
+      return false;
+    }
+    std::vector<int> rows(want);
+    const int n_map = static_cast<int>(std::min<std::size_t>(want, cli.max_context));
+    if (!pool.row_table(slot[i], want, rows.data()) || !sessions[i].map_rows(rows.data(), n_map)) {
+      *e = "kv pool: row table rejected";
+      return false;
+    }
+    return true;
+  };
+  // 5. Warm-up: load the lazily loaded kernels and capture the decode
   //    graph on EVERY session (the graph references that session's
   //    device pointers, so a warm-up on session 0 does not help the
   //    others). Uses an 8-token prompt, three greedy steps.
@@ -965,24 +1319,28 @@ int gpu_serve_cmd(const Args& cli) {
     w.max_tokens = 4;
     Generation g;
     if (cli.max_context >= 16 &&
-        !gpu_generate(sessions[i], w, &g, &err, head))
+        (!prepare(i, 64, &err) || !gpu_generate(sessions[i], w, &g, &err, heads[i])))
       return fail("warm-up[" + std::to_string(i) + "]: " + err);
   }
-
-  std::printf("{\"ready\":true,\"max_context\":%d,\"sessions\":%d,"
+  std::fprintf(stderr,
+               "granite4: serve ready: %d session(s) x %d positions, KV pool %d positions "
+               "(%d pages), main KV %.2f GiB, draft KV %.2f GiB\n",
+               n_sessions, cli.max_context, pool_rows, pool_pages,
+               static_cast<double>(gpu_kv_arena_bytes(arena)) / (1024.0 * 1024.0 * 1024.0),
+               static_cast<double>(eagle_kv_bytes(heads[0])) / (1024.0 * 1024.0 * 1024.0));
+  std::printf("{\"ready\":true,\"max_context\":%d,\"sessions\":%d,\"kv_pool_tokens\":%d,"
               "\"eagle\":%s}\n",
-              cli.max_context, n_sessions, head != nullptr ? "true" : "false");
+              cli.max_context, n_sessions, pool_rows, have_eagle ? "true" : "false");
   std::fflush(stdout);
-
-  // 4b. Warm-up left each session's watermark advanced past the synthetic
+  // 5b. Warm-up left each session's watermark advanced past the synthetic
   //     8-token prompt. Reset so the first serve request starts from an
-  //     empty KV (matching the empty hist below); without this the
-  //     watermark==hist.size() match check would treat every session as
-  //     stale and force a full re-prefill (correct but wasteful, and it
-  //     breaks the invariant that a fresh session has watermark 0).
-  for (int i = 0; i < n_sessions; ++i) sessions[i].truncate(0);
-
-  // 5. Requests dispatch to the session whose KV prefix is the longest
+  //     empty KV (matching the empty hist); give the warm-up pages back.
+  for (int i = 0; i < n_sessions; ++i) {
+    sessions[i].truncate(0);
+    eagle_truncate(heads[i], 0);
+    pool.drop(slot[i]);
+  }
+  // 6. Requests dispatch to the session whose KV prefix is the longest
   //    full prefix of the new prompt; that session resumes from its
   //    watermark (only the tail is uploaded and prefilled). When no session
   //    matches (or the pool is empty), the request goes to the next
@@ -992,7 +1350,6 @@ int gpu_serve_cmd(const Args& cli) {
   //    generated ids. A new prompt that shares a prefix with an existing
   //    hist reuses the cached KV positions instead of re-prefilling them,
   //    which is the primary cost of a long context in a chat conversation.
-  std::vector<std::vector<std::int32_t>> hist(n_sessions);
   int next = 0;
   std::string line;
   for (int c; (c = std::getchar()) != EOF;) {
@@ -1023,25 +1380,24 @@ int gpu_serve_cmd(const Args& cli) {
       a.draft_k = static_cast<int>(req.get_int("draft_lookup", 0));
       a.eos = static_cast<long>(req.get_int("eos", -1));
       a.eagle_k = static_cast<int>(req.get_int("eagle", 0));
-      // Delegate the session pick to the host-tested serve_decide:
-      // longest session whose KV prefix is a full prefix of a.tokens
-      // (watermark == history.size() required; a failed turn leaves the
-      // watermark stale and is treated as a miss). On a miss, the
-      // round-robin pointer's next session with a full re-prefill.
-      // The Eagle head always re-prefills from 0 (generate_eagle truncates
-      // the session and resets its own scratch from scratch; it cannot
-      // resume from a cached prefix), so force resume == 0 for the eagle
-      // path. Note: the head is a single shared object across all
-      // sessions, so eagle is a perf feature for the 1-session case, not
-      // for a multi-session pool (a per-session head is out of scope here).
+      // Delegate the session pick to the host-tested serve_decide: the
+      // session sharing the longest prefix with a.tokens (watermark ==
+      // history.size() required; a failed turn leaves the watermark stale
+      // and is treated as a miss). On a miss, an empty session or the
+      // round-robin pointer's, with a full re-prefill. EAGLE
+      // requests resume like any other: every session has its own head, and
+      // generate_eagle re-forwards only the few positions the head trails by.
       std::vector<ServeSessionState> state(n_sessions);
       for (int i = 0; i < n_sessions; ++i) {
         state[i].history = hist[i];
         state[i].watermark = sessions[i].written();
       }
-      const ServeDecision dec = serve_decide(state, next, a.tokens);
+      // Resume from the longest shared prefix (>= one 64-position page, so a
+      // shared system prompt alone never steals another conversation's
+      // session). Rows past the divergence are simply overwritten.
+      const ServeDecision dec = serve_decide(state, next, a.tokens, kPoolPage);
       picked = dec.picked;
-      resume = (a.eagle_k > 0) ? 0 : dec.resume;
+      resume = dec.resume;
       // G4_FORCE_REPREFILL: override the resume decision so this request
       // full-prefills even when the session's cached prefix matches the
       // prompt (resume == 0 truncates the watermark to 0 and forwards the
@@ -1052,14 +1408,31 @@ int gpu_serve_cmd(const Args& cli) {
       err.clear();
       GpuSession& s = sessions[picked];
       if (std::getenv("G4_SERVE_DEBUG") != nullptr)
-        std::fprintf(stderr, "G4_SERVE session=%d resume=%d prompt=%ld wm=%d\n",
-                     picked, resume, static_cast<long>(a.tokens.size()), s.written());
+        std::fprintf(stderr, "G4_SERVE session=%d resume=%d prompt=%ld wm=%d free_pages=%zu\n",
+                     picked, resume, static_cast<long>(a.tokens.size()), s.written(),
+                     pool.free_pages());
       // The watermark before this turn. Used below to tell a check_request
       // rejection (no GPU work ran, session untouched) apart from a
       // mid-generation failure (a forward completed and the watermark
       // advanced past hist, leaving the KV ahead of the recorded prefix).
       const int wm_before = s.written();
-      const bool ok = gpu_generate(s, a, &g, &err, head, resume);
+      bool ok = false;
+      // Validate first so a rejected request touches neither the pool nor the
+      // session; then reserve pool pages for everything this turn can write.
+      if (check_request(s, a, resume, &err)) {
+        const long need = static_cast<long>(a.tokens.size()) + a.max_tokens + a.draft_k +
+                          (a.eagle_k > 0 ? a.eagle_k + 1 : 0);
+        if (prepare(picked, need, &err)) {
+          last_used[picked] = ++tick;
+          // A turn that does not resume re-prefills from 0: the head's draft
+          // history no longer matches the session's KV.
+          if (resume == 0) {
+            eagle_truncate(heads[picked], 0);
+            policy[picked] = EaglePolicy{};  // a new conversation probes again
+          }
+          ok = gpu_generate(s, a, &g, &err, heads[picked], resume, &policy[picked]);
+        }
+      }
       if (ok) reply = generate_document(g.ids, g.drafted ? &g.report : nullptr);
       // On success, record what the session's KV actually holds so the next
       // turn can resume from it. On failure, reset ONLY if the watermark
@@ -1089,6 +1462,8 @@ int gpu_serve_cmd(const Args& cli) {
           // request re-prefills instead of resuming into bad KV.
           h.clear();
           s.truncate(0);
+          eagle_truncate(heads[picked], 0);
+          pool.drop(slot[picked]);
         } else {
           h.resize(static_cast<std::size_t>(valid));
           if (valid > cli.max_context) {
@@ -1097,11 +1472,21 @@ int gpu_serve_cmd(const Args& cli) {
             // fresh.
             h.clear();
             s.truncate(0);
+            eagle_truncate(heads[picked], 0);
+            pool.drop(slot[picked]);
+          } else {
+            // The head's entries are only meaningful inside the cached
+            // prefix; hand back the pool pages reserved past it so an idle
+            // conversation holds only what it has written.
+            eagle_truncate(heads[picked], std::min(eagle_written(heads[picked]), valid));
+            pool.trim(slot[picked], static_cast<std::size_t>(valid));
           }
         }
       } else if (s.written() != wm_before) {
         hist[picked].clear();
         s.truncate(0);
+        eagle_truncate(heads[picked], 0);
+        pool.drop(slot[picked]);
       }
     }
     if (picked < 0) {
@@ -1221,11 +1606,17 @@ int main(int argc, char** argv) {
         "         [--eagle HEAD.safetensors --eagle-k K]\n"
         "       granite4-infer serve --checkpoint DIR --gpu 1 [--max-context N] [--eagle HEAD]\n"
         "       granite4-infer dump-hidden --checkpoint DIR --gpu 1 --in TOKENS.bin "
-        "--out HIDDEN.bin [--max-context N]\n");
+        "--out HIDDEN.bin [--max-context N]\n"
+        "       granite4-infer kv-bench --checkpoint DIR --gpu 1 --bench-ctx N "
+        "--bench-decode D [--seed S]   (G4_KV8=1 int8 KV, G4_KV8=4 int4 KV)\n");
     return 2;
   }
   if (a.sub == "generate" && a.max_tokens <= 0) {
     std::fprintf(stderr, "generate: --max-tokens required\n");
+    return 2;
+  }
+  if (a.sub == "kv-bench" && (a.bench_ctx < 2 || a.bench_decode <= 0)) {
+    std::fprintf(stderr, "kv-bench: --bench-ctx N (>=2) and --bench-decode D required\n");
     return 2;
   }
   if (a.sub == "generate" && a.draft_k > 0 && a.seed != 0) {
@@ -1242,6 +1633,7 @@ int main(int argc, char** argv) {
     if (a.sub == "forward") return gpu_forward_cmd(a);
     if (a.sub == "serve") return gpu_serve_cmd(a);
     if (a.sub == "dump-hidden") return gpu_dump_hidden_cmd(a);
+    if (a.sub == "kv-bench") return gpu_kv_bench_cmd(a);
     return gpu_generate_cmd(a);
 #else
     std::fprintf(stderr, "granite4-infer was built without CUDA support\n");

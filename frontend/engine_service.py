@@ -52,6 +52,14 @@ _SERVE_STARTUP_TIMEOUT_S = 600
 # speed setting only; unset (or K = 0) decodes without drafting.
 EAGLE_HEAD = os.environ.get("GRANITE4_EAGLE_HEAD", "")
 EAGLE_K = int(os.environ.get("GRANITE4_EAGLE_K", "3"))
+# Resident conversations: the engine keeps SESSIONS sessions (each up to
+# SERVE_MAX_CONTEXT positions, each with its own EAGLE state) on one shared KV
+# pool, and routes a request to the session whose cached history is the longest
+# prefix of its prompt, so interleaved chats each resume instead of
+# re-prefilling. KV_POOL_TOKENS sizes the pool in positions; 0 (default) is
+# SESSIONS x SERVE_MAX_CONTEXT, i.e. every session can fill its context at once.
+SESSIONS = int(os.environ.get("GRANITE4_SESSIONS", "1"))
+KV_POOL_TOKENS = int(os.environ.get("GRANITE4_KV_POOL_TOKENS", "0"))
 
 
 class ServingError(Exception):
@@ -238,7 +246,9 @@ class EngineService:
         k = EAGLE_K if eagle_k is None else eagle_k
         self._eagle_k = k if (gate.gpu and head and k > 0) else 0
         cmd = [gate.engine, "serve", "--checkpoint", gate.checkpoint, "--gpu", "1",
-               "--max-context", str(SERVE_MAX_CONTEXT)]
+               "--max-context", str(SERVE_MAX_CONTEXT), "--sessions", str(max(1, SESSIONS))]
+        if KV_POOL_TOKENS > 0:
+            cmd += ["--kv-pool-tokens", str(KV_POOL_TOKENS)]
         if self._eagle_k:
             cmd += ["--eagle", head, "--eagle-k", str(self._eagle_k)]
         self._serve = ServeProcess(cmd) if gate.gpu else None

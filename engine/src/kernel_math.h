@@ -61,6 +61,62 @@ inline float fp8_to_f32_host(std::uint8_t x) {
 }
 
 // ---------------------------------------------------------------------------
+// KV8 (Q8_0) int8 KV cache - host twin of dev::kv8_*.
+//
+// s = amax / 127 (IEEE RNE); q = clamp(round_even(x / s), -127, 127);
+// dequant = s * q. Must stay bit-identical to the device math so the GPU
+// round-trip test compares against the exact host reference.
+// ---------------------------------------------------------------------------
+
+inline float kv8_scale_host(float amax) {
+  return amax / 127.0f;
+}
+
+inline std::int8_t kv8_quant_host(float x, float scale) {
+  if (scale == 0.0f) return 0;
+  // Float division + round-half-away-from-zero, mirroring dev::kv8_quant
+  // (__float2round) exactly so device and host produce identical codes.
+  const float r = std::round(x / scale);
+  const long long clamped = r > 127.0f ? 127 : (r < -127.0f ? -127 : static_cast<long long>(r));
+  return static_cast<std::int8_t>(clamped);
+}
+
+inline float kv8_dequant_host(std::int8_t q, float scale) {
+  return scale * static_cast<float>(q);
+}
+
+// ---------------------------------------------------------------------------
+// int4 KV (per-row scale) - host twin of dev::q4_*.
+//
+// s = amax / 7 (IEEE RNE); code = clamp(round(x / s), -7, 7) + 8 (0..15);
+// dequant = s * (code - 8). Must stay bit-identical to the device math so
+// the GPU round-trip test compares against the exact host reference.
+// ---------------------------------------------------------------------------
+
+inline float q4_scale_host(float amax) {
+  // s = amax / 7 (IEEE RNE division) - the exact twin of dev::q4_scale. The
+  // reciprocal form (amax * (1.0f/7.0f)) rounds differently in the low ULPs,
+  // so the host must divide too to stay bit-identical to the device codes.
+  return amax / 7.0f;
+}
+
+inline unsigned char q4_quant_host(float x, float scale) {
+  if (scale == 0.0f) return 8;
+  // Float division + round-half-away-from-zero, mirroring dev::q4_quant
+  // (__float2round) exactly so device and host produce identical codes.
+  const float r = x / scale;
+  const long long clamped =
+      r > 7.0f ? 7 : (r < -7.0f ? -7 : static_cast<long long>(std::round(r)));
+  return static_cast<unsigned char>(clamped + 8);
+}
+
+// Unpack one byte into the two dequantized values (even dim first).
+inline void q4_dequant_pair_host(unsigned char byte, float scale, float& lo, float& hi) {
+  lo = scale * static_cast<float>(static_cast<int>(byte & 0x0fu) - 8);
+  hi = scale * static_cast<float>(static_cast<int>((byte >> 4) & 0x0fu) - 8);
+}
+
+// ---------------------------------------------------------------------------
 // RMSNorm (float reference). n is the hidden size (one row).
 // ---------------------------------------------------------------------------
 

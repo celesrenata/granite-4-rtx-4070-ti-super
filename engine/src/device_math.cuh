@@ -81,6 +81,92 @@ __device__ __forceinline__ void fp8x4_to_f32(std::uint32_t w, float& b0, float& 
   b3 = hi.y;
 }
 
+// ---------------------------------------------------------------------------
+// KV8 (Q8_0) int8 KV cache math.
+//
+// The persistent KV cache (and the EAGLE head's own cache) is stored int8:
+// each (head, position) row of d elements shares one float scale, s, chosen
+// from the row's absolute maximum so the largest magnitude maps to the
+// largest int8 code (127). Quantize: q_i = clamp(round(x_i / s), -127, 127).
+// Dequant: x_i ~= q_i * s.
+//
+// Round-trip error is bounded by half a quantization step, |x_i - q_i*s| <=
+// s/2, so the worst-case relative error is (1/127)/2 ~= 0.4% ~= 2^-8. That
+// is below BF16 precision but enough to move a 2-ULP teacher-forced parity
+// gate, so KV8 is opt-in (G4_KV8) and the BF16 cache stays the default the
+// production gate runs on.
+//
+// The device and host twins below stay bit-identical: IEEE RNE division
+// (x / s), RNE round-to-even for the int code, then clamp to [-127, 127].
+// A zero row keeps s == 0 and quantizes to all-zero codes (dequant exactly
+// 0.0; no NaN from dividing by zero).
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float kv8_scale(float amax) {
+  // s = amax / 127 (IEEE RNE division). amax is a max of absolute values.
+  return amax / 127.0f;
+}
+
+// Round-half-away-from-zero to a long, bit-identical to the host twin's
+// std::round(float). The IEEE division feeding it is correctly rounded on
+// both sides, so the code matches. RNE (__float2ll_rn) and away-from-zero
+// differ only at exact +/-0.5 fractions, where RNE keeps the even side; the
+// fmodf correction catches exactly those. (floorf(x + 0.5f) would NOT
+// match: the float addition itself RNE-rounds, e.g. 0.5 - 2^-25 + 0.5f ==
+// 1.0f.)
+__device__ __forceinline__ long kv8_round_away(float r) {
+  long i = __float2ll_rn(r);
+  const float fr = fmodf(r, 1.0f);  // exact fractional part for finite r
+  if (fr == 0.5f) i = static_cast<long>(ceilf(r));
+  else if (fr == -0.5f) i = static_cast<long>(floorf(r));
+  return i;
+}
+
+__device__ __forceinline__ std::int8_t kv8_quant(float x, float scale) {
+  if (scale == 0.0f) return 0;
+  const long r = kv8_round_away(x / scale);
+  const long clamped = r > 127 ? 127 : (r < -127 ? -127 : r);
+  return static_cast<std::int8_t>(clamped);
+}
+
+__device__ __forceinline__ float kv8_dequant(std::int8_t q, float scale) {
+  return scale * static_cast<float>(q);
+}
+
+// ---------------------------------------------------------------------------
+// int4 KV (per-row scale, 2 codes/byte).
+//
+// Q4_0-style: s = amax / 7 (IEEE RNE); code = clamp(round_away(x / s), -7, 7)
+// + 8, so it lives in 0..15 and packs two per byte (lower nibble = the even
+// dim, upper nibble = the odd dim). Dequant = s * (code - 8). A (head,position)
+// row is d/2 code bytes + one float scale: for d == 128 that is 64 B + 4 B,
+// 4x the density of the int8 cache. Rounding reuses kv8_round_away so the
+// device/host twins stay bit-identical (the same guarantee as int8).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float q4_scale(float amax) {
+  // s = amax / 7 (IEEE RNE division). amax is a max of absolute values.
+  return amax / 7.0f;
+}
+
+// Quantize one value to a 0..15 code (caller places it in a byte nibble).
+// Rounding follows the int8 math (half away from zero) so the device/host
+// twins stay bit-identical; scale == 0 -> 8 (zero).
+__device__ __forceinline__ unsigned char q4_quant(float x, float scale) {
+  if (scale == 0.0f) return 8;
+  const long r = kv8_round_away(x / scale);
+  const long clamped = r > 7 ? 7 : (r < -7 ? -7 : r);
+  return static_cast<unsigned char>(clamped + 8);
+}
+
+// Unpack one byte into the two dequantized values (even dim, odd dim).
+__device__ __forceinline__ void q4_dequant_pair(unsigned char byte, float scale, float& lo,
+                                               float& hi) {
+  const float l = static_cast<float>(static_cast<int>(byte & 0x0fu) - 8);
+  const float h = static_cast<float>(static_cast<int>((byte >> 4) & 0x0fu) - 8);
+  lo = scale * l;
+  hi = scale * h;
+}
+
 }  // namespace dev
 }  // namespace granite4
 

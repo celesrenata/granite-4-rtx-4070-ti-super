@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -30,6 +31,7 @@
 #include <cuda_runtime.h>
 
 #include "attention_gpu.h"
+#include "prefill_gemm.h"
 #include "checkpoint.h"
 #include "device_math.cuh"
 #include "kernel_math.h"
@@ -51,7 +53,25 @@ int granite4_kernel_rmsnorm(const std::uint16_t*, const std::uint16_t*, float, i
 int granite4_kernel_verify_qkv_stage(const std::uint16_t*, const std::uint16_t*,
                                      const std::uint16_t*, const float*, const float*, int, int,
                                      int, int, int, int, std::uint16_t*, std::uint16_t*,
-                                     std::uint16_t*, std::uint16_t*);
+                                     std::uint16_t*, std::uint16_t*, const int* d_pt = nullptr);
+// Quantized draft KV: rotate K in place at [pos0..pos0+rows) (Q rotation is
+// done by the caller on the bf16 q), then append the rotated K + raw V to the
+// persistent pool with a per-row scale. int8 (Q8_0) and int4 (Q4_0) forms.
+int granite4_kernel_kv_append_int8_batched(const std::uint16_t* d_src_k,
+                                           const std::uint16_t* d_src_v,
+                                           std::int8_t* d_cache_k, std::int8_t* d_cache_v,
+                                           float* d_cache_k_scale, float* d_cache_v_scale,
+                                           int base_pos, int rows, int stride, int Hk, int d,
+                                           const int* d_pt);
+int granite4_kernel_kv_append_int4_batched(const std::uint16_t* d_src_k,
+                                           const std::uint16_t* d_src_v,
+                                           std::uint8_t* d_cache_k, std::uint8_t* d_cache_v,
+                                           float* d_cache_k_scale, float* d_cache_v_scale,
+                                           int base_pos, int rows, int stride, int Hk, int d,
+                                           const int* d_pt);
+int granite4_kernel_rope_at_pos_batched(const std::uint16_t* d_x,
+                                        const float* d_cos, const float* d_sin, int rows,
+                                        int heads, int d, std::uint16_t* d_out);
 int granite4_rope_tables_build(double, int, int, float**, float**);
 }
 
@@ -167,17 +187,38 @@ struct EagleHead {
   const std::uint16_t* embed = nullptr;
   std::int32_t* vocab = nullptr;
   std::uint16_t *kv_k = nullptr, *kv_v = nullptr;
+  // Quantized persistent draft KV (G4_DRAFT_KV, default 16 = bf16): 8 or 4-bit
+  // Q8_0/Q4_0 codes + a per-(head,position) float scale. bf16 kv_k/kv_v hold
+  // the 16-bit pool; the *_8/_4 pools hold the quantized ones. kv_bits is the
+  // selected width (16/8/4).
+  int kv_bits = 16;
+  std::int8_t *kv8_k = nullptr, *kv8_v = nullptr;
+  float *kv8_k_scale = nullptr, *kv8_v_scale = nullptr;
+  std::uint8_t *kv4_k = nullptr, *kv4_v = nullptr;
+  float *kv4_k_scale = nullptr, *kv4_v_scale = nullptr;
   float *cos_tbl = nullptr, *sin_tbl = nullptr;
   void* attn_scratch = nullptr;
   std::uint16_t* scratch = nullptr;  // per-row buffers for kMaxVerifyRows rows
   std::uint16_t* logits = nullptr;   // [Vd]
   int written = 0;
-  std::vector<void*> allocs;
+  // Shared draft-KV pool (P4). kv_stride is the arena's rows per head: the
+  // whole pool for a paged head, max_pos for a private one. A paged head's
+  // draft KV lives in the SAME rows as its session's main KV - one row table
+  // (the target context's d_pt) addresses both pools - so pages shared or
+  // handed back at the main-cache level cover the draft cache too.
+  int kv_stride = 0;
+  GpuCtx* target = nullptr;  // paged: the session whose row table addresses the KV
+  GpuCtx* scratch_ctx = nullptr;  // the session whose prefill scratch the catch-up borrows
+  bool paged = false;
+  bool owns_tables = true;  // cos/sin: a forked session head borrows the base's
+  std::vector<void*> allocs;  // owned allocations (a fork lists only its own)
 
   ~EagleHead() {
     for (void* p : allocs) cudaFree(p);
-    cudaFree(cos_tbl);
-    cudaFree(sin_tbl);
+    if (owns_tables) {
+      cudaFree(cos_tbl);
+      cudaFree(sin_tbl);
+    }
   }
   template <class T>
   bool alloc(T** p, std::size_t bytes, std::string* err) {
@@ -266,7 +307,11 @@ std::size_t row_elems(const EagleHead& h) {
 }  // namespace
 
 EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig& cfg,
-                      const ForwardSpec& spec, int max_pos, std::string* err) {
+                      const ForwardSpec& spec, int max_pos, std::string* err, int kv_rows) {
+  if (kv_rows != 0 && kv_rows < max_pos) {
+    *err = "eagle head: kv_rows must cover max_pos";
+    return nullptr;
+  }
   TensorManifest man;
   if (!parse_safetensors_file(path, &man, err)) return nullptr;
   auto h = std::make_unique<EagleHead>();
@@ -279,6 +324,13 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
   h->eps = spec.rms_norm_eps;
   h->att_scale = spec.attention_multiplier;
   h->max_pos = max_pos;
+  // kv_rows > 0: the draft KV is one shared arena of kv_rows positions per
+  // head, addressed through `target`'s row table (this head serves that
+  // session; eagle_fork adds the others). 0: a private [max_pos] cache.
+  h->kv_stride = kv_rows > 0 ? kv_rows : max_pos;
+  h->paged = kv_rows > 0;
+  h->target = h->paged ? target : nullptr;
+  h->scratch_ctx = target;
   const std::int64_t H = h->H, I = h->I, nq = h->Hq * h->d, nk = h->Hk * h->d;
   HostTensor t;
   struct W {
@@ -349,12 +401,47 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
       !h->alloc(&h->lm, static_cast<std::size_t>(h->Vd) * H, err))
     return nullptr;
   gather_rows_kernel<<<dim3((h->H + 255) / 256, h->Vd), 256>>>(lm_head, h->vocab, h->H, h->lm);
-  const std::size_t kv = static_cast<std::size_t>(h->Hk) * max_pos * h->d * 2;
-  if (!h->alloc(&h->kv_k, kv, err) || !h->alloc(&h->kv_v, kv, err) ||
-      !h->alloc(&h->attn_scratch, attn_split_scratch_bytes(h->Hq, kMaxVerifyRows, max_pos), err) ||
-      !h->alloc(&h->scratch, row_elems(*h) * kMaxVerifyRows * 2, err) ||
-      !h->alloc(&h->logits, static_cast<std::size_t>(h->Vd) * 2, err))
-    return nullptr;
+  // G4_DRAFT_KV sets the persistent draft KV width: 16 (bf16, default), 8
+  // (Q8_0), or 4 (Q4_0). The quantized pools are 2x (8-bit) and 4x (4-bit)
+  // smaller than the bf16 pool, which is what lets the 131K reader pool fit
+  // the draft head on a 16 GiB card. Both require the split-KV attention
+  // shape (d==128, Hq==4*Hk); anything else falls back to bf16.
+  const char* const dkv_env = std::getenv("G4_DRAFT_KV");
+  h->kv_bits = 16;
+  if (dkv_env != nullptr) {
+    const char* end = nullptr;
+    const long v = std::strtol(dkv_env, const_cast<char**>(&end), 10);
+    if (end != nullptr && *end == '\0' && (v == 8 || v == 4) && h->d == 128 &&
+        h->Hq == 4 * h->Hk)
+      h->kv_bits = static_cast<int>(v);
+  }
+  const std::size_t kv = static_cast<std::size_t>(h->Hk) * h->kv_stride * h->d * 2;
+  const std::size_t kv_quant = static_cast<std::size_t>(h->Hk) * h->kv_stride *
+                               static_cast<std::size_t>(h->d);
+  const std::size_t kv4_quant = kv_quant / 2;
+  const std::size_t kv_scale = static_cast<std::size_t>(h->Hk) * h->kv_stride * 4;
+  bool ok = true;
+  switch (h->kv_bits) {
+  case 8:
+    ok = h->alloc(&h->kv8_k, kv_quant, err) && h->alloc(&h->kv8_v, kv_quant, err) &&
+         h->alloc(&h->kv8_k_scale, kv_scale, err) &&
+         h->alloc(&h->kv8_v_scale, kv_scale, err);
+    break;
+  case 4:
+    ok = h->alloc(&h->kv4_k, kv4_quant, err) && h->alloc(&h->kv4_v, kv4_quant, err) &&
+         h->alloc(&h->kv4_k_scale, kv_scale, err) &&
+         h->alloc(&h->kv4_v_scale, kv_scale, err);
+    break;
+  default:
+    ok = h->alloc(&h->kv_k, kv, err) && h->alloc(&h->kv_v, kv, err);
+    break;
+  }
+  if (ok)
+    ok = h->alloc(&h->attn_scratch, attn_split_scratch_bytes(h->Hq, kMaxVerifyRows, max_pos),
+                  err);
+  if (ok) ok = h->alloc(&h->scratch, row_elems(*h) * kMaxVerifyRows * 2, err);
+  if (ok) ok = h->alloc(&h->logits, static_cast<std::size_t>(h->Vd) * 2, err);
+  if (!ok) return nullptr;
   if (granite4_rope_tables_build(spec.rope_theta, h->d, max_pos, &h->cos_tbl, &h->sin_tbl) != 0) {
     *err = "eagle head: rope tables";
     return nullptr;
@@ -364,6 +451,43 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
 }
 
 void eagle_free(EagleHead* h) { delete h; }
+
+EagleHead* eagle_fork(const EagleHead* base, GpuCtx* target, std::string* err) {
+  if (base == nullptr || target == nullptr || !base->paged) {
+    *err = "eagle fork: needs a paged base head (eagle_load with kv_rows > 0)";
+    return nullptr;
+  }
+  if (gpu_ctx_kv_stride(target) != base->kv_stride) {
+    *err = "eagle fork: the session's KV rows differ from the head's draft pool";
+    return nullptr;
+  }
+  // Share the weights, tables and the draft-KV arena; own the per-session
+  // scratch, logits and watermark.
+  auto h = std::make_unique<EagleHead>(*base);
+  h->allocs.clear();  // the copy must not free what the base owns
+  h->owns_tables = false;
+  h->attn_scratch = nullptr;
+  h->scratch = nullptr;
+  h->logits = nullptr;
+  h->written = 0;
+  h->target = target;
+  h->scratch_ctx = target;
+  if (!h->alloc(&h->attn_scratch,
+                attn_split_scratch_bytes(h->Hq, kMaxVerifyRows, h->max_pos), err) ||
+      !h->alloc(&h->scratch, row_elems(*h) * kMaxVerifyRows * 2, err) ||
+      !h->alloc(&h->logits, static_cast<std::size_t>(h->Vd) * 2, err))
+    return nullptr;
+  return h.release();
+}
+std::size_t eagle_kv_bytes(const EagleHead* h) {
+  if (h == nullptr) return 0;
+  const std::size_t rows = static_cast<std::size_t>(h->Hk) * h->kv_stride;
+  switch (h->kv_bits) {
+    case 8: return 2 * rows * (h->d + 4);
+    case 4: return 2 * rows * (h->d / 2 + 4);
+    default: return 2 * rows * h->d * 2;
+  }
+}
 void eagle_truncate(EagleHead* h, int written) {
   if (h != nullptr && written >= 0 && written < h->written) h->written = written;
 }
@@ -374,12 +498,133 @@ std::size_t eagle_device_bytes(const EagleHead* h) {
   return 2 * H * H + 2 * nq * H + 2 * nk * H + 3 * I * H + static_cast<std::size_t>(h->Vd) * H;
 }
 
+namespace {
+// Prompt catch-up on tensor cores: rows [p, p + R) of the head in one pass of
+// prefill GEMMs (FP8 x bf16, tensor cores) + prefill attention, in the
+// session's prefill scratch (idle between the target's forwards). Same math
+// as the per-row verify-GEMV path, different accumulation order: drafts may
+// differ in rare near-ties, the output never does (the target verifies).
+int eagle_rows_prefill(EagleHead* h, const std::int32_t* d_tokens, int p, int R,
+                       const std::uint16_t* d_feat, std::uint16_t* f,
+                       const GpuPrefillScratch& s, const int* d_pt) {
+  const int H = h->H, I = h->I, nq = h->Hq * h->d, nk = h->Hk * h->d;
+  const int nqkv = nq + 2 * nk;
+  // xin [R][2H] lives in the (not yet used) f32 gate|up buffer.
+  std::uint16_t* const xin = reinterpret_cast<std::uint16_t*>(s.gu);
+  std::uint16_t* const x = s.hidden;
+  std::uint16_t* const xn = s.normed;
+  concat_kernel<<<dim3((2 * H + 255) / 256, R), 256>>>(d_tokens, p + 1, h->embed, d_feat, H, xin);
+  if (h->ln_e != nullptr)
+    input_norm_kernel<<<dim3(2, R), kNormThreads>>>(xin, h->ln_e, h->ln_h, H, h->eps);
+  GemmEpilogue ep;
+  ep.scale0 = h->sc[0];
+  ep.out_bf16 = x;
+  ep.ldc = H;
+  if (prefill_gemm(GemmOut::kBf16, xin, 2 * H, h->fc, R, H, 2 * H, ep, s.ws, s.ws_bytes) != 0)
+    return -1;
+  bias_kernel<<<dim3((H + 255) / 256, R), 256>>>(x, h->bias, H);
+  if (granite4_kernel_rmsnorm(x, h->ln1, h->eps, R, H, xn) != 0) return -1;
+  // q | k | v into one token-major [R][nqkv] row (three tensors, three scales).
+  struct P {
+    const std::uint8_t* w;
+    float sc;
+    int off, n;
+  };
+  for (const P& pj : {P{h->wq, h->sc[1], 0, nq}, P{h->wk, h->sc[2], nq, nk},
+                      P{h->wv, h->sc[3], nq + nk, nk}}) {
+    GemmEpilogue e;
+    e.scale0 = pj.sc;
+    e.out_bf16 = s.qkv + pj.off;
+    e.ldc = nqkv;
+    if (prefill_gemm(GemmOut::kBf16, xn, H, pj.w, R, pj.n, H, e, s.ws, s.ws_bytes) != 0)
+      return -1;
+  }
+  const bool i8 = h->kv_bits == 8, i4 = h->kv_bits == 4;
+  int rc;
+  if (i8)
+    rc = prefill_rope_split_append_int8(s.qkv, h->cos_tbl, h->sin_tbl, p, R, h->Hq, h->Hk, h->d,
+                                        h->kv_stride, s.q_rot, h->kv8_k, h->kv8_v,
+                                        h->kv8_k_scale, h->kv8_v_scale, d_pt);
+  else if (i4)
+    rc = prefill_rope_split_append_int4(s.qkv, h->cos_tbl, h->sin_tbl, p, R, h->Hq, h->Hk, h->d,
+                                        h->kv_stride, s.q_rot, h->kv4_k, h->kv4_v,
+                                        h->kv4_k_scale, h->kv4_v_scale, d_pt);
+  else
+    rc = prefill_rope_split_append(s.qkv, h->cos_tbl, h->sin_tbl, p, R, h->Hq, h->Hk, h->d,
+                                   h->kv_stride, s.q_rot, h->kv_k, h->kv_v, d_pt);
+  if (rc != 0 ||
+      prefill_attention(s.q_rot, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, p, R,
+                        h->kv_stride, s.attn, h->kv8_k, h->kv8_v,
+                        i8 ? h->kv8_k_scale : h->kv4_k_scale,
+                        i8 ? h->kv8_v_scale : h->kv4_v_scale, i8, h->kv4_k, h->kv4_v, i4,
+                        d_pt) != 0)
+    return -1;
+  // hh = x + att Wo  (into x, in place: residual may alias the output)
+  GemmEpilogue eo;
+  eo.scale0 = h->sc[4];
+  eo.out_bf16 = x;
+  eo.residual = x;
+  eo.ldc = H;
+  if (prefill_gemm(GemmOut::kResidual, s.attn, nq, h->wo, R, H, nq, eo, s.ws, s.ws_bytes) != 0 ||
+      granite4_kernel_rmsnorm(x, h->ln2, h->eps, R, H, xn) != 0)
+    return -1;
+  GemmEpilogue eg, eu;
+  eg.scale0 = h->sc[5];
+  eg.out_f32 = s.gu;
+  eg.ldc = 2 * I;
+  eu.scale0 = h->sc[6];
+  eu.out_f32 = s.gu + I;
+  eu.ldc = 2 * I;
+  if (prefill_gemm(GemmOut::kF32, xn, H, h->wg, R, I, H, eg, s.ws, s.ws_bytes) != 0 ||
+      prefill_gemm(GemmOut::kF32, xn, H, h->wu, R, I, H, eu, s.ws, s.ws_bytes) != 0 ||
+      prefill_silu_mul(s.gu, I, R, s.act) != 0)
+    return -1;
+  GemmEpilogue ed;
+  ed.scale0 = h->sc[7];
+  ed.out_bf16 = x;
+  ed.residual = x;
+  ed.ldc = H;
+  if (prefill_gemm(GemmOut::kResidual, s.act, I, h->wd, R, H, I, ed, s.ws, s.ws_bytes) != 0 ||
+      granite4_kernel_rmsnorm(x, h->lnf, h->eps, R, H, f) != 0)
+    return -1;
+  return 0;
+}
+}  // namespace
+
 int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows,
                   const std::uint16_t* d_feat, std::uint16_t* d_feat_out,
                   std::int32_t* d_draft_out) {
   if (h == nullptr || rows < 1 || pos0 != h->written || pos0 + rows > h->max_pos) return -1;
+  // Paged: the draft KV rows are the session's main-cache rows; never write
+  // or read past the positions the host has mapped for it.
+  if (h->target != nullptr && pos0 + rows > gpu_ctx_mapped_rows(h->target)) return -1;
+  const int* const d_pt = h->target != nullptr ? gpu_ctx_kv_rows_device(h->target) : nullptr;
   const int H = h->H, I = h->I, nq = h->Hq * h->d, nk = h->Hk * h->d, half = h->d / 2;
-  for (int c0 = 0; c0 < rows; c0 += kMaxVerifyRows) {
+  // Long catch-ups (a prompt, or the rows a resumed turn adds) run in
+  // prefill-sized chunks on tensor cores; the per-round steps (<= 16 rows)
+  // keep the verify-GEMV path. G4_EAGLE_PREFILL=0 forces the GEMV path.
+  constexpr int kPrefillMinRows = 64;
+  static const bool prefill_ok = [] {
+    const char* e = std::getenv("G4_EAGLE_PREFILL");
+    return e == nullptr || e[0] != '0';
+  }();
+  GpuPrefillScratch ps{};
+  const bool use_prefill = prefill_ok && rows >= kPrefillMinRows && h->scratch_ctx != nullptr &&
+                           h->d == 128 && h->Hq == 4 * h->Hk &&
+                           gpu_ctx_prefill_scratch(h->scratch_ctx, &ps) == 0 && ps.rows >= 64;
+  int c0 = 0;
+  if (use_prefill) {
+    // Whole chunks only; a short tail (< 64 rows) takes the GEMV path below.
+    for (; rows - c0 >= kPrefillMinRows; ) {
+      const int R = std::min(ps.rows, rows - c0);
+      if (eagle_rows_prefill(h, d_tokens, pos0 + c0, R, d_feat + static_cast<std::size_t>(c0) * H,
+                             d_feat_out + static_cast<std::size_t>(c0) * H, ps, d_pt) != 0)
+        return -1;
+      c0 += R;
+      h->written = pos0 + c0;
+    }
+  }
+  for (; c0 < rows; c0 += kMaxVerifyRows) {
     const int R = std::min(kMaxVerifyRows, rows - c0);
     const int p = pos0 + c0;
     std::uint16_t* s = h->scratch;
@@ -400,14 +645,47 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
     bias_kernel<<<dim3((H + 255) / 256, R), 256>>>(x, h->bias, H);
     if (granite4_kernel_rmsnorm(x, h->ln1, h->eps, R, H, xn) != 0 ||
         granite4_verify_qkv(xn, h->wq, h->wk, h->wv, h->sc[1], h->sc[2], h->sc[3], R, nq, nk, nk,
-                            H, q, k, v) != 0 ||
-        granite4_kernel_verify_qkv_stage(q, k, v, h->cos_tbl + static_cast<std::size_t>(p) * half,
-                                         h->sin_tbl + static_cast<std::size_t>(p) * half, p, R,
-                                         h->Hq, h->Hk, h->d, h->max_pos, qr, kr, h->kv_k,
-                                         h->kv_v) != 0 ||
-        attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
-                   h->max_pos, h->attn_scratch, att) != 0 ||
-        granite4_verify_gemv_resid(att, h->wo, h->sc[4], x, 1.0f, R, H, nq, hh) != 0 ||
+                            H, q, k, v) != 0)
+      return -1;
+    if (h->kv_bits == 4 || h->kv_bits == 8) {
+      // Quantized draft KV: rotate Q and K into qr/kr at [p, p+R) (in-place
+      // would race on the +/-half pairs), append the rotated K + raw V to the
+      // persistent pool (Q8_0/Q4_0 codes + per-row scale), and attend over the
+      // full prefix with dequant on load.
+      const std::size_t cosp = static_cast<std::size_t>(p) * half;
+      if (granite4_kernel_rope_at_pos_batched(q, h->cos_tbl + cosp, h->sin_tbl + cosp, R,
+                                              h->Hq, h->d, qr) != 0 ||
+          granite4_kernel_rope_at_pos_batched(k, h->cos_tbl + cosp, h->sin_tbl + cosp, R,
+                                              h->Hk, h->d, kr) != 0)
+        return -1;
+      if (h->kv_bits == 8) {
+        if (granite4_kernel_kv_append_int8_batched(kr, v, h->kv8_k, h->kv8_v, h->kv8_k_scale,
+                                                  h->kv8_v_scale, p, R, h->kv_stride, h->Hk,
+                                                  h->d, d_pt) != 0 ||
+            attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
+                       h->kv_stride, h->attn_scratch, att, h->kv8_k, h->kv8_v, h->kv8_k_scale,
+                       h->kv8_v_scale, true, nullptr, nullptr, false, d_pt, h->max_pos) != 0)
+          return -1;
+      } else {
+        if (granite4_kernel_kv_append_int4_batched(kr, v, h->kv4_k, h->kv4_v, h->kv4_k_scale,
+                                                  h->kv4_v_scale, p, R, h->kv_stride, h->Hk,
+                                                  h->d, d_pt) != 0 ||
+            attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
+                       h->kv_stride, h->attn_scratch, att, nullptr, nullptr, h->kv4_k_scale,
+                       h->kv4_v_scale, false, h->kv4_k, h->kv4_v, true, d_pt,
+                       h->max_pos) != 0)
+          return -1;
+      }
+    } else if (granite4_kernel_verify_qkv_stage(
+                   q, k, v, h->cos_tbl + static_cast<std::size_t>(p) * half,
+                   h->sin_tbl + static_cast<std::size_t>(p) * half, p, R, h->Hq, h->Hk, h->d,
+                   h->kv_stride, qr, kr, h->kv_k, h->kv_v, d_pt) != 0 ||
+               attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
+                          h->kv_stride, h->attn_scratch, att, nullptr, nullptr, nullptr,
+                          nullptr, false, nullptr, nullptr, false, d_pt, h->max_pos) != 0) {
+      return -1;
+    }
+    if (granite4_verify_gemv_resid(att, h->wo, h->sc[4], x, 1.0f, R, H, nq, hh) != 0 ||
         granite4_kernel_rmsnorm(hh, h->ln2, h->eps, R, H, hn) != 0 ||
         granite4_verify_silu(h->wg, h->wu, hn, h->sc[5], h->sc[6], I, H, R, act) != 0 ||
         granite4_verify_gemv_resid(act, h->wd, h->sc[7], hh, 1.0f, R, H, I, hh) != 0 ||

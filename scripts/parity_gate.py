@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import json
 import struct
 import subprocess
@@ -98,6 +99,23 @@ def reference_tokens(ckpt: str, prompt: str, max_tokens: int,
     return out
 
 
+def _gate_env() -> dict[str, str]:
+    """The engine subprocess env the gate runs with.
+
+    The gate always validates the bf16-arithmetic path: it pins G4_KV8=0 so
+    the int8 KV storage option can never leak in from the surrounding
+    environment (the NixOS unit environment, an operator's shell, ...).
+    int8 KV storage is a *memory* optimization (validated by the kernel unit
+    tests and the A/B measurement), not a bf16-parity target — under KV8 the
+    teacher-forced reference diverges by ~4 bf16 ULP on near-ties, which
+    fails the ulpTolerance. See flake.nix (the NixOS module pins the same
+    value on the ExecStartPre command line) and docs/memory.md.
+    """
+    env = dict(os.environ)
+    env["G4_KV8"] = "0"
+    return env
+
+
 def engine_tokens(engine: str, ckpt: str, prompt_ids: list[int], max_tokens: int,
                   gpu: bool = False) -> list[int]:
     """Run granite4-infer generate (greedy) and parse the produced tokens."""
@@ -106,7 +124,7 @@ def engine_tokens(engine: str, ckpt: str, prompt_ids: list[int], max_tokens: int
            "--tokens", toks, "--max-tokens", str(max_tokens), "--seed", "0"]
     if gpu:
         cmd += ["--gpu", "1"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=_gate_env())
     if r.returncode != 0:
         raise RuntimeError(f"engine failed: {r.stderr[-500:]}")
     doc = json.loads(r.stdout)
@@ -120,7 +138,7 @@ def engine_logits(engine: str, ckpt: str, tokens: list[int], last: int,
            "--tokens", ",".join(map(str, tokens)), "--last", str(last)]
     if gpu:
         cmd += ["--gpu", "1"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=_gate_env())
     if r.returncode != 0:
         raise RuntimeError(f"engine failed: {r.stderr[-500:]}")
     rows = json.loads(r.stdout)["logits"]

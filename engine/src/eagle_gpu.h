@@ -18,8 +18,22 @@ struct EagleHead;
 // q/k/v/o/gate/up/down.weight, draft_vocab int32) for `target`, whose packed
 // embedding and FP8 lm_head it shares. max_pos bounds the head's KV cache.
 // Returns nullptr with *err on failure.
+//
+// kv_rows == 0 (default): the head owns a private [max_pos] draft cache.
+// kv_rows > 0: the draft KV is ONE shared arena of kv_rows positions per
+// head - the same row space as the target's shared KV arena - addressed
+// through `target`'s row table, so the single pool serves every session. This
+// head then serves `target`; eagle_fork adds the other sessions.
 EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig& cfg,
-                      const ForwardSpec& spec, int max_pos, std::string* err);
+                      const ForwardSpec& spec, int max_pos, std::string* err,
+                      int kv_rows = 0);
+// A per-session head on `base`'s weights and draft-KV arena: own scratch and
+// watermark, rows addressed through `target`'s row table (a context on the
+// same arena as base's target). `base` must stay alive and must have been
+// loaded with kv_rows > 0. Free forks before the base.
+EagleHead* eagle_fork(const EagleHead* base, GpuCtx* target, std::string* err);
+// Bytes of the draft-KV pool (shared by the base and all forks).
+std::size_t eagle_kv_bytes(const EagleHead* h);
 void eagle_free(EagleHead* h);
 
 // Head entries [pos0, pos0 + rows): entry j reads token d_tokens[j + 1] and

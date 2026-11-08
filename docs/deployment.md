@@ -118,7 +118,8 @@ granite4.nixosModules.granite4Rtx
     package = granite4.packages.${system}.api;
     enginePackage = granite4.packages.${system}.engine-cuda;
     checkpoint = "/opt/granite4-rtx-4070-ti-super/ckpt";  # BF16 safetensors + tokenizer
-    maxContext = 8192;            # positions per request (160 KiB VRAM each)
+    maxContext = 8192;            # positions per request (160 KiB VRAM each, bf16 KV)
+    kv8 = true;                   # int8 KV cache (opt-in; ~52% less KV VRAM, gate stays bf16)
     listenAddress = "127.0.0.1";
     listenPort = 2701;
   };
@@ -142,6 +143,73 @@ within 2 ULP, 21/24 exact top-1 (the three misses are two exact bf16 ties and
 one 2-ULP gap). Free-running token matching is still available
 (`--mode free`, the original P3 gate) for the f32 host oracle; for the bf16
 GPU path one near-tie would flip the rest of the sequence.
+
+KV8 (int8 KV storage) is opt-in per deploy with `kv8 = true` (the NixOS
+module then sets `G4_KV8=1` in the unit environment). The unit environment is
+shared by `ExecStartPre` (the gate) and `ExecStart` (the API + its serve
+engine), so the gate pins `G4_KV8=0` in its own engine subprocesses
+(`scripts/parity_gate.py`, `_gate_env`): the gate always validates the bf16
+*arithmetic* path, and a `kv8` deploy only switches the serve engine's KV
+*storage*.
+
+What KV8 buys (measured on gremlin-1, `docs/memory.md` "Measured KV8 A/B"):
+the KV pool is 82.5 KiB/pos (80 KiB int8 codes + 2.5 KiB per-row scales) vs
+164 KiB/pos bf16 (160 KiB codes + the 4 KiB/pos split-attention compact
+prefix) — ~48% smaller, so a larger context pool fits — at the cost of
+prefill +3.7…13.9% and decode −1.9…3.5% tok/s: a *capacity* win, not a
+speed win. Quality: the teacher-forced bf16-vs-int8 comparison flips the
+argmax only on 1-ULP near-ties (23/24 identical, every position within 2 ULP
+on the gate prompt). The int8 round-trip error is also bounded by the kernel
+unit tests.
+
+`G4_KV8=4` / `kvFormat = "int4"` (per-row-scale int4, 2 codes/byte) goes
+further: 42.5 KiB/pos (40 KiB packed codes + 2.5 KiB scales, ~74% smaller
+than bf16). It is the only KV format that lets the full 131072-position
+reader pool fit a 16 GiB card alongside the FP8 weights for the *greedy*
+path: 131072 positions × 42.5 KiB = **5436 MiB** of KV, which sits under
+the ~16376 MiB card alongside the ~9.2–9.8 GiB weights/scratch floor
+(see `docs/memory.md`, "Q4_0-KV (int4) footprint"). Serve-level A/B
+(measured on a freed gremlin-1, `scripts/kv8-ab-bench.sh 4`): int4 holds
+~122 KiB/pos less than bf16 (~1.5× int8's saving, ~2× the positions for
+the same budget) but is **slower, not faster** — prefill +6.7…24.8%
+(worse than int8's +3.7…13.9%, the penalty grows with context) and decode
+−1.8…3.1% t/s (tracking int8). Pick int8 when latency matters and 64K × 2
+fits; pick int4 only when the context pool must exceed what int8 can hold.
+The speculative EAGLE drafter keeps its own persistent KV, which scales
+with the pool and is a separate budget — at 131072 positions the draft
+head's bf16 KV alone is ~537 MiB, which OOMs the 131K int4-reader config
+(the head dies on its last allocation, "eagle head: rope tables").
+`G4_DRAFT_KV` quantizes that draft KV (16 = bf16, the default; 8 = Q8_0;
+4 = Q4_0), reusing the reader's int8/int4 append + split-KV attention
+kernels; both quantized widths require the split-attention shape
+(d==128, Hq==4*Hk) and fall back to bf16 otherwise. Measured fit on
+gremlin-1 (int4 reader pool @ 131072, r8 head, 1 session):
+
+| draft KV | mem used | free |
+| --- | ---: | ---: |
+| 16 (bf16) | **OOM** | — |
+| 8 (int8) | 15795 MiB | 233 MiB |
+| 4 (int4) | 15667 MiB | 361 MiB |
+
+with the default path unchanged (bf16 draft @ 32768: 15359 MiB, the live
+footprint). Drafts are still target-verified in full precision, so a
+quantized draft KV can only lower the acceptance rate, never change the
+output. Measured quality (int4 reader @ 32768, r8 head, eagle_k=4, 3
+prompts × 120 tokens):
+
+| draft KV | accept rate | speedup | output |
+| --- | ---: | ---: | --- |
+| 16 (bf16) | 0.161 | 1.594× | ref |
+| 8 (int8) | 0.161 | 1.592× | byte-identical |
+| 4 (int4) | 0.159 | 1.581× | byte-identical |
+
+So int8 draft KV is lossless (same accept rate as bf16) and int4 costs
+~1% acceptance — negligible. The per-row int4 error is ~16× the int8
+one, yet the draft KV cache only ever holds the current request's
+*generated* tokens (a 1-layer head, not the long reader context), so
+the quantization error stays small and barely moves the accept rate.
+`G4_DRAFT_KV=8` is the lossless 131K default; `4` is the headroom
+option if you need the last ~128 MiB.
 
 Deploy a pushed commit:
 
