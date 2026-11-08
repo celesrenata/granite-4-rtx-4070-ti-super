@@ -171,10 +171,13 @@ __global__ void __launch_bounds__(kThreads)
     const bool specific = row_tail != nullptr && t0 + n - 1 > tb;
     const int passes = specific ? nr : 1;
     for (int fr = 0; fr < passes; ++fr) {
+    // Later passes of a row-specific tile keep the shared positions (<= tb)
+    // from pass 0 and only rewrite the tail positions with row fr's keys.
+    const int rs = fr > 0 ? max(0, tb + 1 - t0) : 0;
     __syncthreads();  // previous tile's readers (and the q preload) are done
     if (!quantized) {
-      for (int idx = threadIdx.x; idx < n * (kD / 8); idx += kThreads) {
-        const int r = idx / (kD / 8), c = (idx % (kD / 8)) * 8;
+      for (int idx = threadIdx.x; idx < (n - rs) * (kD / 8); idx += kThreads) {
+        const int r = rs + idx / (kD / 8), c = (idx % (kD / 8)) * 8;
         const int row = phys(fr, t0 + r);
         const std::size_t off = static_cast<std::size_t>(row) * kD + c;
         const uint4 kw = *reinterpret_cast<const uint4*>(kb + off);
@@ -187,8 +190,8 @@ __global__ void __launch_bounds__(kThreads)
       }
     } else if (Int4) {
       // KV4: one thread per (row, 16 code bytes = 32 dims).
-      for (int idx = threadIdx.x; idx < n * (kD / 32); idx += kThreads) {
-        const int r = idx / (kD / 32), c = (idx % (kD / 32)) * 16;  // code-byte offset
+      for (int idx = threadIdx.x; idx < (n - rs) * (kD / 32); idx += kThreads) {
+        const int r = rs + idx / (kD / 32), c = (idx % (kD / 32)) * 16;  // code-byte offset
         const int pos = phys(fr, t0 + r);
         const std::size_t cbase = static_cast<std::size_t>(pos) * (kD / 2) + c;
         const float sk = ksc[pos], sv = vsc[pos];
@@ -215,8 +218,8 @@ __global__ void __launch_bounds__(kThreads)
     } else {
       // KV8: one thread per (row, 16 codes): two 16-byte loads, then the same
       // per-element dequant (scale * code -> bf16) the scalar fill did.
-      for (int idx = threadIdx.x; idx < n * (kD / 16); idx += kThreads) {
-        const int r = idx / (kD / 16), c = (idx % (kD / 16)) * 16;  // dim offset
+      for (int idx = threadIdx.x; idx < (n - rs) * (kD / 16); idx += kThreads) {
+        const int r = rs + idx / (kD / 16), c = (idx % (kD / 16)) * 16;  // dim offset
         const int pos = phys(fr, t0 + r);
         const std::size_t base8 = static_cast<std::size_t>(pos) * kD + c;
         const float sk = ksc[pos], sv = vsc[pos];
