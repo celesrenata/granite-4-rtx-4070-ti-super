@@ -27,6 +27,7 @@
 // softmax runs in f32 (expf) and the probabilities are not rounded to bf16
 // before the value product, so outputs agree with the fused kernel within
 // bf16 rounding of the result (test_kernels.cu).
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -87,7 +88,9 @@ __global__ void __launch_bounds__(kThreads)
                       const int* __restrict__ d_pt,
                       const int* __restrict__ row_pos,
                       const int* const* __restrict__ row_pt,
-                      const int* __restrict__ row_grp) {
+                      const int* __restrict__ row_grp,
+                      const int* __restrict__ row_tbase,
+                      const int* __restrict__ row_tail) {
   const int hkv = blockIdx.x;
   const int split = blockIdx.y;
   // row_grp (multi-sequence rows): block z owns rows [r0, r0 + nr) of ONE
@@ -101,8 +104,13 @@ __global__ void __launch_bounds__(kThreads)
   const int base = row_pos != nullptr ? row_pos[r0] - r0
                                       : (d_pos != nullptr ? *d_pos : kv_base);
   const int t_begin = split * tps * kTile;
-  // Row r attends to [0, base + r + 1); the block's last row is the longest.
-  const int kv_max = base + r0 + nr;
+  // Row rr attends to [0, row_len(rr)): consecutive rows (decode / chain
+  // verify) or each row's own position (multi-sequence and tree rows).
+  auto row_len = [&](int rr) {
+    return row_pos != nullptr ? row_pos[r0 + rr] + 1 : base + r0 + rr + 1;
+  };
+  int kv_max = 0;
+  for (int rr = 0; rr < nr; ++rr) kv_max = max(kv_max, row_len(rr));
   if (t_begin >= kv_max) return;
   const int t_end_max = min(kv_max, t_begin + tps * kTile);
 
@@ -146,14 +154,28 @@ __global__ void __launch_bounds__(kThreads)
   }
 
   // Logical position -> physical arena row (identity when d_pt is null).
+  // Tree rows (row_tbase, one row per block): positions above tbase are this
+  // row's ancestors' slots (row_tail), the keys of the path it continues.
   const int* const pt = row_pt != nullptr ? row_pt[r0] : d_pt;
+  // A group of tree rows shares tbase (one session's draft tree): tiles at or
+  // below it are filled once for the group; a tile reaching past it is
+  // filled and attended once per row with that row's own tail (so every row
+  // still sees exactly its sequential tiles).
+  const int tb = row_tbase != nullptr ? row_tbase[r0] : INT_MAX;
+  auto phys = [&](int rr, int lp) {
+    if (lp > tb) lp = row_tail[(r0 + rr) * kAttnTailStride + lp - tb - 1];
+    return pt != nullptr ? pt[lp] : lp;
+  };
   for (int t0 = t_begin; t0 < t_end_max; t0 += kTile) {
     const int n = min(kTile, t_end_max - t0);
+    const bool specific = row_tail != nullptr && t0 + n - 1 > tb;
+    const int passes = specific ? nr : 1;
+    for (int fr = 0; fr < passes; ++fr) {
     __syncthreads();  // previous tile's readers (and the q preload) are done
     if (!quantized) {
       for (int idx = threadIdx.x; idx < n * (kD / 8); idx += kThreads) {
         const int r = idx / (kD / 8), c = (idx % (kD / 8)) * 8;
-        const int row = (pt != nullptr) ? pt[t0 + r] : t0 + r;
+        const int row = phys(fr, t0 + r);
         const std::size_t off = static_cast<std::size_t>(row) * kD + c;
         const uint4 kw = *reinterpret_cast<const uint4*>(kb + off);
         std::uint32_t* const kd = &Ks[r][c / 2];
@@ -167,7 +189,7 @@ __global__ void __launch_bounds__(kThreads)
       // KV4: one thread per (row, 16 code bytes = 32 dims).
       for (int idx = threadIdx.x; idx < n * (kD / 32); idx += kThreads) {
         const int r = idx / (kD / 32), c = (idx % (kD / 32)) * 16;  // code-byte offset
-        const int pos = (pt != nullptr) ? pt[t0 + r] : t0 + r;
+        const int pos = phys(fr, t0 + r);
         const std::size_t cbase = static_cast<std::size_t>(pos) * (kD / 2) + c;
         const float sk = ksc[pos], sv = vsc[pos];
         const uint4 kraw = *reinterpret_cast<const uint4*>(k4 + cbase);
@@ -195,7 +217,7 @@ __global__ void __launch_bounds__(kThreads)
       // per-element dequant (scale * code -> bf16) the scalar fill did.
       for (int idx = threadIdx.x; idx < n * (kD / 16); idx += kThreads) {
         const int r = idx / (kD / 16), c = (idx % (kD / 16)) * 16;  // dim offset
-        const int pos = (pt != nullptr) ? pt[t0 + r] : t0 + r;
+        const int pos = phys(fr, t0 + r);
         const std::size_t base8 = static_cast<std::size_t>(pos) * kD + c;
         const float sk = ksc[pos], sv = vsc[pos];
         const uint4 kraw = *reinterpret_cast<const uint4*>(k8 + base8);
@@ -221,8 +243,9 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
     for (int rr = 0; rr < RB; ++rr) {
       if (rr >= nr) break;
+      if (specific && rr != fr) continue;  // row-specific tile: row fr only
       // This row's slice of the split: [t_begin, min(kv_len, split end)).
-      const int t_end = min(base + r0 + rr + 1, t_begin + tps * kTile);
+      const int t_end = min(row_len(rr), t_begin + tps * kTile);
       if (t0 >= t_end) continue;  // row done (warp-uniform)
       const int nrow = min(kTile, t_end - t0);
       // Logits for kv = lane and lane + 32 of this tile, bf16-rounded.
@@ -272,6 +295,7 @@ __global__ void __launch_bounds__(kThreads)
         o[rr][3] += p * dev::bf16_hi(w.y);
       }
     }
+    }  // passes
   }
 
 #pragma unroll
@@ -279,7 +303,7 @@ __global__ void __launch_bounds__(kThreads)
     if (rr >= nr) break;
     // Rows whose causal length ends before this split never reach it; the
     // combine kernel does not read their slot.
-    if (t_begin >= base + r0 + rr + 1) continue;
+    if (t_begin >= row_len(rr)) continue;
     const std::size_t slot =
         (static_cast<std::size_t>(r0 + rr) * Hq + h) * splits + split;
     if (lane == 0) part_ml[slot] = make_float2(m[rr], l[rr]);
@@ -328,7 +352,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const float* cache_v_scale, bool int8, const std::uint8_t* cache_k4,
                const std::uint8_t* cache_v4, bool int4, const int* d_pt, int max_len,
                const int* row_pos, const int* const* row_pt, const int* row_grp,
-               int ngroups) {
+               int ngroups, const int* row_tbase, const int* row_tail) {
   // `stride` addresses the cache arena; the split layout follows the longest
   // logical sequence (== stride for a private, contiguous cache).
   const int ml = max_len > 0 ? max_len : stride;
@@ -338,6 +362,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
       (d_pos == nullptr && row_pos == nullptr && kv_base + rows > ml) ||
       ((row_pos == nullptr) != (row_pt == nullptr)) ||
       (row_grp != nullptr && (row_pos == nullptr || ngroups <= 0 || ngroups > rows)) ||
+      ((row_tbase != nullptr) != (row_tail != nullptr)) ||
+      (row_tbase != nullptr && row_pos == nullptr) ||
       (int8 && int4) ||
       (int8 && (cache_k8 == nullptr || cache_v8 == nullptr ||
                 cache_k_scale == nullptr || cache_v_scale == nullptr)) ||
@@ -358,16 +384,17 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
       attn_split_kernel<true, false, RB><<<grid, kThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
           cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr, d_pt, row_pos, row_pt,
-          grp);
+          grp, row_tbase, row_tail);
     else if (int4)
       attn_split_kernel<false, true, RB><<<grid, kThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
           nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt, row_pos, row_pt,
-          grp);
+          grp, row_tbase, row_tail);
     else
       attn_split_kernel<false, false, RB><<<grid, kThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
-          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, d_pt, row_pos, row_pt, grp);
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, d_pt, row_pos, row_pt, grp,
+          row_tbase, row_tail);
   };
   using One = std::integral_constant<int, 1>;
   using Many = std::integral_constant<int, kRowsPerBlock>;

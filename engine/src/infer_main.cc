@@ -565,12 +565,15 @@ struct Generation {
   bool drafted = false;
 };
 
+int eagle_tree_nodes();  // draft-tree verify rows (below)
 bool check_request(const GpuSession& s, const Args& a, int prefix, std::string* error) {
   const long plen = static_cast<long>(a.tokens.size());
   // The KV watermark ends at the absolute position plen + max_tokens (+
   // draft_k), independent of `prefix` — the prefix saves prefill compute
   // (only [prefix, plen) is forwarded) but not KV capacity, since the cache
   // is indexed by absolute position. Bound on the final watermark.
+  // (Draft trees trim themselves to the rows left, so the bound keeps the
+  // chain's anchor + k: the frontend clamps max_tokens with the same rule.)
   const long need = plen + a.max_tokens + a.draft_k +
                     (a.eagle_k > 0 ? a.eagle_k + 1 : 0);
   if (a.tokens.empty() || a.max_tokens <= 0) {
@@ -826,6 +829,110 @@ double* plain_rate_cache(std::size_t sessions, int context) {
   const int bucket = std::clamp(context / 4096, 0, 8);
   return on ? &v[std::min<std::size_t>(sessions, 7)][bucket] : nullptr;
 }
+// ---- Draft trees (G4_EAGLE_TREE) -----------------------------------------
+// Node 0 is the anchor; node i (1..n) continues node parent[i] with the
+// parent's rank-th best draft (child[p][rank]). Parents precede children, so
+// node indices strictly increase along every path - which is what lets the
+// accepted path's KV move down into place in order (gpu_ctx_kv_move).
+struct DraftTree {
+  int n = 0;
+  int parent[kMaxVerifyRows] = {};
+  int depth[kMaxVerifyRows] = {};
+  int nchild[kMaxVerifyRows] = {};
+  int child[kMaxVerifyRows][kMaxDraftBranch] = {};
+  int max_depth = 0;
+};
+// "0;0.0;1" (rank tuples, parents first, sibling ranks in order).
+bool parse_tree(const std::string& spec, DraftTree* out) {
+  DraftTree t;
+  t.parent[0] = -1;
+  std::vector<std::vector<int>> tup{{}};
+  std::stringstream ss(spec);
+  std::string item;
+  while (std::getline(ss, item, ';')) {
+    if (item.empty()) continue;
+    std::vector<int> v;
+    std::stringstream is(item);
+    std::string x;
+    while (std::getline(is, x, '.')) {
+      if (x.empty() || x.find_first_not_of("0123456789") != std::string::npos) return false;
+      v.push_back(std::atoi(x.c_str()));
+    }
+    if (v.empty() || static_cast<int>(v.size()) > kMaxTreeDepth || t.n + 1 >= kMaxVerifyRows)
+      return false;
+    const std::vector<int> par(v.begin(), v.end() - 1);
+    int p = -1;
+    for (std::size_t i = 0; i < tup.size(); ++i)
+      if (tup[i] == par) p = static_cast<int>(i);
+    if (p < 0 || v.back() != t.nchild[p] || t.nchild[p] >= kMaxDraftBranch) return false;
+    const int id = ++t.n;
+    t.parent[id] = p;
+    t.depth[id] = t.depth[p] + 1;
+    t.child[p][t.nchild[p]++] = id;
+    t.max_depth = std::max(t.max_depth, t.depth[id]);
+    tup.push_back(v);
+  }
+  *out = t;
+  return true;
+}
+// The first `nodes` nodes of t with depth <= max_depth (still a tree: a
+// node is kept only with its parent; siblings keep their rank order).
+DraftTree trim_tree(const DraftTree& t, int nodes, int max_depth) {
+  DraftTree r;
+  r.parent[0] = -1;
+  int map[kMaxVerifyRows];
+  map[0] = 0;
+  for (int i = 1; i <= t.n; ++i) {
+    map[i] = -1;
+    const int p = map[t.parent[i]];
+    if (p < 0 || t.depth[i] > max_depth || r.n >= nodes) continue;
+    const int id = ++r.n;
+    map[i] = id;
+    r.parent[id] = p;
+    r.depth[id] = t.depth[i];
+    r.child[p][r.nchild[p]++] = id;
+    r.max_depth = std::max(r.max_depth, r.depth[id]);
+  }
+  return r;
+}
+// Tree drafting is on by default: G4_EAGLE_TREE=0 restores the chain, a
+// tree spec replaces the batched-round tree, G4_EAGLE_TREE_SOLO the solo
+// one. The defaults start from the best static trees for the r9 head on
+// held-out chat (scripts/eagle/tree_estimate.py) cut to the depth that won
+// end to end with r10 (each level costs a head step): 7 nodes / depth 3 for
+// 2 sessions (8 verify rows each), 13 nodes / depth 4 solo. conc_bench vs
+// the chain, 2 in flight: chat 205 -> 226, novel 192 -> 212, serving
+// 231 -> 246 tok/s; sequential +11/+20/+12%. The verify stays exact greedy.
+const DraftTree* eagle_tree(bool batched) {
+  struct Cfg {
+    bool on = false;
+    DraftTree solo, batch;
+  };
+  static const Cfg cfg = [] {
+    Cfg c;
+    const char* e = std::getenv("G4_EAGLE_TREE");
+    const std::string ev = e != nullptr ? e : "";
+    c.on = ev != "0";
+    const char* es = std::getenv("G4_EAGLE_TREE_SOLO");
+    const std::string bs = (!ev.empty() && ev != "1") ? ev : "0;0.0;0.0.0;1;0.1;2;1.0";
+    const std::string ss = es != nullptr ? es
+                                         : "0;0.0;0.0.0;1;0.0.0.0;0.1;2;1.0;3;0.2;0.0.1;0.1.0;"
+                                           "1.0.0";
+    if (c.on && (!parse_tree(bs, &c.batch) || !parse_tree(ss, &c.solo))) {
+      std::fprintf(stderr, "granite4: bad G4_EAGLE_TREE spec; tree drafting off\n");
+      c.on = false;
+    }
+    return c;
+  }();
+  if (!cfg.on) return nullptr;
+  return batched ? &cfg.batch : &cfg.solo;
+}
+// Verify rows a request may draft past its watermark (reservations).
+int eagle_tree_nodes() {
+  const DraftTree* a = eagle_tree(false);
+  const DraftTree* b = eagle_tree(true);
+  return a != nullptr ? std::max(a->n, b->n) : 0;
+}
 constexpr int kEagleProbeRounds = 4;
 constexpr double kEagleKeepAccept = 2.0;
 constexpr int kEagleBurst = 8;
@@ -857,6 +964,7 @@ class EagleRun {
     // from predicted features) so the next turn resumes from truth.
     if (head_ != nullptr && started_) eagle_truncate(head_, head_valid_);
     cudaFree(d_last_);
+    cudaFree(f_node_);
   }
   EagleRun(const EagleRun&) = delete;
   EagleRun& operator=(const EagleRun&) = delete;
@@ -985,9 +1093,17 @@ class EagleRun {
       }
       ++rounds_seen_;
     }
-    for (int i = 0; i < acc && !done_; ++i) done_ = emit(drafts_[static_cast<std::size_t>(i)]);
+    int emitted = 0;
+    for (int i = 0; i < acc && !done_; ++i, ++emitted)
+      done_ = emit(drafts_[static_cast<std::size_t>(i)]);
     if (!done_) done_ = emit(ids[static_cast<std::size_t>(acc)]);
-    if (done_) return true;
+    if (done_) {
+      // Only the anchor and the emitted drafts have their KV in place; the
+      // watermark must not cover a rejected draft (finish() keeps
+      // [0, min(written, history)) for the next turn's resume).
+      s_.truncate(std::min(s_.written(), L_ + 1 + emitted));
+      return true;
+    }
     // Target KV is valid for the anchor and the accepted drafts; the head's
     // chain entries (built on predicted features) are dropped.
     const int nl = L_ + acc + 1;
@@ -1001,6 +1117,10 @@ class EagleRun {
     L_ = nl;
     step1_done_ = false;
     last_ = nullptr;
+    return decide(probe, error);
+  }
+  // The adaptive policy after a committed round (chain or tree).
+  bool decide(bool probe, std::string* error) {
     if (probe && !decided_ && rounds_seen_ > kEagleProbeRounds) {
       decided_ = true;
       const double avg = static_cast<double>(probe_acc_) / kEagleProbeRounds;
@@ -1068,6 +1188,7 @@ class EagleRun {
 
   // One solo round (head steps, verify, commit); see commit() for the result.
   bool round(std::string* error) {
+    if (const DraftTree* t = eagle_tree(false)) return round_tree(*t, error);
     const int k = plan_k();
     std::int32_t* const d_tok = s_.d_tokens();
     Ev h0{}, v0{};
@@ -1099,6 +1220,200 @@ class EagleRun {
       return true;
     if (et_) cudaEventRecord(v0.b, cudaStreamPerThread), v_ev_.push_back(v0);
     return commit(ids, true, error);
+  }
+
+  // ---- tree rounds (G4_EAGLE_TREE) ---------------------------------------
+  // This round's tree: src trimmed to max_nodes, the rows left and the
+  // tokens left. Returns its node count (0 = verify the anchor alone).
+  int plan_tree(const DraftTree& src, int max_nodes) {
+    const int remaining = a_.max_tokens - static_cast<int>(gen_.size());
+    const int room = std::min(s_.mapped(), s_.max_pos() - 1) - L_ - 1;
+    tr_ = trim_tree(src, std::max(0, std::min(max_nodes, room)), std::max(0, remaining - 1));
+    k_ = tr_.n;
+    r_t0_ = std::chrono::steady_clock::now();
+    return tr_.n;
+  }
+  const DraftTree& tree() const { return tr_; }
+  EagleRowsReq step1_req_tree() {
+    EagleRowsReq q = step1_req();
+    q.d_draft_out = nullptr;  // the root's drafts come from eagle_draft_topk
+    return q;
+  }
+  bool ensure_tree_buffers(std::string* error) {
+    if (f_node_ != nullptr) return true;
+    if (cudaMalloc(&f_node_, sizeof(std::uint16_t) * kMaxVerifyRows * s_.hidden()) !=
+        cudaSuccess) {
+      *error = "eagle: cudaMalloc failed";
+      return false;
+    }
+    return true;
+  }
+  // Head feature that drafts node x's children (x = 0: the last catch-up row).
+  const std::uint16_t* node_feature(int x) const {
+    if (x == 0) return last_ != nullptr ? last_ : d_last_;
+    return f_node_ + static_cast<std::size_t>(x) * s_.hidden();
+  }
+  // Head level j: rows for the expanding nodes at depth j (j >= 1; head row
+  // of node x at entry L + j - 1, KV slot L + x - 1, token at slot + 1 =
+  // node x's token), then the drafts of their children (into the children's
+  // token slots L + child). Level 0 only drafts the root's children. Run the
+  // rows before the drafts.
+  void tree_level(int j, int head_index, std::vector<EagleTreeRow>* rows,
+                  std::vector<EagleDraftReq>* drafts) {
+    std::int32_t* const d_tok = s_.d_tokens();
+    for (int x = 0; x <= tr_.n; ++x) {
+      if (tr_.depth[x] != j || tr_.nchild[x] == 0) continue;
+      if (j >= 1) {
+        EagleTreeRow r{};
+        r.head = head_index;
+        r.d_tokens = d_tok;
+        r.pos = L_ + j - 1;
+        r.slot = L_ + x - 1;
+        r.depth = j;
+        for (int q = j - 1, a = x; q >= 0; --q, a = tr_.parent[a]) r.tail[q] = L_ + a - 1;
+        r.d_feat = node_feature(tr_.parent[x]);
+        r.d_feat_out = f_node_ + static_cast<std::size_t>(x) * s_.hidden();
+        rows->push_back(r);
+      }
+      EagleDraftReq d{};
+      d.d_feat = node_feature(x);
+      d.d_tokens = d_tok;
+      d.k = tr_.nchild[x];
+      for (int b = 0; b < tr_.nchild[x]; ++b) d.slot[b] = L_ + tr_.child[x][b];
+      drafts->push_back(d);
+    }
+  }
+  // Target verify rows: the anchor (position L) and node x at position
+  // L + depth, KV slot L + x, attending to its ancestors' slots.
+  void tree_verify_rows(std::vector<GpuTreeRow>* rows) {
+    GpuTreeRow a{};
+    a.ctx = s_.ctx();
+    a.tokens = s_.d_tokens();
+    a.pos = a.slot = L_;
+    rows->push_back(a);
+    for (int x = 1; x <= tr_.n; ++x) {
+      GpuTreeRow r{};
+      r.ctx = s_.ctx();
+      r.tokens = s_.d_tokens();
+      r.depth = tr_.depth[x];
+      r.pos = L_ + r.depth;
+      r.slot = L_ + x;
+      for (int q = r.depth - 1, b = x; q >= 0; --q, b = tr_.parent[b]) r.tail[q] = L_ + b;
+      rows->push_back(r);
+    }
+  }
+  // After the tree verify: ids[0..n] are the target's greedy ids after the
+  // anchor / each node, d_hidden ([n + 1][H], row order) their hidden
+  // states. Accepts the longest path the target agrees with, moves its KV
+  // into place, then commits like the chain.
+  bool commit_tree(const std::vector<std::int32_t>& ids, const std::uint16_t* d_hidden,
+                   bool probe, std::string* error) {
+    const int n = tr_.n;
+    if (n > 0 && !s_.tokens(L_ + 1, L_ + 1 + n, &drafts_, error)) return true;
+    int path[kMaxTreeDepth + 1] = {0};
+    int acc = 0;
+    for (int cur = 0;;) {
+      const std::int32_t t = ids[static_cast<std::size_t>(cur)];
+      int next = -1;
+      for (int b = 0; b < tr_.nchild[cur] && next < 0; ++b)
+        if (drafts_[static_cast<std::size_t>(tr_.child[cur][b] - 1)] == t) next = tr_.child[cur][b];
+      if (next < 0) break;
+      path[++acc] = cur = next;
+    }
+    // KV of the path's nodes from their slots to positions L + 1 .. L + acc;
+    // the watermark then covers exactly the anchor and the accepted nodes.
+    int src[kMaxTreeDepth], dst[kMaxTreeDepth], m = 0;
+    for (int j = 1; j <= acc; ++j)
+      if (path[j] != j) src[m] = L_ + path[j], dst[m] = L_ + j, ++m;
+    const int nl = L_ + acc + 1;
+    if (gpu_ctx_kv_move(s_.ctx(), src, dst, m) != 0 || !s_.truncate(nl)) {
+      *error = "eagle: tree KV commit failed";
+      return true;
+    }
+    // Features of the committed rows (anchor + path) for the next catch-up.
+    const std::size_t H = static_cast<std::size_t>(s_.hidden());
+    bool ok = d_hidden == f_verify_ ||
+              cudaMemcpyAsync(f_verify_, d_hidden, H * 2, cudaMemcpyDeviceToDevice,
+                              cudaStreamPerThread) == cudaSuccess;
+    for (int j = 1; ok && j <= acc; ++j)  // in place is safe: path[j] >= j, increasing
+      ok = cudaMemcpyAsync(f_verify_ + j * H, d_hidden + static_cast<std::size_t>(path[j]) * H,
+                           H * 2, cudaMemcpyDeviceToDevice, cudaStreamPerThread) == cudaSuccess;
+    if (!ok) {
+      *error = "eagle: tree feature gather failed";
+      return true;
+    }
+    report_.proposed += n;
+    report_.accepted += acc;
+    ++report_.steps;
+    if (et_) {
+      et_rounds_++;
+      et_acc_ += acc;
+      et_prop_ += n;
+    }
+    recent_acc_ += acc;
+    ++recent_rounds_;
+    if (!decided_ && n > 0 && probe) {
+      if (rounds_seen_ > 0) {
+        probe_acc_ += acc;
+        probe_tok_ += acc + 1;
+        probe_ms_ += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - r_t0_).count();
+      }
+      ++rounds_seen_;
+    }
+    int emitted = 0;
+    for (int j = 1; j <= acc && !done_; ++j, ++emitted)
+      done_ = emit(drafts_[static_cast<std::size_t>(path[j] - 1)]);
+    if (!done_) done_ = emit(ids[static_cast<std::size_t>(path[acc])]);
+    if (done_) {
+      // KV holds the anchor and the emitted path tokens (as the chain).
+      s_.truncate(std::min(s_.written(), L_ + 1 + emitted));
+      return true;
+    }
+    if (!s_.upload(seq_, L_ + 1, nl + 1, error)) return true;
+    eagle_truncate(head_, L_);
+    head_valid_ = std::min(head_valid_, L_);
+    hq_ = L_;
+    L_ = nl;
+    step1_done_ = false;
+    last_ = nullptr;
+    return decide(probe, error);
+  }
+  // One solo tree round (head levels, verify, commit); see commit().
+  bool round_tree(const DraftTree& src, std::string* error) {
+    const int n = plan_tree(src, std::min(kMaxVerifyRows, s_.logit_rows()) - 1);
+    bool ok = ensure_tree_buffers(error);
+    if (ok && n > 0) {
+      if (needs_step1()) {
+        const EagleRowsReq q = step1_req_tree();
+        ok = eagle_forward(head_, q.d_tokens, q.pos0, q.rows, q.d_feat, q.d_feat_out, nullptr) == 0;
+        step1_finished();
+      }
+      for (int j = 0; ok && j < tr_.max_depth; ++j) {
+        std::vector<EagleTreeRow> rows;
+        std::vector<EagleDraftReq> drafts;
+        tree_level(j, 0, &rows, &drafts);
+        if (!rows.empty())
+          ok = eagle_forward_tree(&head_, static_cast<int>(rows.size()), rows.data()) == 0;
+        if (ok && !drafts.empty())
+          ok = eagle_draft_topk(head_, static_cast<int>(drafts.size()), drafts.data()) == 0;
+      }
+    }
+    if (!ok) {
+      if (error->empty()) *error = "eagle: tree head failed";
+      return true;
+    }
+    std::vector<GpuTreeRow> vr;
+    tree_verify_rows(&vr);
+    char cerr[256] = "";
+    std::vector<std::int32_t> ids;
+    if (gpu_forward_tree(vr.data(), static_cast<int>(vr.size()), s_.logits_buffer(),
+                         s_.argmax_buffer(), f_verify_, cerr, sizeof cerr) != 0) {
+      *error = std::string("eagle tree verify: ") + cerr;
+      return true;
+    }
+    if (!s_.argmax(n + 1, &ids, error)) return true;
+    return commit_tree(ids, f_verify_, true, error);
   }
 
   // Leave drafting at a round boundary (another session needs the batch);
@@ -1153,6 +1468,8 @@ class EagleRun {
   std::vector<std::int32_t> seq_, drafts_;
   std::uint16_t *f_verify_ = nullptr, *f_chain_ = nullptr;
   std::uint16_t* d_last_ = nullptr;      // start()'s last catch-up feature (own copy)
+  std::uint16_t* f_node_ = nullptr;      // tree rounds: head feature per node
+  DraftTree tr_;                         // this round's tree
   const std::uint16_t* last_ = nullptr;  // step-2 input after an in-round step 1
   int L_ = 0, hq_ = 0, head_valid_ = 0, k_ = 0;
   bool started_ = false, done_ = false, plain_ = false, decided_ = false, et_ = false;
@@ -1227,8 +1544,8 @@ int gpu_generate_cmd(const Args& a) {
   GpuSession s;
   Generation g;
   const int max_pos = static_cast<int>(a.tokens.size()) + a.max_tokens + a.draft_k +
-                      (a.eagle_k > 0 ? a.eagle_k + 1 : 0);
-  const int rows = std::max(a.draft_k, a.eagle_k) + 1;
+                      (a.eagle_k > 0 ? std::max(a.eagle_k, eagle_tree_nodes()) + 1 : 0);
+  const int rows = std::max({a.draft_k, a.eagle_k, a.eagle_k > 0 ? eagle_tree_nodes() : 0}) + 1;
   EagleHead* head = nullptr;
   if (!s.open(a.dir, max_pos, rows, &err) || !open_eagle(s, a.eagle, &head, &err))
     return fail(err);
@@ -1791,7 +2108,7 @@ int gpu_serve_cmd(const Args& cli) {
     // Pool pages for everything this job can write (+ one decode chunk of
     // overshoot past the stop).
     const long need = static_cast<long>(a.tokens.size()) + a.max_tokens + a.draft_k +
-                      (a.eagle_k > 0 ? a.eagle_k + 1 : 0) + 8;
+                      (a.eagle_k > 0 ? std::max(a.eagle_k, eagle_tree_nodes()) + 1 : 0) + 8;
     if (!prepare(j->sess, std::min<long>(need, cli.max_context), &j->err)) {
       send_error(j->has_id, j->id, j->err);
       return true;
@@ -1877,6 +2194,99 @@ int gpu_serve_cmd(const Args& cli) {
     }
     std::size_t gen_before = 0;
     for (Job* j : ej) gen_before += j->g.ids.size();
+    GpuSession& lead = sessions[ej[0]->sess];
+    std::vector<std::int32_t> ids;
+    char cerr[256] = "";
+    Clock::time_point tv{}, tc{};
+    if (const DraftTree* tsrc = eagle_tree(true)) {
+      // Tree round: every session drafts its tree (trimmed to its share of
+      // the verify rows), the head levels run batched across sessions, one
+      // tree verify, then each session commits its accepted path.
+      const int per = kMaxVerifyRows / static_cast<int>(ej.size()) - 1;
+      int maxd = 0;
+      std::vector<EagleHead*> hs;
+      for (Job* j : ej) {
+        j->eagle->plan_tree(*tsrc, per);
+        maxd = std::max(maxd, j->eagle->tree().max_depth);
+        hs.push_back(heads[j->sess]);
+        std::string be;
+        if (!j->eagle->ensure_tree_buffers(&be)) {
+          for (Job* q : ej) fail_job(*q, be);
+          return;
+        }
+      }
+      bool tok = true;
+      {
+        std::vector<EagleHead*> sh;
+        std::vector<EagleRowsReq> sq;
+        std::vector<Job*> sj;
+        for (Job* j : ej)
+          if (j->eagle->needs_step1()) {
+            sh.push_back(heads[j->sess]);
+            sq.push_back(j->eagle->step1_req_tree());
+            sj.push_back(j);
+          }
+        if (!sq.empty() &&
+            eagle_forward_multi(sh.data(), static_cast<int>(sh.size()), sq.data()) != 0)
+          for (std::size_t i = 0; tok && i < sq.size(); ++i)
+            tok = eagle_forward(sh[i], sq[i].d_tokens, sq[i].pos0, sq[i].rows, sq[i].d_feat,
+                                sq[i].d_feat_out, nullptr) == 0;
+        for (Job* j : sj) j->eagle->step1_finished();
+      }
+      for (int lv = 0; tok && lv < maxd; ++lv) {
+        std::vector<EagleTreeRow> rows;
+        std::vector<EagleDraftReq> drafts;
+        for (std::size_t i = 0; i < ej.size(); ++i)
+          ej[i]->eagle->tree_level(lv, static_cast<int>(i), &rows, &drafts);
+        if (!rows.empty())
+          tok = eagle_forward_tree(hs.data(), static_cast<int>(rows.size()), rows.data()) == 0;
+        if (tok && !drafts.empty())
+          tok = eagle_draft_topk(hs[0], static_cast<int>(drafts.size()), drafts.data()) == 0;
+      }
+      if (!tok) {
+        for (Job* j : ej) fail_job(*j, "eagle: tree head failed");
+        return;
+      }
+      if (bt.on) {
+        cudaStreamSynchronize(cudaStreamPerThread);
+        bt.head += ms_since(t0);
+        tv = Clock::now();
+      }
+      std::vector<GpuTreeRow> vr;
+      std::vector<int> voff;
+      for (Job* j : ej) {
+        voff.push_back(static_cast<int>(vr.size()));
+        j->eagle->tree_verify_rows(&vr);
+      }
+      const int nrows = static_cast<int>(vr.size());
+      if (nrows > kMaxVerifyRows ||
+          gpu_forward_tree(vr.data(), nrows, lead.logits_buffer(), lead.argmax_buffer(),
+                           d_multi_hidden, cerr, sizeof cerr) != 0 ||
+          !lead.argmax(nrows, &ids, &err)) {
+        for (Job* j : ej) fail_job(*j, std::string("eagle tree verify: ") + cerr);
+        return;
+      }
+      if (bt.on) {
+        bt.verify += ms_since(tv);
+        bt.rows += nrows;
+        tc = Clock::now();
+      }
+      const std::size_t Ht = static_cast<std::size_t>(cfg.hidden_size);
+      for (std::size_t i = 0; i < ej.size(); ++i) {
+        Job& j = *ej[i];
+        const int n = j.eagle->tree().n + 1;
+        const std::vector<std::int32_t> mine(ids.begin() + voff[i], ids.begin() + voff[i] + n);
+        if (j.eagle->commit_tree(mine, d_multi_hidden + static_cast<std::size_t>(voff[i]) * Ht,
+                                 false, &j.err)) {
+          if (!j.err.empty() || j.eagle->done()) {
+            j.eagle->report_timing();
+            finish(j);
+          } else {
+            j.plain = true;
+          }
+        }
+      }
+    } else {
     int kmax = 0;
     std::vector<int> ks;
     for (Job* j : ej) {
@@ -1916,7 +2326,6 @@ int gpu_serve_cmd(const Args& cli) {
       for (Job* j : ej) fail_job(*j, "eagle: head forward failed");
       return;
     }
-    Clock::time_point tv{};
     if (bt.on) {
       cudaStreamSynchronize(cudaStreamPerThread);
       bt.head += ms_since(t0);
@@ -1933,9 +2342,6 @@ int gpu_serve_cmd(const Args& cli) {
         rp.push_back(ej[i]->eagle->verify_from() + r);
       }
     const int nrows = static_cast<int>(rc.size());
-    GpuSession& lead = sessions[ej[0]->sess];
-    std::vector<std::int32_t> ids;
-    char cerr[256] = "";
     if (nrows > kMaxVerifyRows ||
         gpu_forward_multi(rc.data(), rt.data(), rp.data(), nrows, lead.logits_buffer(),
                           lead.argmax_buffer(), d_multi_hidden, cerr, sizeof cerr) != 0 ||
@@ -1943,7 +2349,6 @@ int gpu_serve_cmd(const Args& cli) {
       for (Job* j : ej) fail_job(*j, std::string("eagle batched verify: ") + cerr);
       return;
     }
-    Clock::time_point tc{};
     if (bt.on) {
       bt.verify += ms_since(tv);
       bt.rows += nrows;
@@ -1968,6 +2373,7 @@ int gpu_serve_cmd(const Args& cli) {
         }
       }
     }
+    }  // chain round
     // Policy (per batch): time rounds 2..5, then one timed plain burst.
     std::size_t gen_after = 0;
     for (Job* j : ej) gen_after += j->g.ids.size();

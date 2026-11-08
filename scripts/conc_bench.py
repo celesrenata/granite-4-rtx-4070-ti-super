@@ -67,6 +67,7 @@ def main():
     ap.add_argument("--env", nargs="*", default=[], help="extra engine env KEY=VAL")
     ap.add_argument("--families", default="chat,novel,serving")
     ap.add_argument("--engine-log", default="", help="append engine stderr here (default: discard)")
+    ap.add_argument("--save-outputs", default="", help="write {family: [token ids per prompt]} (sequential pass) as JSON")
     a = ap.parse_args()
     tok = tokenizer.ByteBPE(Path(a.ckpt) / "tokenizer.json")
     chat = [c["turns"][0] for c in json.load(open(a.prompts))[-12:]]
@@ -90,6 +91,7 @@ def main():
                             stderr=(open(a.engine_log, "a") if a.engine_log else subprocess.DEVNULL), text=True, bufsize=1, env=env)
     proc.stdout.readline()
     rid = 0
+    saved = {}
     for fam, ps in fams.items():
         reqs = []
         for q in ps:
@@ -108,6 +110,7 @@ def main():
         acc_con = run.accept
         n = sum(len(v) for v in seq.values())
         same = all(seq[r["id"] - 10000] == con[r["id"]] for r in reqs)
+        saved[fam] = [seq[r["id"] - 10000] for r in reqs]
         print(f"{fam:6s} {len(reqs)} prompts {n} tok: sequential {n / ws:6.1f} tok/s, "
               f"{a.inflight} in flight {n / wc:6.1f} tok/s ({ws / wc:.2f}x), "
               f"outputs identical: {same}"
@@ -115,6 +118,8 @@ def main():
               flush=True)
     proc.stdin.close()
     proc.wait()
+    if a.save_outputs:
+        json.dump(saved, open(a.save_outputs, "w"))
 
 
 if __name__ == "__main__":

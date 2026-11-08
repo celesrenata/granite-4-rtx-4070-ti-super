@@ -144,6 +144,8 @@ void gpu_weights_free(GpuCtx* ctx);
 // Device descriptor of a multi-session batch: row r is position pos[r] of the
 // session whose position -> arena-row table is pt[r] and whose token buffer is
 // tok[r] (device pointers).
+// Deepest draft-tree node (remapped positions per row).
+constexpr int kMaxTreeDepth = 8;
 struct GpuMultiRows {
   int n;
   int pos[kMaxVerifyRows];
@@ -152,6 +154,17 @@ struct GpuMultiRows {
   // Attention row groups (gpu_forward_multi): runs of one session's
   // consecutive rows, r0 | count << 8 (see attn_split row_grp).
   int grp[kMaxVerifyRows];
+  // Tree rows (tree != 0; zero-initialized descriptors keep the plain
+  // meaning): row r reads its token at tok[r][slot[r]] (the head: slot + 1)
+  // and writes its KV at logical position slot[r], while pos[r] stays its
+  // RoPE position / causal length - 1. Attention maps logical positions p in
+  // (tbase[r], pos[r]] to tail[r][p - tbase[r] - 1] (logical slots of the
+  // row's ancestors, then itself), so a draft-tree node attends to exactly
+  // the keys the sequential decode of its path would see.
+  int tree;
+  int slot[kMaxVerifyRows];
+  int tbase[kMaxVerifyRows];
+  int tail[kMaxVerifyRows][kMaxTreeDepth];
 };
 // One forward over rows of several sessions sharing weights + one KV arena:
 // row r is position row_pos[r] of session row_ctx[r] (token from
@@ -165,6 +178,28 @@ int gpu_forward_multi(GpuCtx* const* row_ctx, std::int32_t* const* row_tokens,
                       const int* row_pos, int n, std::uint16_t* d_logits,
                       std::int32_t* d_argmax, std::uint16_t* d_hidden, char* error,
                       std::size_t error_size);
+// Draft-tree verify: like gpu_forward_multi, but row r is an explicit
+// (session, RoPE position, KV slot, ancestor slots) row. A session's rows
+// write KV at distinct slots >= its watermark (within its mapped rows); a row
+// with depth D > 0 attends to positions [0, pos - D] of the session plus the
+// D slots in tail[] (its ancestors in depth order, then its own slot), which
+// is bit-identical to decoding that path sequentially. Afterwards each
+// session's watermark is its highest written slot + 1; commit an accepted
+// path with gpu_ctx_kv_move + gpu_ctx_truncate. n <= kMaxVerifyRows.
+struct GpuTreeRow {
+  GpuCtx* ctx;
+  std::int32_t* tokens;  // device; the row's token is tokens[slot]
+  int pos, slot, depth;
+  int tail[kMaxTreeDepth];  // logical slots of positions pos - depth + 1 .. pos
+};
+int gpu_forward_tree(const GpuTreeRow* rows, int n, std::uint16_t* d_logits,
+                     std::int32_t* d_argmax, std::uint16_t* d_hidden, char* error,
+                     std::size_t error_size);
+// Copy the KV (every layer; codes + scales for KV8 / KV4) of logical
+// positions src[i] to dst[i], i < n (n <= kMaxTreeDepth), in order. Used to
+// move an accepted draft-tree path into place; dst[i] <= src[i] and every dst
+// below every later src keeps the in-order copy safe.
+int gpu_ctx_kv_move(GpuCtx* ctx, const int* src, const int* dst, int n);
 // The multi-row RoPE / KV append kernels over a device descriptor (the EAGLE
 // head's batched steps use them on its own KV pool). bits: 16 / 8 / 4.
 int gpu_multi_rope(const std::uint16_t* x, const float* cos_tbl, const float* sin_tbl,

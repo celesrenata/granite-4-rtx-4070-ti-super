@@ -172,7 +172,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
                const int* d_pt = nullptr, int max_len = 0,
                const int* row_pos = nullptr, const int* const* row_pt = nullptr,
-               const int* row_grp = nullptr, int ngroups = 0);
+               const int* row_grp = nullptr, int ngroups = 0,
+               const int* row_tbase = nullptr, const int* row_tail = nullptr);
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                       int base_pos, int rows, int stride, std::uint16_t* out,
@@ -3127,6 +3128,188 @@ static void test_decode_multi_device() {
   }
   unsetenv("G4_KV8");
 }
+// Draft-tree verify: gpu_forward_tree over an anchor + 5 nodes (depths
+// 1,1,2,2,3) of a paged session == decoding each node's path one position at
+// a time on a private cache (logits, bit for bit); after gpu_ctx_kv_move of
+// the accepted path 1 -> 3 -> 5 and a truncate, the next decoded position
+// matches the sequential reference too.
+static void test_tree_verify_device() {
+  ModelConfig model;
+  model.num_layers = 2;
+  model.hidden_size = 512;
+  model.intermediate_size = 256;
+  model.num_attention_heads = 4;
+  model.num_key_value_heads = 1;
+  model.head_dim = 128;
+  model.vocab_size = 512;
+  model.max_context_length = 131072;
+  ForwardSpec spec;
+  const int L = 2, H = 512, I = 256, Hq = 4, Hk = 1, d = 128, V = 512;
+  const auto z = [](int v) { return static_cast<std::size_t>(v); };
+  const GpuWeightsLayout lay{z(H), z(I), z(V), z(L), z(Hq), z(Hk), z(d)};
+  Xorshift64 rng(0x7ee5);
+  std::vector<std::uint8_t> weights(lay.total_bytes());
+  auto fill_bf16 = [&](std::size_t off, std::size_t elems) {
+    for (std::size_t i = 0; i < elems; ++i) {
+      const std::uint16_t v = gen_bf16(rng);
+      weights[off + 2 * i] = static_cast<std::uint8_t>(v & 0xffu);
+      weights[off + 2 * i + 1] = static_cast<std::uint8_t>(v >> 8);
+    }
+  };
+  auto fill_fp8 = [&](std::size_t off, std::size_t elems) {
+    for (std::size_t i = 0; i < elems; ++i)
+      weights[off + i] = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  };
+  fill_bf16(0, z(V) * H);
+  for (int layer = 0; layer < L; ++layer) {
+    const std::size_t base = lay.embed_bytes() + z(layer) * lay.layer_bytes();
+    fill_bf16(base + lay.off_attn_norm(), H);
+    fill_bf16(base + lay.off_ffn_norm(), H);
+    fill_fp8(base + lay.off_q(), z(H) * H);
+    fill_fp8(base + lay.off_k(), z(Hk) * d * H);
+    fill_fp8(base + lay.off_v(), z(Hk) * d * H);
+    fill_fp8(base + lay.off_o(), z(H) * H);
+    fill_fp8(base + lay.off_gate(), z(I) * H);
+    fill_fp8(base + lay.off_up(), z(I) * H);
+    fill_fp8(base + lay.off_down(), z(H) * I);
+  }
+  fill_bf16(lay.final_norm_off(), H);
+  fill_fp8(lay.lm_head_off(), z(V) * H);
+  std::vector<float> scales(lay.num_scales());
+  for (auto& sc : scales) sc = 0.1f + 0.9f * rng.next_float_range(1.0);
+  const int N = 5;
+  const int parent[N + 1] = {-1, 0, 0, 1, 1, 3};
+  const int depth[N + 1] = {0, 1, 1, 2, 2, 3};
+  std::vector<std::int32_t> node_tok(z(N + 1));
+  for (int n = 1; n <= N; ++n) node_tok[z(n)] = (n * 131 + 29) % V;
+  // (max_pos, prompt P; the anchor sits at P): one tile; tails crossing a
+  // tile (= split, 1 tile per split) boundary; the production split width
+  // (max_pos > 16K: 2 tiles per split) with tails crossing a tile inside a
+  // split, and a split boundary.
+  const int kCases[4][2] = {{64, 17}, {512, 62}, {20000, 12861}, {20000, 12924}};
+  for (const auto& cs : kCases) {
+  const int max_pos = cs[0], P = cs[1], arena_rows = 2 * max_pos + 8;
+  std::vector<std::int32_t> prompt(z(P));
+  for (int i = 0; i < P; ++i) prompt[z(i)] = (i * 53 + 11) % V;
+  char err[256];
+  const char* const modes[] = {"0", "1", "4"};
+  const char* const names[] = {"bf16", "KV8", "KV4"};
+  for (int m = 0; m < 3; ++m) {
+    setenv("G4_KV8", modes[m], 1);
+    const std::string tag = std::string("tree verify [") + names[m] + " P=" +
+                            std::to_string(P) + "]: ";
+    std::int32_t *dtok = nullptr, *dref = nullptr, *dids = nullptr;
+    std::uint16_t *lg = nullptr, *lg1 = nullptr;
+    if (cudaMalloc(&dtok, z(max_pos) * 4) || cudaMalloc(&dref, z(max_pos) * 4) ||
+        cudaMalloc(&dids, z(kMaxVerifyRows) * 4) ||
+        cudaMalloc(&lg, z(kMaxVerifyRows) * V * 2) || cudaMalloc(&lg1, z(V) * 2)) {
+      ++g_failures;
+      continue;
+    }
+    std::vector<std::int32_t> t(z(max_pos), 0);
+    std::copy(prompt.begin(), prompt.end(), t.begin());
+    CUDA_CHECK(cudaMemcpy(dtok, t.data(), z(max_pos) * 4, cudaMemcpyHostToDevice));
+    // Paged session: prefill the prompt (its argmax is the anchor at P).
+    GpuKvArena* arena = gpu_kv_arena_create(model, arena_rows, err, sizeof err);
+    GpuWeights* w = gpu_weights_create();
+    bool ok = arena != nullptr && w != nullptr &&
+              gpu_weights_load(w, weights.data(), weights.size(), scales.data(), scales.size(),
+                               err, sizeof err) == 0;
+    GpuCtx* c = ok ? gpu_ctx_create_paged(model, spec, max_pos, arena) : nullptr;
+    std::vector<int> rows(z(max_pos));
+    for (int i = 0; i < max_pos; ++i) rows[z(i)] = 2 * (max_pos - 1 - i) + 1;
+    ok = c != nullptr && gpu_ctx_use_weights(c, w) == 0 &&
+         gpu_ctx_set_kv_rows_n(c, rows.data(), max_pos) == 0;
+    GpuForwardOut out;
+    out.d_logits = lg1;
+    out.logits_from = P - 1;
+    out.d_argmax = dtok + P;
+    ok = ok && gpu_forward(c, dtok, P, out, err, sizeof err) == 0;
+    std::int32_t anchor = 0;
+    if (ok) CUDA_CHECK(cudaMemcpy(&anchor, dtok + P, 4, cudaMemcpyDeviceToHost));
+    // Node tokens at their slots P + n.
+    if (ok)
+      CUDA_CHECK(cudaMemcpy(dtok + P + 1, node_tok.data() + 1, z(N) * 4, cudaMemcpyHostToDevice));
+    GpuTreeRow tr[N + 1];
+    for (int n = 0; n <= N; ++n) {
+      tr[n] = GpuTreeRow{};
+      tr[n].ctx = c;
+      tr[n].tokens = dtok;
+      tr[n].pos = P + depth[n];
+      tr[n].slot = P + n;
+      tr[n].depth = depth[n];
+      std::vector<int> anc;
+      for (int a = n; a > 0; a = parent[a]) anc.push_back(a);
+      for (int j = 0; j < depth[n]; ++j) tr[n].tail[j] = P + anc[anc.size() - 1 - z(j)];
+    }
+    ok = ok && gpu_forward_tree(tr, N + 1, lg, dids, nullptr, err, sizeof err) == 0;
+    expect(ok, (tag + "gpu_forward_tree").c_str());
+    // Reference: a private cache decoding each node's path position by position.
+    auto ref_path = [&](const std::vector<std::int32_t>& path, std::vector<std::uint16_t>* lo) {
+      GpuCtx* r = gpu_ctx_create(model, spec, max_pos);
+      bool good = r != nullptr && gpu_weights_load(r, weights.data(), weights.size(),
+                                                   scales.data(), scales.size(), err,
+                                                   sizeof err) == 0;
+      std::vector<std::int32_t> seq(prompt);
+      seq.insert(seq.end(), path.begin(), path.end());
+      seq.resize(z(max_pos), 0);
+      CUDA_CHECK(cudaMemcpy(dref, seq.data(), z(max_pos) * 4, cudaMemcpyHostToDevice));
+      GpuForwardOut o;
+      o.d_logits = lg1;
+      o.logits_from = P - 1;
+      good = good && gpu_forward(r, dref, P, o, err, sizeof err) == 0;
+      for (std::size_t i = 0; good && i < path.size(); ++i) {
+        GpuForwardOut o1;
+        o1.d_logits = lg1;
+        o1.logits_from = P + static_cast<int>(i);
+        good = gpu_forward(r, dref, P + static_cast<int>(i) + 1, o1, err, sizeof err) == 0;
+      }
+      lo->resize(z(V));
+      if (good) CUDA_CHECK(cudaMemcpy(lo->data(), lg1, z(V) * 2, cudaMemcpyDeviceToHost));
+      gpu_ctx_free(r);
+      return good;
+    };
+    bool same = ok;
+    for (int n = 0; ok && n <= N; ++n) {
+      std::vector<std::int32_t> path{anchor};
+      std::vector<int> anc;
+      for (int a = n; a > 0; a = parent[a]) anc.push_back(a);
+      for (auto it = anc.rbegin(); it != anc.rend(); ++it) path.push_back(node_tok[z(*it)]);
+      std::vector<std::uint16_t> want, got(z(V));
+      const bool good = ref_path(path, &want);
+      CUDA_CHECK(cudaMemcpy(got.data(), lg + z(n) * V, z(V) * 2, cudaMemcpyDeviceToHost));
+      same = same && good && want == got;
+    }
+    expect(same, (tag + "every tree row bit-identical to decoding its path").c_str());
+    // Accept 1 -> 3 -> 5: move slots P+3 -> P+2, P+5 -> P+3, truncate, decode one more.
+    const int src[2] = {P + 3, P + 5}, dst[2] = {P + 2, P + 3};
+    ok = ok && gpu_ctx_kv_move(c, src, dst, 2) == 0 && gpu_ctx_truncate(c, P + 4) == 0;
+    const std::int32_t acc_tok[3] = {node_tok[1], node_tok[3], node_tok[5]};
+    const std::int32_t next = 77;
+    if (ok) {
+      CUDA_CHECK(cudaMemcpy(dtok + P + 1, acc_tok, 3 * 4, cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(dtok + P + 4, &next, 4, cudaMemcpyHostToDevice));
+    }
+    GpuForwardOut o2;
+    o2.d_logits = lg1;
+    o2.logits_from = P + 4;
+    ok = ok && gpu_forward(c, dtok, P + 5, o2, err, sizeof err) == 0;
+    std::vector<std::uint16_t> got2(z(V)), want2;
+    if (ok) CUDA_CHECK(cudaMemcpy(got2.data(), lg1, z(V) * 2, cudaMemcpyDeviceToHost));
+    const bool good2 = ok && ref_path({anchor, acc_tok[0], acc_tok[1], acc_tok[2], next}, &want2);
+    expect(good2 && got2 == want2,
+           (tag + "accepted path moved into place: next position == sequential decode").c_str());
+    if (same && good2 && got2 == want2)
+      std::printf("  tree verify [%s P=%d]: 6 rows == path decodes; KV move + continue exact\n",
+                  names[m], P);
+    gpu_ctx_free(c);
+    gpu_kv_arena_free(arena);
+    gpu_weights_free_obj(w);
+    cudaFree(dtok); cudaFree(dref); cudaFree(dids); cudaFree(lg); cudaFree(lg1);
+  }
+  }  // cases
+  unsetenv("G4_KV8");
+}
 int main() {
   int n = 0;
   if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -3169,6 +3352,7 @@ int main() {
   test_shared_arena_sessions_device();
   test_attn_split_rows_bit_identical_device();
   test_decode_multi_device();
+  test_tree_verify_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();
