@@ -960,6 +960,28 @@ on the drafting, so near-ties on resumed turns can differ between chain and
 tree (or with the policy on/off) - fresh turns cannot. Keeping the last
 round's verify features per session would let resume skip that re-forward.
 
+**Verify cost after trees** (`G4_MULTI_PROFILE=1` times the multi step's
+phases; the skinny bench now evicts L2 with reads - its memset flush left
+dirty lines whose write-back was billed to the GEMMs). A 15-row tree verify
+at chat length: GEMMs 14.1 ms (~590 GB/s, the weight pass), attention 2.06,
+lm_head 0.70, norms 0.48, RoPE 0.26 ms. Attention was not bandwidth bound
+(~100 MB of KV): every call launched all 256 splits of the 32K layout and
+the blocks past the rows' ends only exited. `attn_split` now takes a bound on
+the rows' causal lengths (`kv_hint`) and launches only the reachable splits
+(split width and slots unchanged, so bit-identical); verify and head calls
+pass the host-known bound, the decode graphs a 2K bucket (re-captured when it
+changes). Verify steps also replay CUDA graphs per (rows, groups, tree, 1K
+bucket, buffers) (`G4_VERIFY_GRAPH=0`), and row groups run a rows-parallel
+kernel (one warp per row x head, tree tails in a per-row buffer;
+`G4_ATTN_ROWS=0`). Attention 2.06 -> 1.24 ms, verify 16.91 -> 15.75 ms.
+
+| After trees, 2 in flight (r10) | tree | + tail refill, graphs, launch bound |
+|---|---:|---:|
+| chat | 225.9 | 240.5 |
+| novel | 212.1 | 228.7 |
+| serving | 246.4 | 265.2 |
+| live API, 1 / 2 clients | 114.0 / 210.5 | 121.9 / 225.5 |
+
 Rejected here: an EAGLE-3-style multi-layer head (`dump-hidden
 --feat-layers`, `train_eagle.py --extra-layers`; +1.8% over its matched
 control, +0.2% over r10 - not worth capturing two more features on every
