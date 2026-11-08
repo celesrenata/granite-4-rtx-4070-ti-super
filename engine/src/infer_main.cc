@@ -811,6 +811,21 @@ int eagle_batched_k() {
   }();
   return v;
 }
+// Plain decode throughput (tokens/ms) by number of sessions decoding
+// together, measured by the first timed plain burst and reused by later
+// probes, which then cost no burst + re-sync forward. 0 = not measured yet.
+// Keyed by session count and context (longest session, 4096-position
+// buckets): attention makes plain decode slower at long context.
+// G4_EAGLE_PROBE_CACHE=0 re-measures on every probe.
+double* plain_rate_cache(std::size_t sessions, int context) {
+  static const bool on = [] {
+    const char* e = std::getenv("G4_EAGLE_PROBE_CACHE");
+    return e == nullptr || e[0] != '0';
+  }();
+  static double v[8][9] = {};
+  const int bucket = std::clamp(context / 4096, 0, 8);
+  return on ? &v[std::min<std::size_t>(sessions, 7)][bucket] : nullptr;
+}
 constexpr int kEagleProbeRounds = 4;
 constexpr double kEagleKeepAccept = 2.0;
 constexpr int kEagleBurst = 8;
@@ -993,8 +1008,16 @@ class EagleRun {
       // The burst plus the rows already pending for the head ([hq, L)) must
       // fit one verify-sized hidden forward for the re-sync.
       const int burst = std::min({kEagleBurst, left, kMaxVerifyRows - (L_ - hq_)});
+      double* const cached = plain_rate_cache(1, L_);
       if (avg < min_accept_) {
         plain_ = true;
+      } else if (avg < kEagleKeepAccept && cached != nullptr && *cached > 0.0) {
+        const double eagle_rate = probe_tok_ / std::max(probe_ms_, 1e-3);
+        plain_ = *cached >= eagle_rate;  // the anchor already sits at d_tokens[written]
+        if (std::getenv("G4_SERVE_DEBUG") != nullptr || et_)
+          std::fprintf(stderr, "G4_EAGLE probe (cached plain): %.2f accepted/round, eagle %.1f "
+                       "tok/s, plain %.1f tok/s -> %s\n", avg, 1000.0 * eagle_rate,
+                       1000.0 * *cached, plain_ ? "plain" : "eagle");
       } else if (avg < kEagleKeepAccept && burst >= 2) {
         const auto b0 = std::chrono::steady_clock::now();
         std::vector<std::int32_t> bt;
@@ -1004,6 +1027,7 @@ class EagleRun {
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0)
                 .count();
         const double plain_rate = burst / std::max(plain_ms, 1e-3);
+        if (cached != nullptr) *cached = plain_rate;
         const double eagle_rate = probe_tok_ / std::max(probe_ms_, 1e-3);
         if (std::getenv("G4_SERVE_DEBUG") != nullptr || et_)
           std::fprintf(stderr, "G4_EAGLE probe: %.2f accepted/round, eagle %.1f tok/s, "
@@ -1823,9 +1847,34 @@ int gpu_serve_cmd(const Args& cli) {
     j.eagle->report_timing();
     finish(j);
   };
+  // G4_EAGLE_TIMING=1: sync at phase boundaries of batched rounds and print
+  // per-round averages (head / verify+readback / commit / gap to the
+  // previous round) every 64 rounds.
+  struct BatchTiming {
+    bool on = false;
+    long rounds = 0, rows = 0, tok = 0, gaps = 0;
+    double head = 0, verify = 0, commit = 0, gap = 0;
+    std::chrono::steady_clock::time_point last{};
+    std::chrono::steady_clock::time_point top{};  // scheduler loop top
+    double tail = 0;  // round end -> loop top
+  } bt;
+  {
+    const char* e = std::getenv("G4_EAGLE_TIMING");
+    bt.on = e != nullptr && e[0] == '1';
+  }
+  using Clock = std::chrono::steady_clock;
+  auto ms_since = [](Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+  };
   auto batched_round = [&](std::vector<Job*>& ej) {
     if (bp.members != ej) bp = BatchPolicy{ej};
     const auto t0 = std::chrono::steady_clock::now();
+    // Steady-state gap only: consecutive rounds of an unchanged batch.
+    if (bt.on && bp.rounds > 0) {
+      bt.gap += std::chrono::duration<double, std::milli>(t0 - bt.last).count();
+      bt.tail += std::chrono::duration<double, std::milli>(bt.top - bt.last).count();
+      ++bt.gaps;
+    }
     std::size_t gen_before = 0;
     for (Job* j : ej) gen_before += j->g.ids.size();
     int kmax = 0;
@@ -1867,6 +1916,12 @@ int gpu_serve_cmd(const Args& cli) {
       for (Job* j : ej) fail_job(*j, "eagle: head forward failed");
       return;
     }
+    Clock::time_point tv{};
+    if (bt.on) {
+      cudaStreamSynchronize(cudaStreamPerThread);
+      bt.head += ms_since(t0);
+      tv = Clock::now();
+    }
     // One verify forward over every run's anchor + drafts.
     std::vector<GpuCtx*> rc;
     std::vector<std::int32_t*> rt;
@@ -1887,6 +1942,12 @@ int gpu_serve_cmd(const Args& cli) {
         !lead.argmax(nrows, &ids, &err)) {
       for (Job* j : ej) fail_job(*j, std::string("eagle batched verify: ") + cerr);
       return;
+    }
+    Clock::time_point tc{};
+    if (bt.on) {
+      bt.verify += ms_since(tv);
+      bt.rows += nrows;
+      tc = Clock::now();
     }
     const std::size_t H = static_cast<std::size_t>(cfg.hidden_size);
     int off = 0;
@@ -1910,6 +1971,19 @@ int gpu_serve_cmd(const Args& cli) {
     // Policy (per batch): time rounds 2..5, then one timed plain burst.
     std::size_t gen_after = 0;
     for (Job* j : ej) gen_after += j->g.ids.size();
+    if (bt.on) {
+      cudaStreamSynchronize(cudaStreamPerThread);
+      bt.commit += ms_since(tc);
+      bt.tok += static_cast<long>(gen_after - gen_before);
+      bt.last = Clock::now();
+      if (++bt.rounds % 64 == 0) {
+        const double R = static_cast<double>(bt.rounds);
+        std::fprintf(stderr, "G4_EAGLE batched: rounds=%ld rows/rnd=%.1f tok/rnd=%.2f "
+                     "head=%.2f verify=%.2f commit=%.2f gap=%.2f (to loop top %.2f) ms/rnd\n", bt.rounds,
+                     bt.rows / R, bt.tok / R, bt.head / R, bt.verify / R, bt.commit / R,
+                     bt.gaps ? bt.gap / bt.gaps : 0.0, bt.gaps ? bt.tail / bt.gaps : 0.0);
+      }
+    }
     ++bp.rounds;
     if (bp.rounds >= 2 && !bp.decided) {
       bp.tokens += static_cast<long>(gen_after - gen_before);
@@ -1928,6 +2002,24 @@ int gpu_serve_cmd(const Args& cli) {
       burst = std::min({burst, j->a.max_tokens - static_cast<int>(j->g.ids.size()),
                         kMaxVerifyRows - j->eagle->pending_rows(), s.mapped() - s.written(),
                         s.max_pos() - 1 - s.written()});
+    }
+    int ctx_max = 0;
+    for (Job* j : live) ctx_max = std::max(ctx_max, sessions[j->sess].written());
+    double* const cached = plain_rate_cache(live.size(), ctx_max);
+    if (cached != nullptr && *cached > 0.0) {
+      // Plain throughput for this batch shape is known: decide without a burst.
+      const double eagle_rate = static_cast<double>(bp.tokens) / std::max(bp.ms, 1e-3);
+      const bool to_plain = *cached >= eagle_rate;
+      if (debug)
+        std::fprintf(stderr, "G4_EAGLE batch probe (%zu sessions, cached plain): eagle %.1f "
+                     "tok/s, plain %.1f tok/s -> %s\n", live.size(), 1000.0 * eagle_rate,
+                     1000.0 * *cached, to_plain ? "plain" : "eagle");
+      if (to_plain)
+        for (Job* j : live) {
+          j->eagle->yield_plain();
+          j->plain = true;
+        }
+      return;
     }
     if (burst < 2) return;
     std::vector<GpuCtx*> cs;
@@ -1953,6 +2045,7 @@ int gpu_serve_cmd(const Args& cli) {
     const double plain_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0).count();
     const double plain_rate = static_cast<double>(burst * live.size()) / std::max(plain_ms, 1e-3);
+    if (cached != nullptr) *cached = plain_rate;
     const double eagle_rate = static_cast<double>(bp.tokens) / std::max(bp.ms, 1e-3);
     const bool to_plain = plain_rate >= eagle_rate;
     if (debug)
@@ -1977,6 +2070,7 @@ int gpu_serve_cmd(const Args& cli) {
   };
   std::deque<std::string> pending;
   for (;;) {
+    if (bt.on) bt.top = Clock::now();
     {
       std::unique_lock<std::mutex> lk(inq.m);
       if (active_count() == 0 && pending.empty())

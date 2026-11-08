@@ -66,12 +66,17 @@ def main():
     ap.add_argument("--kv", default="1")
     ap.add_argument("--env", nargs="*", default=[], help="extra engine env KEY=VAL")
     ap.add_argument("--families", default="chat,novel,serving")
+    ap.add_argument("--engine-log", default="", help="append engine stderr here (default: discard)")
     a = ap.parse_args()
     tok = tokenizer.ByteBPE(Path(a.ckpt) / "tokenizer.json")
     chat = [c["turns"][0] for c in json.load(open(a.prompts))[-12:]]
     serving = [d["prompt"] for d in json.load(open(
         "/opt/granite4-rtx-4070-ti-super/eagle/ds/serving/eval.json"))][:12]
-    allf = {"chat": chat, "novel": NOVEL, "serving": serving}
+    # ~3K-token contexts (attention-heavy verify): engine sources + a question.
+    src = sorted((Path(__file__).resolve().parents[1] / "engine" / "src").glob("*.c[cu]"))
+    doc = [f"Here is a source file:\n\n{p.read_text()[:10000]}\n\nExplain what this code does, "
+           "section by section." for p in src[:8]]
+    allf = {"chat": chat, "novel": NOVEL, "serving": serving, "doc": doc}
     fams = {f: allf[f] for f in a.families.split(",")}
     env = dict(os.environ, G4_KV8=a.kv, G4_FORCE_REPREFILL="1")
     for kv in a.env:
@@ -82,7 +87,7 @@ def main():
     if a.eagle:
         cmd += ["--eagle", a.eagle, "--eagle-k", str(a.eagle_k)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
+                            stderr=(open(a.engine_log, "a") if a.engine_log else subprocess.DEVNULL), text=True, bufsize=1, env=env)
     proc.stdout.readline()
     rid = 0
     for fam, ps in fams.items():

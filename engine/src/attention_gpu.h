@@ -39,6 +39,9 @@ std::size_t attn_split_scratch_bytes(int Hq, int rows, int stride);
 // d_pt are ignored. Device arrays of `rows` entries. Used to decode several
 // sessions of one shared KV arena in one step; each row's arithmetic is that
 // of a single-row call at its position.
+// row_grp (device, ngroups entries, with row_pos): block z owns rows
+// [g & 0xff, + (g >> 8)) of ONE sequence at consecutive positions, so those
+// rows read each K/V tile once (bit-identical to one row per block).
 //
 // KV8 (Q8_0): when int8 is true the persistent cache is read as int8 codes
 // int4, the KV cache is read as int4 codes (cache_k4/cache_v4,
@@ -56,7 +59,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const std::uint8_t* cache_k4 = nullptr,
                const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
                const int* d_pt = nullptr, int max_len = 0,
-               const int* row_pos = nullptr, const int* const* row_pt = nullptr);
+               const int* row_pos = nullptr, const int* const* row_pt = nullptr,
+               const int* row_grp = nullptr, int ngroups = 0);
 
 }  // namespace granite4
 

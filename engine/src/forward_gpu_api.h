@@ -149,6 +149,9 @@ struct GpuMultiRows {
   int pos[kMaxVerifyRows];
   const int* pt[kMaxVerifyRows];
   std::int32_t* tok[kMaxVerifyRows];
+  // Attention row groups (gpu_forward_multi): runs of one session's
+  // consecutive rows, r0 | count << 8 (see attn_split row_grp).
+  int grp[kMaxVerifyRows];
 };
 // One forward over rows of several sessions sharing weights + one KV arena:
 // row r is position row_pos[r] of session row_ctx[r] (token from
