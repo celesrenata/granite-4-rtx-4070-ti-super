@@ -141,6 +141,16 @@ void gpu_weights_free(GpuCtx* ctx);
 // Number of sequence positions already processed by this ctx (the
 // KV-written watermark); gpu_forward_range recomputes positions at or
 // below this value only when end <= written.
+// Multi-session greedy decode: `steps` steps, each decoding the next token
+// of all n sessions in one batched forward (the weights stream once for all
+// rows). Session i continues from its watermark exactly as gpu_decode_greedy
+// would (its token at d_tokens[i][written] in, the greedy id out at
+// [written + 1], watermark advances by `steps`), and each row is bit-identical
+// to that session decoding alone. ctxs[0] leads (its scratch runs the step);
+// with n > 1 all sessions must share weights and one KV arena (paged
+// contexts). n <= kMaxVerifyRows. d_logits holds [n][vocab] (last step).
+int gpu_decode_multi(GpuCtx* const* ctxs, std::int32_t* const* d_tokens, int n, int steps,
+                     std::uint16_t* d_logits, char* error, std::size_t error_size);
 int gpu_ctx_written(GpuCtx* ctx);
 
 // Lower the KV watermark without freeing allocations. Rows at or above the

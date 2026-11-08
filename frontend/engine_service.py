@@ -82,41 +82,71 @@ class ServingError(Exception):
 
 
 class ServeProcess:
-    """One persistent `granite4-infer serve` engine.
+    """One persistent `granite4-infer serve` engine, shared by concurrent requests.
 
-    Requests are serialized (the engine runs one at a time). The process is
-    started on first use; a timeout, a malformed reply, or a dead process
-    kills it, and the next request starts a fresh one.
+    The engine schedules several requests at once (one per session; plain
+    greedy jobs decode together in one batched step), so requests are not
+    serialized here: each carries an integer "id" that the engine echoes in its
+    reply, and a reader thread routes reply lines to the waiting request. A
+    reply without an id (an engine that predates ids) goes to the only request
+    in flight. The process is started on first use; a timeout, a malformed
+    reply, or a dead process kills it (failing every request in flight), and
+    the next request starts a fresh one.
     """
 
     def __init__(self, cmd: list[str], *, startup_timeout_s: float = _SERVE_STARTUP_TIMEOUT_S):
         self._cmd = cmd
         self._startup_timeout_s = startup_timeout_s
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()        # process lifecycle + stdin writes
         self._proc: subprocess.Popen[str] | None = None
         self._lines: queue.Queue[str | None] = queue.Queue()
+        self._waiters: dict[int, queue.Queue[str | None]] = {}
+        self._wlock = threading.Lock()       # _waiters
+        self._next_id = 0
+        self._ready = False
 
     def _start(self) -> None:
         proc = subprocess.Popen(self._cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 text=True, bufsize=1)
         lines: queue.Queue[str | None] = queue.Queue()
+        self._ready = False
 
         def _pump() -> None:
             assert proc.stdout is not None
             for line in proc.stdout:
-                lines.put(line)
+                if not self._ready or proc is not self._proc:
+                    lines.put(line)  # the ready line (read by _start)
+                    continue
+                self._route(line)
             lines.put(None)  # EOF: the engine exited
+            with self._wlock:
+                waiters = list(self._waiters.values()) if proc is self._proc else []
+            for w in waiters:
+                w.put(None)
 
-        threading.Thread(target=_pump, daemon=True).start()
         self._proc, self._lines = proc, lines
-        ready = self._read(self._startup_timeout_s)
+        threading.Thread(target=_pump, daemon=True).start()
+        ready = self._read_queue(lines, self._startup_timeout_s)
         if ready.get("ready") is not True:
             self.close()
             raise ServingError(500, "engine_failed", "engine did not report ready")
+        self._ready = True
 
-    def _read(self, timeout_s: float) -> dict[str, Any]:
+    def _route(self, line: str) -> None:
         try:
-            line = self._lines.get(timeout=timeout_s)
+            rid = json.loads(line).get("id")
+        except (json.JSONDecodeError, AttributeError):
+            rid = None
+        with self._wlock:
+            w = self._waiters.get(rid) if isinstance(rid, int) else None
+            if w is None and len(self._waiters) == 1:
+                w = next(iter(self._waiters.values()))
+        if w is not None:
+            w.put(line)
+
+    def _read_queue(self, q: "queue.Queue[str | None]", timeout_s: float) -> dict[str, Any]:
+        try:
+            line = q.get(timeout=timeout_s)
         except queue.Empty:
             self.close()
             raise ServingError(504, "generation_timeout",
@@ -132,7 +162,11 @@ class ServeProcess:
         if not isinstance(doc, dict):
             self.close()
             raise ServingError(500, "engine_malformed", "engine emitted a non-object")
+        doc.pop("id", None)
         return doc
+
+    def _read(self, timeout_s: float) -> dict[str, Any]:
+        return self._read_queue(self._lines, timeout_s)
 
     def warm(self) -> None:
         """Start the engine (load the model) if it is not running."""
@@ -141,20 +175,35 @@ class ServeProcess:
                 self._start()
 
     def request(self, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+        mine: queue.Queue[str | None] = queue.Queue()
         with self._lock:
             if self._proc is None or self._proc.poll() is not None:
                 self._start()
             assert self._proc is not None and self._proc.stdin is not None
+            self._next_id += 1
+            rid = self._next_id
+            with self._wlock:
+                self._waiters[rid] = mine
             try:
-                self._proc.stdin.write(json.dumps(payload) + "\n")
+                self._proc.stdin.write(json.dumps(dict(payload, id=rid)) + "\n")
                 self._proc.stdin.flush()
             except (BrokenPipeError, OSError):
+                with self._wlock:
+                    self._waiters.pop(rid, None)
                 self.close()
                 raise ServingError(500, "engine_failed", "engine process exited")
-            return self._read(timeout_s)
+        try:
+            return self._read_queue(mine, timeout_s)
+        finally:
+            with self._wlock:
+                self._waiters.pop(rid, None)
 
     def close(self) -> None:
         proc, self._proc = self._proc, None
+        with self._wlock:
+            waiters = list(self._waiters.values())
+        for w in waiters:
+            w.put(None)
         if proc is None:
             return
         if proc.poll() is None:

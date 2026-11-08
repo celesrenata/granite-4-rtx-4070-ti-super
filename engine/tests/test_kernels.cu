@@ -169,7 +169,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const float* cache_v_scale = nullptr, bool int8 = false,
                const std::uint8_t* cache_k4 = nullptr,
                const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
-               const int* d_pt = nullptr, int max_len = 0);
+               const int* d_pt = nullptr, int max_len = 0,
+               const int* row_pos = nullptr, const int* const* row_pt = nullptr);
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                       int base_pos, int rows, int stride, std::uint16_t* out,
@@ -2919,6 +2920,149 @@ static void test_attn_split_rows_bit_identical_device() {
   cudaFree(dks); cudaFree(dvs); cudaFree(dq); cudaFree(dmulti); cudaFree(dsingle);
   cudaFree(dpt); cudaFree(scratch);
 }
+// Multi-session decode: gpu_decode_multi over two sessions of one shared
+// arena == each session decoding alone (gpu_decode_greedy on a private
+// cache), token for token and bit for bit in the last step's logits.
+static void test_decode_multi_device() {
+  ModelConfig model;
+  model.num_layers = 2;
+  model.hidden_size = 512;
+  model.intermediate_size = 256;
+  model.num_attention_heads = 4;
+  model.num_key_value_heads = 1;
+  model.head_dim = 128;
+  model.vocab_size = 512;
+  model.max_context_length = 131072;
+  ForwardSpec spec;
+  const int L = 2, H = 512, I = 256, Hq = 4, Hk = 1, d = 128, V = 512;
+  const int max_pos = 64, arena_rows = 192, steps = 9;
+  const auto z = [](int v) { return static_cast<std::size_t>(v); };
+  const GpuWeightsLayout lay{z(H), z(I), z(V), z(L), z(Hq), z(Hk), z(d)};
+  Xorshift64 rng(0x3317);
+  std::vector<std::uint8_t> weights(lay.total_bytes());
+  auto fill_bf16 = [&](std::size_t off, std::size_t elems) {
+    for (std::size_t i = 0; i < elems; ++i) {
+      const std::uint16_t v = gen_bf16(rng);
+      weights[off + 2 * i] = static_cast<std::uint8_t>(v & 0xffu);
+      weights[off + 2 * i + 1] = static_cast<std::uint8_t>(v >> 8);
+    }
+  };
+  auto fill_fp8 = [&](std::size_t off, std::size_t elems) {
+    for (std::size_t i = 0; i < elems; ++i)
+      weights[off + i] = fp8_e4m3_encode(rng.next_float_range(2.0), nullptr);
+  };
+  fill_bf16(0, z(V) * H);
+  for (int layer = 0; layer < L; ++layer) {
+    const std::size_t base = lay.embed_bytes() + z(layer) * lay.layer_bytes();
+    fill_bf16(base + lay.off_attn_norm(), H);
+    fill_bf16(base + lay.off_ffn_norm(), H);
+    fill_fp8(base + lay.off_q(), z(H) * H);
+    fill_fp8(base + lay.off_k(), z(Hk) * d * H);
+    fill_fp8(base + lay.off_v(), z(Hk) * d * H);
+    fill_fp8(base + lay.off_o(), z(H) * H);
+    fill_fp8(base + lay.off_gate(), z(I) * H);
+    fill_fp8(base + lay.off_up(), z(I) * H);
+    fill_fp8(base + lay.off_down(), z(H) * I);
+  }
+  fill_bf16(lay.final_norm_off(), H);
+  fill_fp8(lay.lm_head_off(), z(V) * H);
+  std::vector<float> scales(lay.num_scales());
+  for (auto& s : scales) s = 0.1f + 0.9f * rng.next_float_range(1.0);
+  const int plen[2] = {13, 21};  // different positions per session
+  char err[256];
+  const char* const modes[] = {"0", "1", "4"};
+  const char* const names[] = {"bf16", "KV8", "KV4"};
+  for (int m = 0; m < 3; ++m) {
+    setenv("G4_KV8", modes[m], 1);
+    const std::string tag = std::string("decode multi [") + names[m] + "]: ";
+    std::int32_t* tok[2][2];  // [run][session]
+    std::uint16_t *lg_ref, *lg_multi;
+    bool ok = cudaMalloc(&lg_ref, z(V) * 2) == cudaSuccess &&
+              cudaMalloc(&lg_multi, z(2) * V * 2) == cudaSuccess;
+    for (int r = 0; r < 2 && ok; ++r)
+      for (int s = 0; s < 2 && ok; ++s) {
+        ok = cudaMalloc(&tok[r][s], z(max_pos) * 4) == cudaSuccess;
+        std::vector<std::int32_t> t(max_pos, 0);
+        for (int i = 0; i < plen[s]; ++i) t[i] = (i * (s ? 41 : 97) + (s ? 7 : 13)) % V;
+        if (ok) CUDA_CHECK(cudaMemcpy(tok[r][s], t.data(), z(max_pos) * 4, cudaMemcpyHostToDevice));
+      }
+    if (!ok) {
+      ++g_failures;
+      continue;
+    }
+    // Reference: each session alone on a private cache.
+    std::vector<std::int32_t> want[2];
+    std::vector<std::uint16_t> want_lg[2];
+    for (int s = 0; s < 2; ++s) {
+      GpuCtx* c = gpu_ctx_create(model, spec, max_pos);
+      expect(c != nullptr && gpu_weights_load(c, weights.data(), weights.size(), scales.data(),
+                                              scales.size(), err, sizeof err) == 0,
+             (tag + "ref ctx").c_str());
+      GpuForwardOut out;
+      out.d_logits = lg_ref;
+      out.logits_from = plen[s] - 1;
+      out.d_argmax = tok[0][s] + plen[s];
+      expect(gpu_forward(c, tok[0][s], plen[s], out, err, sizeof err) == 0 &&
+                 gpu_decode_greedy(c, tok[0][s], steps, lg_ref, err, sizeof err) == 0,
+             (tag + "ref prefill + decode").c_str());
+      want[s].resize(z(steps + 1));
+      want_lg[s].resize(z(V));
+      CUDA_CHECK(cudaMemcpy(want[s].data(), tok[0][s] + plen[s], want[s].size() * 4,
+                            cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(want_lg[s].data(), lg_ref, z(V) * 2, cudaMemcpyDeviceToHost));
+      gpu_ctx_free(c);
+    }
+    // Multi: both sessions on one arena, decoded together.
+    GpuKvArena* arena = gpu_kv_arena_create(model, arena_rows, err, sizeof err);
+    GpuWeights* w = gpu_weights_create();
+    ok = arena != nullptr && w != nullptr &&
+         gpu_weights_load(w, weights.data(), weights.size(), scales.data(), scales.size(), err,
+                          sizeof err) == 0;
+    GpuCtx* c[2] = {nullptr, nullptr};
+    for (int s = 0; s < 2 && ok; ++s) {
+      c[s] = gpu_ctx_create_paged(model, spec, max_pos, arena);
+      std::vector<int> rows(max_pos);
+      for (int i = 0; i < max_pos; ++i) rows[i] = s == 0 ? 3 * i : 3 * (max_pos - 1 - i) + 1;
+      ok = c[s] != nullptr && gpu_ctx_use_weights(c[s], w) == 0 &&
+           gpu_ctx_set_kv_rows_n(c[s], rows.data(), max_pos) == 0;
+      GpuForwardOut out;
+      out.d_logits = lg_ref;
+      out.logits_from = plen[s] - 1;
+      out.d_argmax = tok[1][s] + plen[s];
+      ok = ok && gpu_forward(c[s], tok[1][s], plen[s], out, err, sizeof err) == 0;
+    }
+    expect(ok, (tag + "paged sessions prefilled").c_str());
+    std::int32_t* toks[2] = {tok[1][0], tok[1][1]};
+    // Two calls (5 + 4 steps): the second replays the captured graph.
+    ok = ok && gpu_decode_multi(c, toks, 2, 5, lg_multi, err, sizeof err) == 0 &&
+         gpu_decode_multi(c, toks, 2, steps - 5, lg_multi, err, sizeof err) == 0;
+    expect(ok, (tag + "gpu_decode_multi").c_str());
+    if (ok) {
+      bool same = true;
+      for (int s = 0; s < 2; ++s) {
+        std::vector<std::int32_t> got(z(steps + 1));
+        std::vector<std::uint16_t> lg(z(V));
+        CUDA_CHECK(cudaMemcpy(got.data(), tok[1][s] + plen[s], got.size() * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(lg.data(), lg_multi + z(s) * V, z(V) * 2, cudaMemcpyDeviceToHost));
+        same = same && got == want[s] && lg == want_lg[s] &&
+               gpu_ctx_written(c[s]) == plen[s] + steps;
+      }
+      expect(same, (tag + "2 sessions decoded together == each decoded alone (tokens + logits)").c_str());
+      if (same)
+        std::printf("  decode multi [%s]: 2 sessions x %d steps bit-identical to solo decode\n",
+                    names[m], steps);
+    }
+    gpu_ctx_free(c[1]);
+    gpu_ctx_free(c[0]);
+    gpu_kv_arena_free(arena);
+    gpu_weights_free_obj(w);
+    cudaFree(lg_ref);
+    cudaFree(lg_multi);
+    for (auto& r : tok)
+      for (auto* p : r) cudaFree(p);
+  }
+  unsetenv("G4_KV8");
+}
 int main() {
   int n = 0;
   if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -2960,6 +3104,7 @@ int main() {
   test_batched_forward_range_parity_device();
   test_shared_arena_sessions_device();
   test_attn_split_rows_bit_identical_device();
+  test_decode_multi_device();
   test_paged_kv_compact_device();
   test_silu_gate_up_device();
   test_sampling_device();

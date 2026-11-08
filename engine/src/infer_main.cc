@@ -73,6 +73,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -430,6 +436,7 @@ class GpuSession {
   }
 
   GpuCtx* ctx() { return ctx_; }
+  std::uint16_t* logits_buffer() { return d_logits_; }
   std::int32_t* d_tokens() { return d_tokens_; }
   const std::string& dir() const { return dir_; }
   // Device scratch for draft-head features: [max_pos][hidden] (prompt) and
@@ -769,215 +776,279 @@ constexpr int kEagleBurst = 8;
 // yields the greedy ids t_0..t_k and the features of those rows. The exact
 // gate accepts the prefix d_i == t_{i-1}; t_a is the new anchor. Everything
 // up to the read-back of t and d is enqueued without a host round trip.
-bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* out,
-                    std::string* error, int prefix = -1, EaglePolicy* policy = nullptr) {
-  if (head == nullptr) {
-    *error = "eagle: no head loaded (start with --eagle HEAD)";
-    return false;
+// One EAGLE generation as a resumable object, so the serve scheduler can run
+// it round by round next to other sessions. start() prefills and emits the
+// first token; round() runs one draft + verify round; after any round the
+// target KV holds [0, L) and the anchor (last emitted token) sits at
+// d_tokens[L], which is also exactly the plain-decode invariant, so
+// yield_plain() can hand the request to the (batched) greedy decode at any
+// round boundary.
+class EagleRun {
+ public:
+  EagleRun(GpuSession& s, EagleHead* head, const Args& a, Generation* out,
+           EaglePolicy* policy)
+      : s_(s), head_(head), a_(a), out_(out), gen_(out->ids), report_(out->report),
+        policy_(policy) {}
+  ~EagleRun() {
+    // Drop head entries past the last true-feature row (chain entries came
+    // from predicted features) so the next turn resumes from truth.
+    if (head_ != nullptr && started_) eagle_truncate(head_, head_valid_);
   }
-  std::vector<std::int32_t> seq = a.tokens;
-  const int plen = static_cast<int>(seq.size());
-  std::vector<std::int32_t>& generated = out->ids;
-  DraftReport& report = out->report;
-  out->drafted = true;
-  std::uint16_t *f_prompt, *f_verify, *f_chain;
-  if (!s.feature_buffers(&f_prompt, &f_verify, &f_chain, error)) return false;
-  std::vector<std::int32_t> ids;
-  // Resume from the session's cached conversation. The target KV holds
-  // [0, prefix); the head holds entries [0, eagle_written) (built from true
-  // target features, so valid whenever they lie inside the cached prefix).
-  // The head's catch-up needs the target's features for [hq0, plen), so the
-  // target re-forwards from hq0 = min(prefix, head entries): a handful of
-  // positions after a normal turn (the head trails the target by one round),
-  // not the whole prompt. prefix < 0 (or no head history): from scratch.
-  // At least one row is always forwarded - it yields the first token.
-  int hq0 = 0;
-  if (prefix > 0) hq0 = std::max(0, std::min({prefix, eagle_written(head), plen - 1}));
-  if (!s.truncate(hq0) || !s.upload(seq, 0, plen, error) ||
-      !s.forward(plen, plen - 1, error, f_prompt, hq0) || !s.argmax(1, &ids, error))
-    return false;
-  eagle_truncate(head, hq0);
-  // Head entries [0, head_valid) were built from true target features. On any
-  // exit (done, failed) drop the chain entries past it - they came from the
-  // head's own predicted features - so the next turn resumes from truth.
-  int head_valid = hq0;
-  struct HeadTrunc {
-    EagleHead* h;
-    const int* valid;
-    ~HeadTrunc() { eagle_truncate(h, *valid); }
-  } head_trunc{head, &head_valid};
-  auto emit = [&](std::int32_t tok) {
-    seq.push_back(tok);
-    generated.push_back(tok);
-    return a.is_eos(tok) || static_cast<int>(generated.size()) >= a.max_tokens;
-  };
-  if (emit(ids[0])) return true;
-  int L = plen, hq = hq0;
-  std::uint16_t* feat = f_prompt;  // features of positions [hq, L); outputs overwrite them
-  std::int32_t* const d_tok = s.d_tokens();
-  const std::size_t H = static_cast<std::size_t>(s.hidden());
-  std::vector<std::int32_t> drafts;
-  if (!s.upload(seq, L, L + 1, error)) return false;
-  // G4_EAGLE_TIMING=1: per-round device time split into head-draft and target
-  // verify (CUDA events around each; readback = wall - head - verify). Zero cost
-  // when unset.
-  const char* const eam = std::getenv("G4_EAGLE_TIMING");
-  const bool et = eam != nullptr && eam[0] == '1';
-  struct Ev { cudaEvent_t a, b; };
-  std::vector<Ev> h_ev, v_ev;
-  long et_rounds = 0, et_acc = 0, et_prop = 0;
-  // Adaptive drafting (see EaglePolicy): timed probe rounds, then one decision.
-  const double min_accept = eagle_min_accept();
-  int rounds_seen = 0, probe_acc = 0, probe_tok = 0;
-  double probe_ms = 0.0;
-  bool decided = min_accept <= 0.0, go_plain = false;
-  const auto et_t0 = std::chrono::steady_clock::now();
-  auto round = [&](std::string* out_err) -> bool {
+  EagleRun(const EagleRun&) = delete;
+  EagleRun& operator=(const EagleRun&) = delete;
+
+  // Prefill (resuming from `prefix` when > 0) and emit the first token.
+  // *done is set when the request already finished. false = error.
+  bool start(int prefix, bool* done, std::string* error) {
+    *done = false;
+    if (head_ == nullptr) {
+      *error = "eagle: no head loaded (start with --eagle HEAD)";
+      return false;
+    }
+    seq_ = a_.tokens;
+    const int plen = static_cast<int>(seq_.size());
+    out_->drafted = true;
+    if (!s_.feature_buffers(&f_prompt_, &f_verify_, &f_chain_, error)) return false;
+    // Resume from the session's cached conversation. The target KV holds
+    // [0, prefix); the head holds entries [0, eagle_written) (built from true
+    // target features, so valid whenever they lie inside the cached prefix).
+    // The head's catch-up needs the target's features for [hq0, plen), so the
+    // target re-forwards from hq0 = min(prefix, head entries): a handful of
+    // positions after a normal turn (the head trails the target by one round),
+    // not the whole prompt. prefix < 0 (or no head history): from scratch.
+    // At least one row is always forwarded - it yields the first token.
+    int hq0 = 0;
+    if (prefix > 0) hq0 = std::max(0, std::min({prefix, eagle_written(head_), plen - 1}));
+    std::vector<std::int32_t> ids;
+    if (!s_.truncate(hq0) || !s_.upload(seq_, 0, plen, error) ||
+        !s_.forward(plen, plen - 1, error, f_prompt_, hq0) || !s_.argmax(1, &ids, error))
+      return false;
+    eagle_truncate(head_, hq0);
+    started_ = true;
+    head_valid_ = hq0;
+    L_ = plen;
+    hq_ = hq0;
+    feat_ = f_prompt_;
+    if (emit(ids[0])) {
+      *done = true;
+      return true;
+    }
+    if (!s_.upload(seq_, L_, L_ + 1, error)) return false;
+    const char* const eam = std::getenv("G4_EAGLE_TIMING");
+    et_ = eam != nullptr && eam[0] == '1';
+    min_accept_ = eagle_min_accept();
+    decided_ = min_accept_ <= 0.0;
+    t0_ = std::chrono::steady_clock::now();
+    return true;
+  }
+
+  // One draft + verify round. Returns true when the loop should stop: the
+  // request finished (done()), drafting stopped paying (plain()), or an error
+  // (error non-empty). false = keep drafting.
+  bool round(std::string* error) {
     const auto r_t0 = std::chrono::steady_clock::now();
-    const int remaining = a.max_tokens - static_cast<int>(generated.size());
-    const int k = std::max(0, std::min({a.eagle_k, remaining - 1, s.max_pos() - L - 2}));
-    Ev h0, v0;
-    if (et && k > 0) cudaEventCreate(&h0.a), cudaEventCreate(&h0.b);
+    const int remaining = a_.max_tokens - static_cast<int>(gen_.size());
+    const int k = std::max(0, std::min({a_.eagle_k, remaining - 1, s_.max_pos() - L_ - 2}));
+    std::int32_t* const d_tok = s_.d_tokens();
+    const std::size_t H = static_cast<std::size_t>(s_.hidden());
+    Ev h0{}, v0{};
     if (k > 0) {
-      if (et) cudaEventRecord(h0.a, cudaStreamPerThread);
-      const int rows = L - hq;
-      std::uint16_t* const last = feat + static_cast<std::size_t>(rows - 1) * H;
-      bool ok = eagle_forward(head, d_tok, hq, rows, feat, feat, d_tok + L + 1) == 0;
+      if (et_) cudaEventCreate(&h0.a), cudaEventCreate(&h0.b),
+          cudaEventRecord(h0.a, cudaStreamPerThread);
+      const int rows = L_ - hq_;
+      std::uint16_t* const last = feat_ + static_cast<std::size_t>(rows - 1) * H;
+      bool ok = eagle_forward(head_, d_tok, hq_, rows, feat_, feat_, d_tok + L_ + 1) == 0;
       for (int i = 2; ok && i <= k; ++i)
-        ok = eagle_forward(head, d_tok, L + i - 2, 1, i == 2 ? last : f_chain, f_chain,
-                           d_tok + L + i) == 0;
-      if (et) cudaEventRecord(h0.b, cudaStreamPerThread), h_ev.push_back(h0);
+        ok = eagle_forward(head_, d_tok, L_ + i - 2, 1, i == 2 ? last : f_chain_, f_chain_,
+                           d_tok + L_ + i) == 0;
+      if (et_) cudaEventRecord(h0.b, cudaStreamPerThread), h_ev_.push_back(h0);
       if (!ok) {
-        *out_err = "eagle: head forward failed";
+        *error = "eagle: head forward failed";
         return true;
       }
-      head_valid = L;  // entries [hq, L) came from true target features
+      head_valid_ = L_;  // entries [hq, L) came from true target features
     }
     // Target verify over anchor + drafts: greedy ids t_0..t_k and features.
-    if (et) cudaEventCreate(&v0.a), cudaEventCreate(&v0.b);
-    if (et) cudaEventRecord(v0.a, cudaStreamPerThread);
-    if (!s.forward(L + k + 1, L, error, f_verify, L) || !s.argmax(k + 1, &ids, error) ||
-        !s.tokens(L + 1, L + 1 + k, &drafts, error))
+    if (et_) cudaEventCreate(&v0.a), cudaEventCreate(&v0.b),
+        cudaEventRecord(v0.a, cudaStreamPerThread);
+    std::vector<std::int32_t> ids;
+    if (!s_.forward(L_ + k + 1, L_, error, f_verify_, L_) || !s_.argmax(k + 1, &ids, error) ||
+        !s_.tokens(L_ + 1, L_ + 1 + k, &drafts_, error))
       return true;
-    if (et) cudaEventRecord(v0.b, cudaStreamPerThread), v_ev.push_back(v0);
+    if (et_) cudaEventRecord(v0.b, cudaStreamPerThread), v_ev_.push_back(v0);
     int acc = 0;
-    while (acc < k && drafts[static_cast<std::size_t>(acc)] == ids[static_cast<std::size_t>(acc)])
+    while (acc < k && drafts_[static_cast<std::size_t>(acc)] == ids[static_cast<std::size_t>(acc)])
       ++acc;
-    report.proposed += k;
-    report.accepted += acc;
-    ++report.steps;
-    if (et) { et_rounds++; et_acc += acc; et_prop += k; }
-    if (!decided && k > 0) {
-      if (rounds_seen > 0) {  // round 0 carries the head's prompt catch-up
-        probe_acc += acc;
-        probe_tok += acc + 1;
-        probe_ms += std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - r_t0).count();
-      }
-      ++rounds_seen;
+    report_.proposed += k;
+    report_.accepted += acc;
+    ++report_.steps;
+    if (et_) {
+      et_rounds_++;
+      et_acc_ += acc;
+      et_prop_ += k;
     }
-    bool stop = false;
-    for (int i = 0; i < acc && !stop; ++i) stop = emit(drafts[static_cast<std::size_t>(i)]);
-    if (!stop) stop = emit(ids[static_cast<std::size_t>(acc)]);
-    if (stop) return true;
+    if (!decided_ && k > 0) {
+      if (rounds_seen_ > 0) {  // round 0 carries the head's prompt catch-up
+        probe_acc_ += acc;
+        probe_tok_ += acc + 1;
+        probe_ms_ += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - r_t0).count();
+      }
+      ++rounds_seen_;
+    }
+    for (int i = 0; i < acc && !done_; ++i) done_ = emit(drafts_[static_cast<std::size_t>(i)]);
+    if (!done_) done_ = emit(ids[static_cast<std::size_t>(acc)]);
+    if (done_) return true;
     // Target KV is valid for the anchor and the accepted drafts; the head's
     // chain entries (built on predicted features) are dropped.
-    const int nl = L + acc + 1;
-    if (!s.truncate(nl) || !s.upload(seq, nl, nl + 1, error)) {
+    const int nl = L_ + acc + 1;
+    if (!s_.truncate(nl) || !s_.upload(seq_, nl, nl + 1, error)) {
       if (error->empty()) *error = "kv truncate failed";
       return true;
     }
-    eagle_truncate(head, L);
-    head_valid = std::min(head_valid, L);
-    hq = L;
-    feat = f_verify;
-    L = nl;
-    if (!decided && rounds_seen > kEagleProbeRounds) {
-      decided = true;
-      const double avg = static_cast<double>(probe_acc) / kEagleProbeRounds;
-      const int left = a.max_tokens - static_cast<int>(generated.size());
+    eagle_truncate(head_, L_);
+    head_valid_ = std::min(head_valid_, L_);
+    hq_ = L_;
+    feat_ = f_verify_;
+    L_ = nl;
+    if (!decided_ && rounds_seen_ > kEagleProbeRounds) {
+      decided_ = true;
+      const double avg = static_cast<double>(probe_acc_) / kEagleProbeRounds;
+      const int left = a_.max_tokens - static_cast<int>(gen_.size());
       // The burst plus the rows already pending for the head ([hq, L)) must
       // fit one verify-sized hidden forward for the re-sync.
-      const int burst = std::min({kEagleBurst, left, kMaxVerifyRows - (L - hq)});
-      if (avg < min_accept) {
-        go_plain = true;
+      const int burst = std::min({kEagleBurst, left, kMaxVerifyRows - (L_ - hq_)});
+      if (avg < min_accept_) {
+        plain_ = true;
       } else if (avg < kEagleKeepAccept && burst >= 2) {
         const auto b0 = std::chrono::steady_clock::now();
         std::vector<std::int32_t> bt;
-        if (!s.decode_greedy(burst, error) || !s.tokens(L + 1, L + 1 + burst, &bt, error))
+        if (!s_.decode_greedy(burst, error) || !s_.tokens(L_ + 1, L_ + 1 + burst, &bt, error))
           return true;
         const double plain_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0)
                 .count();
         const double plain_rate = burst / std::max(plain_ms, 1e-3);
-        const double eagle_rate = probe_tok / std::max(probe_ms, 1e-3);
-        if (std::getenv("G4_SERVE_DEBUG") != nullptr || et)
+        const double eagle_rate = probe_tok_ / std::max(probe_ms_, 1e-3);
+        if (std::getenv("G4_SERVE_DEBUG") != nullptr || et_)
           std::fprintf(stderr, "G4_EAGLE probe: %.2f accepted/round, eagle %.1f tok/s, "
                        "plain %.1f tok/s -> %s\n", avg, 1000.0 * eagle_rate,
                        1000.0 * plain_rate, plain_rate >= eagle_rate ? "plain" : "eagle");
-        bool stop2 = false;
         for (std::int32_t t : bt)
-          if ((stop2 = emit(t))) break;
-        if (stop2) return true;
+          if ((done_ = emit(t))) break;
+        if (done_) return true;
         if (plain_rate >= eagle_rate) {
-          go_plain = true;  // the anchor already sits at d_tokens[written]
+          plain_ = true;  // the anchor already sits at d_tokens[written]
         } else {
           // Re-sync: features of [hq, L + burst) for the head's next catch-up
           // (rows [hq, L) were verified, rows [L, L + burst) decoded; both are
           // recomputed bit-identically by the verify-shaped forward).
-          if (!s.truncate(hq) || !s.forward_hidden(L + burst, hq, f_verify, error)) return true;
-          L += burst;
+          if (!s_.truncate(hq_) || !s_.forward_hidden(L_ + burst, hq_, f_verify_, error))
+            return true;
+          L_ += burst;
         }
       }
+      if (plain_ && policy_ != nullptr) policy_->off = true;  // measured: not paying
+      if (plain_ && (std::getenv("G4_SERVE_DEBUG") != nullptr || et_))
+        std::fprintf(stderr, "G4_EAGLE drafting off after %d rounds (%.2f accepted/round)\n",
+                     rounds_seen_, avg);
     }
-    return go_plain;  // drafting is not paying: leave the loop, finish greedily
-  };
-  bool stop = false;
-  do stop = round(error); while (!stop && error->empty());
-  if (!error->empty()) return false;
-  if (go_plain && static_cast<int>(generated.size()) < a.max_tokens &&
-      !(a.eos >= 0 && !generated.empty() && a.is_eos(generated.back()))) {
-    // The anchor (last emitted token) sits at d_tokens[L], the target KV holds
-    // [0, L): continue as plain chained greedy decode, 8 tokens per readback.
-    if (policy != nullptr) policy->off = true;
-    if (std::getenv("G4_SERVE_DEBUG") != nullptr || et)
-      std::fprintf(stderr, "G4_EAGLE drafting off after %d rounds (%.2f accepted/round)\n",
-                   rounds_seen, static_cast<double>(probe_acc) / kEagleProbeRounds);
-    constexpr int kChunk = 8;
-    std::vector<std::int32_t> ids2;
-    bool done = false;
-    while (!done && static_cast<int>(generated.size()) < a.max_tokens) {
-      const int pos = s.written();
-      const int steps = std::min(kChunk, a.max_tokens - static_cast<int>(generated.size()));
-      if (!s.decode_greedy(steps, error) || !s.tokens(pos + 1, pos + 1 + steps, &ids2, error))
-        return false;
-      for (std::int32_t t : ids2)
-        if (emit(t)) {
-          done = true;
-          break;
-        }
-    }
+    return plain_;
   }
-  const double et_wall =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - et_t0).count();
-  if (et) {
+
+  // Leave drafting at a round boundary (another session needs the batch);
+  // the conversation's policy is untouched.
+  void yield_plain() { plain_ = true; }
+  bool done() const { return done_; }
+  bool plain() const { return plain_; }
+  // Emit a token decoded outside the rounds (plain continuation); true = stop.
+  bool emit(std::int32_t tok) {
+    seq_.push_back(tok);
+    gen_.push_back(tok);
+    return a_.is_eos(tok) || static_cast<int>(gen_.size()) >= a_.max_tokens;
+  }
+
+  void report_timing() {
+    if (!et_) return;
+    const double wall =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0_).count();
     double hms = 0, vms = 0;
     float dms = 0;
-    for (auto& e : h_ev) if (cudaEventSynchronize(e.b) == cudaSuccess)
-      dms = 0, cudaEventElapsedTime(&dms, e.a, e.b), hms += dms,
-      cudaEventDestroy(e.a), cudaEventDestroy(e.b);
-    for (auto& e : v_ev) if (cudaEventSynchronize(e.b) == cudaSuccess)
-      dms = 0, cudaEventElapsedTime(&dms, e.a, e.b), vms += dms,
-      cudaEventDestroy(e.a), cudaEventDestroy(e.b);
-    const double R = et_rounds ? static_cast<double>(et_rounds) : 1.0;
-    const double tok = static_cast<double>(generated.size());
+    for (auto& e : h_ev_)
+      if (cudaEventSynchronize(e.b) == cudaSuccess)
+        dms = 0, cudaEventElapsedTime(&dms, e.a, e.b), hms += dms, cudaEventDestroy(e.a),
+        cudaEventDestroy(e.b);
+    for (auto& e : v_ev_)
+      if (cudaEventSynchronize(e.b) == cudaSuccess)
+        dms = 0, cudaEventElapsedTime(&dms, e.a, e.b), vms += dms, cudaEventDestroy(e.a),
+        cudaEventDestroy(e.b);
+    h_ev_.clear();
+    v_ev_.clear();
+    const double R = et_rounds_ ? static_cast<double>(et_rounds_) : 1.0;
+    const double tok = static_cast<double>(gen_.size());
     std::fprintf(stderr, "G4_EAGLE head_ms=%.1f (%.3f/rnd) verify_ms=%.1f (%.3f/rnd) "
-                   "read_ms=%.1f wall_ms=%.1f rounds=%ld acc=%ld prop=%ld tok/rnd=%.2f "
-                   "head%%=%.0f verify%%=%.0f tok/s=%.1f\n",
-                hms, hms / R, vms, vms / R, et_wall - hms - vms, et_wall, et_rounds, et_acc,
-                et_prop, (et_acc + et_rounds) / R, et_wall ? 100 * hms / et_wall : 0.0,
-                et_wall ? 100 * vms / et_wall : 0.0, et_wall ? tok / (et_wall / 1000.0) : 0.0);
+                 "read_ms=%.1f wall_ms=%.1f rounds=%ld acc=%ld prop=%ld tok/rnd=%.2f "
+                 "head%%=%.0f verify%%=%.0f tok/s=%.1f\n",
+                 hms, hms / R, vms, vms / R, wall - hms - vms, wall, et_rounds_, et_acc_,
+                 et_prop_, (et_acc_ + et_rounds_) / R, wall ? 100 * hms / wall : 0.0,
+                 wall ? 100 * vms / wall : 0.0, wall ? tok / (wall / 1000.0) : 0.0);
   }
+
+ private:
+  struct Ev {
+    cudaEvent_t a, b;
+  };
+  GpuSession& s_;
+  EagleHead* head_;
+  const Args& a_;
+  Generation* out_;
+  std::vector<std::int32_t>& gen_;
+  DraftReport& report_;
+  EaglePolicy* policy_;
+  std::vector<std::int32_t> seq_, drafts_;
+  std::uint16_t *f_prompt_ = nullptr, *f_verify_ = nullptr, *f_chain_ = nullptr;
+  std::uint16_t* feat_ = nullptr;  // features of positions [hq, L)
+  int L_ = 0, hq_ = 0, head_valid_ = 0;
+  bool started_ = false, done_ = false, plain_ = false, decided_ = false, et_ = false;
+  double min_accept_ = 0.0, probe_ms_ = 0.0;
+  int rounds_seen_ = 0, probe_acc_ = 0, probe_tok_ = 0;
+  long et_rounds_ = 0, et_acc_ = 0, et_prop_ = 0;
+  std::vector<Ev> h_ev_, v_ev_;
+  std::chrono::steady_clock::time_point t0_;
+};
+
+// Plain chained greedy decode from the current watermark (anchor at
+// d_tokens[written]) until `emit` says stop; 8 tokens per readback.
+template <class Emit>
+bool decode_tail(GpuSession& s, int remaining, Emit emit, std::string* error) {
+  constexpr int kChunk = 8;
+  std::vector<std::int32_t> ids;
+  while (remaining > 0) {
+    const int pos = s.written();
+    const int steps = std::min(kChunk, remaining);
+    if (!s.decode_greedy(steps, error) || !s.tokens(pos + 1, pos + 1 + steps, &ids, error))
+      return false;
+    for (std::int32_t t : ids) {
+      --remaining;
+      if (emit(t)) return true;
+    }
+  }
+  return true;
+}
+
+bool generate_eagle(GpuSession& s, EagleHead* head, const Args& a, Generation* out,
+                    std::string* error, int prefix = -1, EaglePolicy* policy = nullptr) {
+  EagleRun run(s, head, a, out, policy);
+  bool done = false;
+  if (!run.start(prefix, &done, error)) return false;
+  while (!done && !run.round(error)) {
+  }
+  if (!error->empty()) return false;
+  if (!run.done() && run.plain() &&
+      !decode_tail(s, a.max_tokens - static_cast<int>(out->ids.size()),
+                   [&](std::int32_t t) { return run.emit(t); }, error))
+    return false;
+  run.report_timing();
   return true;
 }
 
@@ -1350,160 +1421,334 @@ int gpu_serve_cmd(const Args& cli) {
   //    generated ids. A new prompt that shares a prefix with an existing
   //    hist reuses the cached KV positions instead of re-prefilling them,
   //    which is the primary cost of a long context in a chat conversation.
-  int next = 0;
-  std::string line;
-  for (int c; (c = std::getchar()) != EOF;) {
-    if (c != '\n') {
-      line.push_back(static_cast<char>(c));
-      continue;
+  // 6. Concurrent scheduler. Requests (one JSON line each, optional integer
+  //    "id" echoed in the reply) are read on a separate thread, so a request
+  //    can arrive while others generate. Each request becomes a job bound to
+  //    an idle session: the session sharing the longest prefix with its
+  //    prompt (resume from there) or an empty / round-robin one. Every loop
+  //    iteration advances the active jobs by one unit:
+  //      - one job alone, EAGLE: one draft + verify round;
+  //      - plain greedy jobs: one chunk of up to 8 tokens, ALL of them in one
+  //        batched multi-session step (gpu_decode_multi: the weights stream
+  //        once for every session; each session's tokens are bit-identical to
+  //        decoding it alone).
+  //    A second job arriving while an EAGLE job runs moves that job to plain
+  //    decode at its round boundary (exact either way), so both batch.
+  //    Seeded sampling and draft-lookup requests run to completion on their
+  //    session (the other jobs pause meanwhile).
+  struct LineQueue {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::string> q;
+    bool eof = false;
+  } inq;
+  std::thread reader([&inq] {
+    std::string ln;
+    for (int c; (c = std::getchar()) != EOF;) {
+      if (c != '\n') {
+        ln.push_back(static_cast<char>(c));
+        continue;
+      }
+      {
+        std::lock_guard<std::mutex> lk(inq.m);
+        inq.q.push_back(std::move(ln));
+      }
+      inq.cv.notify_one();
+      ln.clear();
     }
-    json::Value req;
-    std::string perr;
+    std::lock_guard<std::mutex> lk(inq.m);
+    inq.eof = true;
+    inq.cv.notify_one();
+  });
+  struct Job {
+    long long id = 0;
+    bool has_id = false;
     Args a;
-    Generation g;
-    std::string reply;
-    err.clear();
-    int picked = -1;
+    int sess = -1;
     int resume = 0;
-    if (!json::parse(line.data(), line.size(), &req, &perr) ||
-        req.kind != json::Value::Kind::Object) {
-      err = "bad request: " + perr;
+    int wm_before = 0;
+    Generation g;
+    std::unique_ptr<EagleRun> eagle;  // non-null while drafting
+    bool plain = false;               // plain greedy decode (batchable)
+    bool done = false;
+    std::string err;
+  };
+  std::list<std::unique_ptr<Job>> jobs;  // stable addresses (EagleRun keeps refs)
+  std::vector<bool> busy(n_sessions, false);
+  const bool debug = std::getenv("G4_SERVE_DEBUG") != nullptr;
+  int next = 0;
+  auto send = [](const std::string& s) {
+    std::fwrite(s.data(), 1, s.size(), stdout);
+    std::fflush(stdout);
+  };
+  auto id_prefix = [](bool has, long long id) {
+    return has ? "{\"id\":" + std::to_string(id) + "," : std::string("{");
+  };
+  auto send_error = [&](bool has, long long id, const std::string& e) {
+    std::string esc;
+    for (char ch : e) {
+      if (ch == '"' || ch == '\\') esc.push_back('\\');
+      if (static_cast<unsigned char>(ch) >= 0x20) esc.push_back(ch);
+    }
+    send(id_prefix(has, id) + "\"error\":\"" + esc + "\"}\n");
+  };
+  // Record what the session's KV holds after a job, exactly as the
+  // sequential loop did (see the comments there in history).
+  auto finish = [&](Job& j) {
+    const int picked = j.sess;
+    GpuSession& s = sessions[picked];
+    j.eagle.reset();  // its destructor trims the head to its true-feature rows
+    const bool ok = j.err.empty();
+    if (ok) {
+      std::string doc = generate_document(j.g.ids, j.g.drafted ? &j.g.report : nullptr);
+      send(id_prefix(j.has_id, j.id) + doc.substr(1));
+      auto& h = hist[picked];
+      h.assign(j.a.tokens.begin(), j.a.tokens.end());
+      for (std::int32_t t : j.g.ids) h.push_back(t);
+      // The watermark can overshoot the committed tokens (a decode chunk past
+      // the stop is discarded) or undershoot by one; positions
+      // [0, min(written, h.size())) hold the committed prefix's KV.
+      const int valid = std::min(s.written(), static_cast<int>(h.size()));
+      if (!s.truncate(valid) || valid > cli.max_context) {
+        h.clear();
+        s.truncate(0);
+        eagle_truncate(heads[picked], 0);
+        pool.drop(slot[picked]);
+      } else {
+        h.resize(static_cast<std::size_t>(valid));
+        eagle_truncate(heads[picked], std::min(eagle_written(heads[picked]), valid));
+        pool.trim(slot[picked], static_cast<std::size_t>(valid));
+      }
     } else {
-      const json::Value* toks = req.find("tokens");
-      if (toks != nullptr && toks->kind == json::Value::Kind::Array)
-        for (const auto& t : toks->arr)
-          a.tokens.push_back(t.kind == json::Value::Kind::Int
-                                 ? static_cast<std::int32_t>(t.int_value)
-                                 : -1);
-      a.max_tokens = static_cast<int>(req.get_int("max_tokens", 0));
-      a.seed = static_cast<long>(req.get_int("seed", 0));
-      a.draft_k = static_cast<int>(req.get_int("draft_lookup", 0));
-      a.eos = static_cast<long>(req.get_int("eos", -1));
-      a.eagle_k = static_cast<int>(req.get_int("eagle", 0));
-      // Delegate the session pick to the host-tested serve_decide: the
-      // session sharing the longest prefix with a.tokens (watermark ==
-      // history.size() required; a failed turn leaves the watermark stale
-      // and is treated as a miss). On a miss, an empty session or the
-      // round-robin pointer's, with a full re-prefill. EAGLE
-      // requests resume like any other: every session has its own head, and
-      // generate_eagle re-forwards only the few positions the head trails by.
-      std::vector<ServeSessionState> state(n_sessions);
-      for (int i = 0; i < n_sessions; ++i) {
-        state[i].history = hist[i];
-        state[i].watermark = sessions[i].written();
-      }
-      // Resume from the longest shared prefix (>= one 64-position page, so a
-      // shared system prompt alone never steals another conversation's
-      // session). Rows past the divergence are simply overwritten.
-      const ServeDecision dec = serve_decide(state, next, a.tokens, kPoolPage);
-      picked = dec.picked;
-      resume = dec.resume;
-      // G4_FORCE_REPREFILL: override the resume decision so this request
-      // full-prefills even when the session's cached prefix matches the
-      // prompt (resume == 0 truncates the watermark to 0 and forwards the
-      // whole prompt). An A/B switch for benchmarking the value of resume;
-      // the post-turn watermark/hist bookkeeping is identical either way.
-      if (std::getenv("G4_FORCE_REPREFILL") != nullptr) resume = 0;
-      next = dec.next;
-      err.clear();
-      GpuSession& s = sessions[picked];
-      if (std::getenv("G4_SERVE_DEBUG") != nullptr)
-        std::fprintf(stderr, "G4_SERVE session=%d resume=%d prompt=%ld wm=%d free_pages=%zu\n",
-                     picked, resume, static_cast<long>(a.tokens.size()), s.written(),
-                     pool.free_pages());
-      // The watermark before this turn. Used below to tell a check_request
-      // rejection (no GPU work ran, session untouched) apart from a
-      // mid-generation failure (a forward completed and the watermark
-      // advanced past hist, leaving the KV ahead of the recorded prefix).
-      const int wm_before = s.written();
-      bool ok = false;
-      // Validate first so a rejected request touches neither the pool nor the
-      // session; then reserve pool pages for everything this turn can write.
-      if (check_request(s, a, resume, &err)) {
-        const long need = static_cast<long>(a.tokens.size()) + a.max_tokens + a.draft_k +
-                          (a.eagle_k > 0 ? a.eagle_k + 1 : 0);
-        if (prepare(picked, need, &err)) {
-          last_used[picked] = ++tick;
-          // A turn that does not resume re-prefills from 0: the head's draft
-          // history no longer matches the session's KV.
-          if (resume == 0) {
-            eagle_truncate(heads[picked], 0);
-            policy[picked] = EaglePolicy{};  // a new conversation probes again
-          }
-          ok = gpu_generate(s, a, &g, &err, heads[picked], resume, &policy[picked]);
-        }
-      }
-      if (ok) reply = generate_document(g.ids, g.drafted ? &g.report : nullptr);
-      // On success, record what the session's KV actually holds so the next
-      // turn can resume from it. On failure, reset ONLY if the watermark
-      // actually moved: a check_request rejection (empty prompt,
-      // max_tokens <= 0, token out of range, context overflow) runs no GPU
-      // work, so the session is untouched and its cached conversation must
-      // be kept; a mid-generation failure advances the watermark past the
-      // recorded prefix, so the next request must re-prefill from scratch.
-      if (ok) {
-        auto& h = hist[picked];
-        h.assign(a.tokens.begin(), a.tokens.end());
-        for (std::int32_t t : g.ids) h.push_back(t);
-        // The committed length is a.tokens + g.ids, but the watermark does
-        // not always equal it: the greedy-EOS chunked path enqueues a full
-        // chunk past the stop and discards it (overshoot), and the
-        // sampled-EOS path commits the stop token without forwarding its KV
-        // (undershoot by one). The positions guaranteed to hold the
-        // committed prefix's KV are [0, min(written, h.size())). Clamp the
-        // watermark down to that and keep hist == the cached prefix, so the
-        // invariant serve_decide relies on (watermark == history.size())
-        // holds and a resume never reads past valid KV. truncate() only
-        // moves the watermark down; positions [0, valid) are untouched.
-        const int valid = std::min(s.written(), static_cast<int>(h.size()));
-        if (!s.truncate(valid)) {
-          // Should be unreachable (valid <= written <= max_pos), but if it
-          // happens the watermark is in an unknown state: reset so the next
-          // request re-prefills instead of resuming into bad KV.
-          h.clear();
-          s.truncate(0);
-          eagle_truncate(heads[picked], 0);
-          pool.drop(slot[picked]);
-        } else {
-          h.resize(static_cast<std::size_t>(valid));
-          if (valid > cli.max_context) {
-            // Over the context bound: the session's KV can't hold this
-            // conversation anymore. Reset so the next request starts
-            // fresh.
-            h.clear();
-            s.truncate(0);
-            eagle_truncate(heads[picked], 0);
-            pool.drop(slot[picked]);
-          } else {
-            // The head's entries are only meaningful inside the cached
-            // prefix; hand back the pool pages reserved past it so an idle
-            // conversation holds only what it has written.
-            eagle_truncate(heads[picked], std::min(eagle_written(heads[picked]), valid));
-            pool.trim(slot[picked], static_cast<std::size_t>(valid));
-          }
-        }
-      } else if (s.written() != wm_before) {
+      send_error(j.has_id, j.id, j.err);
+      if (s.written() != j.wm_before) {
         hist[picked].clear();
         s.truncate(0);
         eagle_truncate(heads[picked], 0);
         pool.drop(slot[picked]);
       }
     }
-    if (picked < 0) {
-      // Bad request: no session touched, round-robin pointer unchanged.
+    busy[picked] = false;
+    j.done = true;
+  };
+  // Plain greedy start: prefill (from the resume point) and the first token;
+  // afterwards d_tokens[written] holds the last emitted token.
+  auto start_plain = [&](Job& j) -> bool {
+    GpuSession& s = sessions[j.sess];
+    const int plen = static_cast<int>(j.a.tokens.size());
+    const int p = j.resume > 0 ? j.resume : 0;
+    std::vector<std::int32_t> first;
+    if (!s.truncate(p) || !s.upload(j.a.tokens, p, plen, &j.err) ||
+        !s.forward(plen, plen - 1, &j.err) || !s.argmax_to_token(plen, &j.err) ||
+        !s.tokens(plen, plen + 1, &first, &j.err))
+      return false;
+    j.g.ids.push_back(first[0]);
+    j.plain = true;
+    if (j.a.is_eos(first[0]) || static_cast<int>(j.g.ids.size()) >= j.a.max_tokens)
+      finish(j);
+    return true;
+  };
+  auto active_count = [&] {
+    int n = 0;
+    for (auto& j : jobs)
+      if (!j->done) ++n;
+    return n;
+  };
+  // Parse one request line and start it on an idle session. false = no
+  // idle session (the line stays queued).
+  auto admit = [&](const std::string& line) -> bool {
+    int idle = -1;
+    for (int i = 0; i < n_sessions; ++i)
+      if (!busy[i]) idle = i;
+    if (idle < 0) return false;
+    json::Value req;
+    std::string perr;
+    auto j = std::make_unique<Job>();
+    if (!json::parse(line.data(), line.size(), &req, &perr) ||
+        req.kind != json::Value::Kind::Object) {
+      send_error(false, 0, "bad request: " + perr);
+      return true;
     }
-    if (reply.empty() && !err.empty()) {
-      std::string esc;
-      for (char ch : err) {
-        if (ch == '"' || ch == '\\') esc.push_back('\\');
-        if (static_cast<unsigned char>(ch) >= 0x20) esc.push_back(ch);
+    if (req.find("id") != nullptr) {
+      j->has_id = true;
+      j->id = req.get_int("id", 0);
+    }
+    Args& a = j->a;
+    const json::Value* toks = req.find("tokens");
+    if (toks != nullptr && toks->kind == json::Value::Kind::Array)
+      for (const auto& t : toks->arr)
+        a.tokens.push_back(t.kind == json::Value::Kind::Int
+                               ? static_cast<std::int32_t>(t.int_value)
+                               : -1);
+    a.max_tokens = static_cast<int>(req.get_int("max_tokens", 0));
+    a.seed = static_cast<long>(req.get_int("seed", 0));
+    a.draft_k = static_cast<int>(req.get_int("draft_lookup", 0));
+    a.eos = static_cast<long>(req.get_int("eos", -1));
+    a.eagle_k = static_cast<int>(req.get_int("eagle", 0));
+    // Session pick among the idle sessions, starting at the round-robin
+    // pointer: the longest shared prefix (>= one page), else an empty one.
+    std::vector<int> order;
+    for (int k = 0; k < n_sessions; ++k) {
+      const int i = (next + k) % n_sessions;
+      if (!busy[i]) order.push_back(i);
+    }
+    std::vector<ServeSessionState> state(order.size());
+    for (std::size_t k = 0; k < order.size(); ++k) {
+      state[k].history = hist[order[k]];
+      state[k].watermark = sessions[order[k]].written();
+    }
+    const ServeDecision dec = serve_decide(state, 0, a.tokens, kPoolPage);
+    j->sess = order[static_cast<std::size_t>(dec.picked)];
+    j->resume = std::getenv("G4_FORCE_REPREFILL") != nullptr ? 0 : dec.resume;
+    next = (j->sess + 1) % n_sessions;
+    GpuSession& s = sessions[j->sess];
+    j->wm_before = s.written();
+    if (debug)
+      std::fprintf(stderr, "G4_SERVE id=%lld session=%d resume=%d prompt=%zu wm=%d "
+                   "free_pages=%zu active=%d\n", j->id, j->sess, j->resume, a.tokens.size(),
+                   s.written(), pool.free_pages(), active_count());
+    if (!check_request(s, a, j->resume, &j->err)) {
+      send_error(j->has_id, j->id, j->err);
+      return true;  // session untouched
+    }
+    // Pool pages for everything this job can write (+ one decode chunk of
+    // overshoot past the stop).
+    const long need = static_cast<long>(a.tokens.size()) + a.max_tokens + a.draft_k +
+                      (a.eagle_k > 0 ? a.eagle_k + 1 : 0) + 8;
+    if (!prepare(j->sess, std::min<long>(need, cli.max_context), &j->err)) {
+      send_error(j->has_id, j->id, j->err);
+      return true;
+    }
+    busy[j->sess] = true;
+    last_used[j->sess] = ++tick;
+    if (j->resume == 0) {
+      eagle_truncate(heads[j->sess], 0);
+      policy[j->sess] = EaglePolicy{};  // a new conversation probes again
+    }
+    Job& jr = *j;
+    jobs.push_back(std::move(j));
+    const bool others = active_count() > 1;
+    // Another job is running: EAGLE jobs give way to the batched plain decode.
+    if (others)
+      for (auto& o : jobs)
+        if (!o->done && o->eagle != nullptr) {
+          o->eagle->yield_plain();
+          o->plain = true;
+        }
+    const bool greedy = a.seed == 0 && a.draft_k == 0;
+    bool ok;
+    if (greedy && a.eagle_k > 0 && heads[jr.sess] != nullptr && !policy[jr.sess].off &&
+        !others) {
+      jr.eagle = std::make_unique<EagleRun>(s, heads[jr.sess], jr.a, &jr.g, &policy[jr.sess]);
+      bool done = false;
+      ok = jr.eagle->start(jr.resume, &done, &jr.err);
+      if (ok && done) finish(jr);
+    } else if (greedy) {
+      ok = start_plain(jr);
+    } else {
+      // Sampled / draft-lookup: monolithic on this session.
+      ok = gpu_generate(s, jr.a, &jr.g, &jr.err, nullptr, jr.resume);
+      if (ok) finish(jr);
+    }
+    if (!ok) {
+      if (jr.err.empty()) jr.err = "generation failed";
+      finish(jr);
+    }
+    return true;
+  };
+  std::deque<std::string> pending;
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lk(inq.m);
+      if (active_count() == 0 && pending.empty())
+        inq.cv.wait(lk, [&] { return !inq.q.empty() || inq.eof; });
+      while (!inq.q.empty()) {
+        pending.push_back(std::move(inq.q.front()));
+        inq.q.pop_front();
       }
-      reply = "{\"error\":\"" + esc + "\"}\n";
+      if (inq.eof && inq.q.empty() && pending.empty() && active_count() == 0) break;
     }
-    std::fwrite(reply.data(), 1, reply.size(), stdout);
-    std::fflush(stdout);
-    line.clear();
+    while (!pending.empty() && admit(pending.front())) pending.pop_front();
+    jobs.remove_if([](const std::unique_ptr<Job>& j) { return j->done; });
+    if (jobs.empty()) continue;
+    // EAGLE: only while its job is the only one.
+    for (auto& jp : jobs) {
+      Job& j = *jp;
+      if (j.done || j.eagle == nullptr || j.plain) continue;
+      if (active_count() > 1) {
+        j.eagle->yield_plain();
+        j.plain = true;
+        continue;
+      }
+      if (j.eagle->round(&j.err)) {
+        if (!j.err.empty() || j.eagle->done()) {
+          if (j.eagle) j.eagle->report_timing();
+          finish(j);
+        } else {
+          j.plain = true;  // drafting stopped paying: plain decode from here
+        }
+      }
+    }
+    // Plain jobs: one batched chunk for all of them.
+    std::vector<Job*> pj;
+    for (auto& jp : jobs)
+      if (!jp->done && jp->plain) pj.push_back(jp.get());
+    if (pj.empty()) continue;
+    int steps = 8;
+    for (Job* j : pj) {
+      GpuSession& s = sessions[j->sess];
+      steps = std::min({steps, s.mapped() - s.written(), s.max_pos() - 1 - s.written(),
+                        j->a.max_tokens - static_cast<int>(j->g.ids.size())});
+    }
+    if (steps < 1) {
+      // A job at the end of its rows (only reachable at the context bound).
+      for (Job* j : pj) finish(*j);
+      continue;
+    }
+    std::vector<int> pos(pj.size());
+    for (std::size_t i = 0; i < pj.size(); ++i) pos[i] = sessions[pj[i]->sess].written();
+    bool ok = true;
+    std::string e;
+    if (pj.size() == 1) {
+      ok = sessions[pj[0]->sess].decode_greedy(steps, &e);
+    } else {
+      std::vector<GpuCtx*> cs;
+      std::vector<std::int32_t*> ts;
+      for (Job* j : pj) {
+        cs.push_back(sessions[j->sess].ctx());
+        ts.push_back(sessions[j->sess].d_tokens());
+      }
+      char cerr[256] = "";
+      ok = gpu_decode_multi(cs.data(), ts.data(), static_cast<int>(pj.size()), steps,
+                            sessions[pj[0]->sess].logits_buffer(), cerr, sizeof cerr) == 0;
+      if (!ok) e = std::string("gpu_decode_multi: ") + cerr;
+    }
+    for (std::size_t i = 0; i < pj.size(); ++i) {
+      Job& j = *pj[i];
+      std::vector<std::int32_t> ids;
+      if (!ok || !sessions[j.sess].tokens(pos[i] + 1, pos[i] + 1 + steps, &ids, &e)) {
+        j.err = e.empty() ? "decode failed" : e;
+        finish(j);
+        continue;
+      }
+      for (std::int32_t t : ids) {
+        if (j.eagle != nullptr) {
+          if (j.eagle->emit(t)) {
+            j.eagle->report_timing();
+            finish(j);
+            break;
+          }
+        } else {
+          j.g.ids.push_back(t);
+          if (j.a.is_eos(t) || static_cast<int>(j.g.ids.size()) >= j.a.max_tokens) {
+            finish(j);
+            break;
+          }
+        }
+      }
+    }
   }
+  reader.join();
   return 0;
 }
 #endif  // GRANITE_CUDA

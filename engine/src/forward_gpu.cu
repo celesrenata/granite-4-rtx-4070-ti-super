@@ -269,6 +269,194 @@ __global__ void __launch_bounds__(kArgmaxThreads)
   }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-session decode (P4): one step decodes the next token of several
+// sessions that share the weights and one KV arena. Each row is its own
+// sequence: position, row table and token buffer come from a device
+// descriptor, so a captured graph replays the step and the positions advance
+// on the device. Every kernel below is the multi-row twin of the batched
+// verify kernel with the same per-element arithmetic, so each session's row
+// is bit-identical to that session decoding alone.
+// ---------------------------------------------------------------------------
+struct MultiRows {
+  int n;
+  int pos[kMaxVerifyRows];             // position of row r (the token at tok[r][pos])
+  const int* pt[kMaxVerifyRows];       // position -> arena row table of row r
+  std::int32_t* tok[kMaxVerifyRows];   // the session's token buffer
+};
+
+__global__ void embed_multi_kernel(const MultiRows* __restrict__ mr,
+                                   const std::uint16_t* emb, float mult, std::uint16_t* out,
+                                   int H) {
+  const int r = blockIdx.y;
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= H) return;
+  const std::int32_t tok = mr->tok[r][mr->pos[r]];
+  out[static_cast<std::size_t>(r) * H + j] =
+      f32_to_bf16(mult * bf16_to_f32(emb[static_cast<std::size_t>(tok) * H + j]));
+}
+
+// rope_at_pos_batched_kernel with row r at its own position.
+__global__ void rope_multi_kernel(const std::uint16_t* x, const float* cos_tbl,
+                                  const float* sin_tbl, const MultiRows* __restrict__ mr,
+                                  int rows, int heads, int d, std::uint16_t* out) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= rows * heads * d) return;
+  const int row = idx / (heads * d);
+  const int local = idx % (heads * d);
+  const int h = local / d;
+  const int col = local % d;
+  const int half = d / 2;
+  const int i = col < half ? col : col - half;
+  const std::size_t t = static_cast<std::size_t>(mr->pos[row]) * half + i;
+  const float c = cos_tbl[t];
+  const float s = sin_tbl[t];
+  const std::size_t base =
+      static_cast<std::size_t>(row) * heads * d + static_cast<std::size_t>(h) * d;
+  float y;
+  if (col < half) {
+    const float a = bf16_to_f32(x[base + col]);
+    const float b = bf16_to_f32(x[base + col + half]);
+    y = a * c - b * s;
+  } else {
+    const float a = bf16_to_f32(x[base + col]);
+    const float b = bf16_to_f32(x[base + col - half]);
+    y = a * c + b * s;
+  }
+  out[idx] = f32_to_bf16(y);
+}
+
+// kv_append_batched_kernel (bf16) with per-row position / table.
+__global__ void kv_append_multi_kernel(const std::uint16_t* src_k, const std::uint16_t* src_v,
+                                       std::uint16_t* cache_k, std::uint16_t* cache_v,
+                                       const MultiRows* __restrict__ mr, int rows, int stride,
+                                       int Hk, int d) {
+  const int r = blockIdx.y;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows || idx >= Hk * d) return;
+  const int hkv = idx / d;
+  const int i = idx % d;
+  const int row = mr->pt[r][mr->pos[r]];
+  const std::size_t cache_row = static_cast<std::size_t>(hkv) * stride * d;
+  const std::size_t src_off =
+      static_cast<std::size_t>(r) * Hk * d + static_cast<std::size_t>(idx);
+  cache_k[cache_row + static_cast<std::size_t>(row) * d + i] = src_k[src_off];
+  cache_v[cache_row + static_cast<std::size_t>(row) * d + i] = src_v[src_off];
+}
+
+// kv_append_int8_batched_kernel with per-row position / table.
+__global__ void kv_append_int8_multi_kernel(
+    const std::uint16_t* __restrict__ src_k, const std::uint16_t* __restrict__ src_v,
+    std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
+    float* __restrict__ cache_k_scale, float* __restrict__ cache_v_scale,
+    const MultiRows* __restrict__ mr, int stride, int Hk, int d) {
+  const int hkv = blockIdx.x;
+  const int r = blockIdx.y;
+  const int i = threadIdx.x;  // blockDim.x == d
+  const int row = mr->pt[r][mr->pos[r]];
+  const std::size_t src = (static_cast<std::size_t>(r) * Hk + hkv) * d + i;
+  const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + row) * d + i;
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + row;
+  const float x = bf16_to_f32(src_k[src]);
+  const float y = bf16_to_f32(src_v[src]);
+  __shared__ float smax[2];
+  const int lane = i & 31;
+  float ax = fabsf(x), ay = fabsf(y);
+  for (int off = 16; off > 0; off >>= 1) {
+    ax = fmaxf(ax, __shfl_down_sync(0xffffffffu, ax, off));
+    ay = fmaxf(ay, __shfl_down_sync(0xffffffffu, ay, off));
+  }
+  __shared__ float wmax[2][32];
+  if (lane == 0) {
+    wmax[0][i >> 5] = ax;
+    wmax[1][i >> 5] = ay;
+  }
+  __syncthreads();
+  float mk = 0.0f, mv = 0.0f;
+  for (int w = 0; w < (d + 31) >> 5; ++w) {
+    mk = fmaxf(mk, wmax[0][w]);
+    mv = fmaxf(mv, wmax[1][w]);
+  }
+  if (i == 0) {
+    const float sk = dev::kv8_scale(mk);
+    const float sv = dev::kv8_scale(mv);
+    smax[0] = sk;
+    smax[1] = sv;
+    cache_k_scale[sc] = sk;
+    cache_v_scale[sc] = sv;
+  }
+  __syncthreads();
+  cache_k[cache] = dev::kv8_quant(x, smax[0]);
+  cache_v[cache] = dev::kv8_quant(y, smax[1]);
+}
+
+// kv_append_int4_batched_kernel with per-row position / table.
+__global__ void kv_append_int4_multi_kernel(
+    const std::uint16_t* __restrict__ src_k, const std::uint16_t* __restrict__ src_v,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    float* __restrict__ cache_k_scale, float* __restrict__ cache_v_scale,
+    const MultiRows* __restrict__ mr, int stride, int Hk, int d) {
+  const int hkv = blockIdx.x;
+  const int r = blockIdx.y;
+  const int w = threadIdx.x;  // blockDim.x == d/2
+  const int row = mr->pt[r][mr->pos[r]];
+  const int d0 = 2 * w;
+  const int d1 = d0 + 1;
+  const std::size_t src0 = (static_cast<std::size_t>(r) * Hk + hkv) * d + d0;
+  const std::size_t src1 = (static_cast<std::size_t>(r) * Hk + hkv) * d + d1;
+  const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + row) * (d / 2) + w;
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + row;
+  const float x0 = bf16_to_f32(src_k[src0]);
+  const float x1 = bf16_to_f32(src_k[src1]);
+  const float y0 = bf16_to_f32(src_v[src0]);
+  const float y1 = bf16_to_f32(src_v[src1]);
+  __shared__ float smax[2];
+  const int lane = w & 31;
+  float ax = fmaxf(fabsf(x0), fabsf(x1));
+  float ay = fmaxf(fabsf(y0), fabsf(y1));
+  for (int off = 16; off > 0; off >>= 1) {
+    ax = fmaxf(ax, __shfl_down_sync(0xffffffffu, ax, off));
+    ay = fmaxf(ay, __shfl_down_sync(0xffffffffu, ay, off));
+  }
+  __shared__ float wmax[2][32];
+  if (lane == 0) {
+    wmax[0][w >> 5] = ax;
+    wmax[1][w >> 5] = ay;
+  }
+  __syncthreads();
+  float mk = 0.0f, mv = 0.0f;
+  for (int wp = 0; wp < ((d / 2) + 31) >> 5; ++wp) {
+    mk = fmaxf(mk, wmax[0][wp]);
+    mv = fmaxf(mv, wmax[1][wp]);
+  }
+  if (w == 0) {
+    const float sk = dev::q4_scale(mk);
+    const float sv = dev::q4_scale(mv);
+    smax[0] = sk;
+    smax[1] = sv;
+    cache_k_scale[sc] = sk;
+    cache_v_scale[sc] = sv;
+  }
+  __syncthreads();
+  const unsigned char ck =
+      static_cast<unsigned char>((dev::q4_quant(x0, smax[0]) & 0x0fu) |
+                                 (dev::q4_quant(x1, smax[0]) << 4));
+  const unsigned char cv =
+      static_cast<unsigned char>((dev::q4_quant(y0, smax[1]) & 0x0fu) |
+                                 (dev::q4_quant(y1, smax[1]) << 4));
+  cache_k[cache] = ck;
+  cache_v[cache] = cv;
+}
+
+// Row r's greedy id becomes its session's next token; positions advance.
+__global__ void multi_scatter_advance_kernel(MultiRows* mr, const std::int32_t* ids) {
+  const int r = threadIdx.x;
+  if (r >= mr->n) return;
+  const int p = mr->pos[r];
+  mr->tok[r][p + 1] = ids[r];
+  mr->pos[r] = p + 1;
+}
+
 __global__ void kv_append_compact_kernel(const std::uint16_t* src_k,
                                          const std::uint16_t* src_v,
                                          std::uint16_t* cache_k,
@@ -853,6 +1041,11 @@ struct GpuCtx {
   // forwarded. max_pos for the identity layout; set by gpu_ctx_set_kv_rows_n.
   int mapped = 0;
   GpuKvArena* kv_arena = nullptr;  // non-null: kv_* alias the arena (not owned)
+  // Multi-session decode (gpu_decode_multi), owned by the step's lead context.
+  MultiRows* d_multi = nullptr;      // device descriptor
+  std::int32_t* d_multi_ids = nullptr;
+  cudaGraphExec_t multi_graph = nullptr;
+  std::vector<const void*> multi_key;  // what multi_graph was captured with
   // Non-null: the prefill scratch is borrowed from this context (sessions
   // that run one at a time share one ~0.8 GiB scratch).
   GpuCtx* prefill_owner = nullptr;
@@ -1189,6 +1382,9 @@ void gpu_ctx_free(GpuCtx* ctx) {
   cudaFree(ctx->d_pt);
   cudaFree(ctx->attn_scratch);
   if (ctx->prefill_owner == nullptr) cudaFree(ctx->prefill);
+  cudaFree(ctx->d_multi);
+  cudaFree(ctx->d_multi_ids);
+  if (ctx->multi_graph != nullptr) cudaGraphExecDestroy(ctx->multi_graph);
   if (ctx->decode_graph != nullptr) cudaGraphExecDestroy(ctx->decode_graph);
   cudaFree(ctx->cos_tbl);
   cudaFree(ctx->sin_tbl);
@@ -1792,6 +1988,95 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
   return 0;
 }
 
+// One multi-session decode step (see MultiRows): n rows, row r = session r's
+// next position. Weights and KV arena come from g (all sessions share them);
+// scratch_batched / attn_scratch are g's. Logits land in d_logits [n][V], the
+// greedy ids in d_ids, then each session's token and position advance.
+int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logits,
+                       std::int32_t* d_ids) {
+  const int rows = n;
+  const int L = g->L, H = g->H, I = g->I, Hq = g->Hq, Hk = g->Hk, d = g->d, V = g->V;
+  const float rms_eps = g->spec.rms_norm_eps;
+  const float resid_scale = g->spec.residual_multiplier;
+  const HeadView hv = head_view(g);
+  const std::size_t nq = static_cast<std::size_t>(Hq) * d;
+  const std::size_t nk = static_cast<std::size_t>(Hk) * d;
+  std::uint16_t* const d_hidden = g->scratch_batched;  // [rows][H]
+  std::uint16_t* const d_normed = d_hidden + rows * H;
+  std::uint16_t* const d_normed2 = d_normed + rows * H;
+  std::uint16_t* const d_qf = d_normed2 + rows * H;
+  std::uint16_t* const d_k_new = d_qf + rows * nq;
+  std::uint16_t* const d_v_new = d_k_new + rows * nk;
+  std::uint16_t* const d_qf_rot = d_v_new + rows * nk;
+  std::uint16_t* const d_k_new_rot = d_qf_rot + rows * nq;
+  std::uint16_t* const d_attn_out = d_k_new_rot + rows * nk;
+  std::uint16_t* const d_gate_out = d_attn_out + rows * nq;
+  const int* const row_pos = d_mr->pos;  // device addresses inside the descriptor
+  const int* const* const row_pt = d_mr->pt;
+
+  embed_multi_kernel<<<dim3((H + 255) / 256, rows), 256>>>(d_mr, hv.embed,
+                                                           g->spec.embedding_multiplier,
+                                                           d_hidden, H);
+  G4_CUDA_CHECK(cudaGetLastError());
+  for (int layer = 0; layer < L; ++layer) {
+    const LayerView lw = layer_view(g, layer);
+    if (granite4_kernel_rmsnorm_batched(d_hidden, lw.attn_norm, rms_eps, rows, H,
+                                        d_normed) != 0 ||
+        granite4_verify_qkv(d_normed, lw.wq, lw.wk, lw.wv, lw.sc[0], lw.sc[1], lw.sc[2],
+                            rows, Hq * d, Hk * d, Hk * d, H, d_qf, d_k_new, d_v_new) != 0)
+      return -1;
+    rope_multi_kernel<<<static_cast<unsigned>((rows * nq + 255) / 256), 256>>>(
+        d_qf, g->cos_tbl, g->sin_tbl, d_mr, rows, Hq, d, d_qf_rot);
+    rope_multi_kernel<<<static_cast<unsigned>((rows * nk + 255) / 256), 256>>>(
+        d_k_new, g->cos_tbl, g->sin_tbl, d_mr, rows, Hk, d, d_k_new_rot);
+    G4_CUDA_CHECK(cudaGetLastError());
+    int rc;
+    if (g->kv4) {
+      kv_append_int4_multi_kernel<<<dim3(Hk, rows), d / 2>>>(
+          d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale, d_mr,
+          g->kv_stride, Hk, d);
+      rc = attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d, 0,
+                      nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, nullptr,
+                      nullptr, lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
+                      true, nullptr, g->max_pos, row_pos, row_pt);
+    } else if (g->kv8) {
+      kv_append_int8_multi_kernel<<<dim3(Hk, rows), d>>>(
+          d_k_new_rot, d_v_new, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, d_mr,
+          g->kv_stride, Hk, d);
+      rc = attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d, 0,
+                      nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, lw.kv8_k,
+                      lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, true, nullptr, nullptr, false,
+                      nullptr, g->max_pos, row_pos, row_pt);
+    } else {
+      kv_append_multi_kernel<<<dim3((Hk * d + 255) / 256, rows), 256>>>(
+          d_k_new_rot, d_v_new, lw.kv_k, lw.kv_v, d_mr, rows, g->kv_stride, Hk, d);
+      rc = attn_split(d_qf_rot, lw.kv_k, lw.kv_v, g->spec.attention_multiplier, Hq, Hk, d, 0,
+                      nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, nullptr,
+                      nullptr, nullptr, nullptr, false, nullptr, nullptr, false, nullptr,
+                      g->max_pos, row_pos, row_pt);
+    }
+    G4_CUDA_CHECK(cudaGetLastError());
+    if (rc != 0 ||
+        granite4_verify_gemv_resid(d_attn_out, lw.wo, lw.sc[3], d_hidden, resid_scale, rows,
+                                   H, H, d_hidden) != 0 ||
+        granite4_kernel_rmsnorm_batched(d_hidden, lw.ffn_norm, rms_eps, rows, H,
+                                        d_normed2) != 0 ||
+        granite4_verify_silu(lw.wg, lw.wu, d_normed2, lw.sc[4], lw.sc[5], I, H, rows,
+                             d_gate_out) != 0 ||
+        granite4_verify_gemv_resid(d_gate_out, lw.wd, lw.sc[6], d_hidden, resid_scale, rows,
+                                   H, I, d_hidden) != 0)
+      return -1;
+  }
+  if (granite4_kernel_rmsnorm_batched(d_hidden, hv.final_norm, rms_eps, rows, H, d_normed) !=
+          0 ||
+      granite4_verify_gemv(d_normed, hv.lm_head, hv.lm_scale, rows, V, H, d_logits) != 0)
+    return -1;
+  argmax_rows_kernel<<<rows, kArgmaxThreads>>>(d_logits, V, d_ids, nullptr);
+  multi_scatter_advance_kernel<<<1, 32>>>(d_mr, d_ids);
+  G4_CUDA_CHECK(cudaGetLastError());
+  return 0;
+}
+
 int emit_rows(const GpuForwardOut& out, int first, int end, const std::uint16_t* normed,
               int H, int V, const std::uint8_t* lm_head, float lm_scale) {
   const RowOut ro = row_out(out, std::max(first, hidden_from(out)), V, H);
@@ -2338,6 +2623,80 @@ int gpu_decode_greedy(GpuCtx* ctx, std::int32_t* d_tokens, int steps,
   return 0;
 }
 
+int gpu_decode_multi(GpuCtx* const* ctxs, std::int32_t* const* d_tokens, int n, int steps,
+                     std::uint16_t* d_logits, char* error, std::size_t error_size) {
+  auto seterr = [&](const char* what) {
+    if (error != nullptr && error_size > 0) std::snprintf(error, error_size, "%s", what);
+    return -1;
+  };
+  if (ctxs == nullptr || d_tokens == nullptr || d_logits == nullptr || n < 1 ||
+      n > kMaxVerifyRows || steps <= 0)
+    return seterr("invalid multi-decode arguments");
+  GpuCtx* const g = ctxs[0];
+  for (int i = 0; i < n; ++i) {
+    const GpuCtx* c = ctxs[i];
+    if (c == nullptr || d_tokens[i] == nullptr || c->weights == nullptr ||
+        c->weights != g->weights || c->max_pos != g->max_pos || c->kv8 != g->kv8 ||
+        c->kv4 != g->kv4 || !c->split_attn || c->written <= 0 ||
+        c->written > c->max_pos - 1 - steps || c->written + steps > c->mapped)
+      return seterr("multi-decode: a session is not ready (weights, format, or rows)");
+    if (n > 1 && (c->kv_arena == nullptr || c->kv_arena != g->kv_arena))
+      return seterr("multi-decode: sessions must share one KV arena");
+    for (int j = 0; j < i; ++j)
+      if (ctxs[j] == c) return seterr("multi-decode: a session appears twice");
+  }
+  if (g->d_multi == nullptr) {
+    if (cudaMalloc(&g->d_multi, sizeof(MultiRows)) != cudaSuccess ||
+        cudaMalloc(&g->d_multi_ids, sizeof(std::int32_t) * kMaxVerifyRows) != cudaSuccess)
+      return seterr("multi-decode: cudaMalloc failed");
+  }
+  MultiRows h{};
+  h.n = n;
+  std::vector<const void*> key{d_logits};
+  for (int i = 0; i < n; ++i) {
+    h.pos[i] = ctxs[i]->written;
+    h.pt[i] = ctxs[i]->d_pt;
+    h.tok[i] = d_tokens[i];
+    key.push_back(ctxs[i]);
+    key.push_back(d_tokens[i]);
+  }
+  if (cudaMemcpyAsync(g->d_multi, &h, sizeof h, cudaMemcpyHostToDevice, cudaStreamPerThread) !=
+      cudaSuccess)
+    return seterr("multi-decode: descriptor upload failed");
+  // The step reads everything that changes (positions) from the descriptor,
+  // so one captured graph per (sessions, buffers) replays every step.
+  if (g->multi_graph != nullptr && g->multi_key != key) {
+    cudaGraphExecDestroy(g->multi_graph);
+    g->multi_graph = nullptr;
+  }
+  bool graph = env_enabled("G4_GRAPH");
+  if (graph && g->multi_graph == nullptr) {
+    cudaGraph_t cg = nullptr;
+    if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) !=
+        cudaSuccess) {
+      graph = false;
+    } else {
+      const int rc = forward_multi_step(g, g->d_multi, n, d_logits, g->d_multi_ids);
+      if (cudaStreamEndCapture(cudaStreamPerThread, &cg) != cudaSuccess || rc != 0 ||
+          cudaGraphInstantiate(&g->multi_graph, cg, 0) != cudaSuccess) {
+        g->multi_graph = nullptr;
+        graph = false;
+      }
+      if (cg != nullptr) cudaGraphDestroy(cg);
+      cudaGetLastError();
+      g->multi_key = key;
+    }
+  }
+  for (int s = 0; s < steps; ++s) {
+    const int rc = graph ? (cudaGraphLaunch(g->multi_graph, cudaStreamPerThread) == cudaSuccess
+                                ? 0
+                                : -1)
+                         : forward_multi_step(g, g->d_multi, n, d_logits, g->d_multi_ids);
+    if (rc != 0) return seterr("multi-decode step failed");
+  }
+  for (int i = 0; i < n; ++i) ctxs[i]->written += steps;
+  return 0;
+}
 int gpu_ctx_written(GpuCtx* ctx) { return ctx != nullptr ? ctx->written : -1; }
 
 int gpu_ctx_shared_weights(GpuCtx* ctx, const std::uint16_t** d_embed,
