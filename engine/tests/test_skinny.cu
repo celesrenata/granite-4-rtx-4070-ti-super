@@ -208,6 +208,16 @@ void test_modes() {
   cudaFree(ov);
 }
 
+// Evicts L2 by reading (not writing) a buffer much larger than it: a
+// memset flush leaves dirty lines whose write-back would bill the timed
+// kernel for extra DRAM traffic.
+__global__ void read_flush(const uint4* p, std::size_t n, unsigned* sink) {
+  unsigned acc = 0;
+  for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+    acc ^= p[i].x ^ p[i].w;
+  if (acc == 0x9e3779b9u) *sink = acc;  // keep the loads
+}
 // One decoder layer's GEMMs at Granite 4.2 8B shapes + lm_head, per T.
 void bench() {
   const int H = 4096, I = 12800, KV = 1024, V = 100352;
@@ -215,6 +225,12 @@ void bench() {
   float* flush;
   const std::size_t fl = 256u << 20;
   CK(cudaMalloc(&flush, fl));
+  CK(cudaMemset(flush, 1, fl));
+  unsigned* sink;
+  CK(cudaMalloc(&sink, 4));
+  auto evict = [&]() {
+    read_flush<<<264, 512>>>(reinterpret_cast<const uint4*>(flush), fl / 16, sink);
+  };
   std::uint16_t* out;
   CK(cudaMalloc(&out, static_cast<std::size_t>(16) * V * 2));
   cudaEvent_t e0, e1;
@@ -227,7 +243,7 @@ void bench() {
     float total = 0;
     const double bytes = 2.0 * H * H + 2.0 * KV * H + 3.0 * I * H;
     for (int rep = 0; rep < 3; ++rep) {
-      CK(cudaMemset(flush, rep, fl));
+      evict();
       cudaEventRecord(e0);
       // Fused Q|K|V, as the forward runs it.
       granite4_verify_qkv(a.d, q.d, k.d, v.d, 1.0f, 1.0f, 1.0f, T, H, KV, KV, H, out,
@@ -248,7 +264,7 @@ void bench() {
       auto one = [&](const char* name, double mb, auto&& fn) {
         float best = 1e9f;
         for (int rep = 0; rep < 3; ++rep) {
-          CK(cudaMemset(flush, rep, fl));
+          evict();
           cudaEventRecord(e0);
           fn();
           cudaEventRecord(e1);
@@ -270,7 +286,7 @@ void bench() {
           [&] { granite4_verify_silu(g.d, u.d, a.d, 1.0f, 1.0f, I, H, T, out); });
       one("down", 1.0 * I * H / 1e6, [&] { granite4_verify_gemv(a.d, dn.d, 1.0f, T, H, I, out); });
     }
-    CK(cudaMemset(flush, 7, fl));
+    evict();
     cudaEventRecord(e0);
     granite4_verify_gemv(a.d, lm.d, 1.0f, T, V, H, out);
     cudaEventRecord(e1);

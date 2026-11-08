@@ -282,6 +282,11 @@ using MultiRows = GpuMultiRows;  // forward_gpu_api.h
 // Multi-session verify groups a session's rows in attention from this
 // position on (attention_split.cu kShortCtx: below it one row per block).
 constexpr int kMultiGroupMinCtx = 1024;
+// Attention launch bound for a verify step, rounded up to 1K positions so one
+// captured verify graph covers a whole bucket (attn_split kv_hint).
+int kv_bucket(int len) { return (len + 1023) / 1024 * 1024; }
+// Decode graphs: 2K buckets (re-captured when a session crosses one).
+int decode_bucket(int len) { return (len + 2047) / 2048 * 2048; }
 static_assert(kMaxTreeDepth == kAttnTailStride, "tree tail layout");
 // Token index / KV write position of multi row r (tree rows: their slot).
 __device__ __forceinline__ int multi_slot(const MultiRows* mr, int r) {
@@ -1045,12 +1050,29 @@ struct GpuCtx {
   int mapped = 0;
   // Host mirror of d_pt[0, mapped) (gpu_ctx_kv_move); empty = identity.
   std::vector<int> h_pt;
+  // Attention launch bound of the single-position step (attn_split kv_hint;
+  // 0 = all splits). Baked into the decode graph: graph_kv_hint is the value
+  // it was captured with.
+  int decode_kv_hint = 0;
+  int graph_kv_hint = -1;
   GpuKvArena* kv_arena = nullptr;  // non-null: kv_* alias the arena (not owned)
   // Multi-session decode (gpu_decode_multi), owned by the step's lead context.
   MultiRows* d_multi = nullptr;      // device descriptor
   std::int32_t* d_multi_ids = nullptr;
   cudaGraphExec_t multi_graph = nullptr;
   std::vector<const void*> multi_key;  // what multi_graph was captured with
+  // Verify-step graphs (gpu_forward_multi / gpu_forward_tree): one per
+  // (rows, attention groups, tree, output buffers); the rows themselves are
+  // read from d_multi, uploaded before every replay. exec == null: capture
+  // failed for that key, run uncaptured.
+  struct VerifyGraph {
+    int n, ngroups;
+    bool tree;
+    int kv_hint;
+    const void *logits, *argmax, *hidden;
+    cudaGraphExec_t exec;
+  };
+  std::vector<VerifyGraph> verify_graphs;
   // Non-null: the prefill scratch is borrowed from this context (sessions
   // that run one at a time share one ~0.8 GiB scratch).
   GpuCtx* prefill_owner = nullptr;
@@ -1390,6 +1412,8 @@ void gpu_ctx_free(GpuCtx* ctx) {
   cudaFree(ctx->d_multi);
   cudaFree(ctx->d_multi_ids);
   if (ctx->multi_graph != nullptr) cudaGraphExecDestroy(ctx->multi_graph);
+  for (auto& vg : ctx->verify_graphs)
+    if (vg.exec != nullptr) cudaGraphExecDestroy(vg.exec);
   if (ctx->decode_graph != nullptr) cudaGraphExecDestroy(ctx->decode_graph);
   cudaFree(ctx->cos_tbl);
   cudaFree(ctx->sin_tbl);
@@ -1777,7 +1801,8 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
       if (attn_split(d_qf_rot, nullptr, nullptr, att_scale, Hq, Hk, d, 0, g->d_pos, 1,
                      kv_stride, g->attn_scratch, d_attn_out, nullptr, nullptr,
                      lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
-                     true, g->d_pt, max_pos) != 0)
+                     true, g->d_pt, max_pos, nullptr, nullptr, nullptr, 0, nullptr, nullptr,
+                     g->decode_kv_hint) != 0)
         return -1;
     } else if (g->kv8) {
       // KV8: the persistent cache is int8, so only the split-KV attention
@@ -1787,12 +1812,14 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
       if (attn_split(d_qf_rot, nullptr, nullptr, att_scale, Hq, Hk, d, 0, g->d_pos, 1,
                      kv_stride, g->attn_scratch, d_attn_out, lw.kv8_k, lw.kv8_v,
                      lw.kv8_k_scale, lw.kv8_v_scale, true, nullptr, nullptr,
-                     false, g->d_pt, max_pos) != 0)
+                     false, g->d_pt, max_pos, nullptr, nullptr, nullptr, 0, nullptr, nullptr,
+                     g->decode_kv_hint) != 0)
         return -1;
     } else if (direct && g->split_attn) {
       if (attn_split(d_qf_rot, lw.kv_k, lw.kv_v, att_scale, Hq, Hk, d, 0, g->d_pos, 1,
                      kv_stride, g->attn_scratch, d_attn_out, nullptr, nullptr,
-                     nullptr, nullptr, false, nullptr, nullptr, false, g->d_pt, max_pos) != 0)
+                     nullptr, nullptr, false, nullptr, nullptr, false, g->d_pt, max_pos,
+                     nullptr, nullptr, nullptr, 0, nullptr, nullptr, g->decode_kv_hint) != 0)
         return -1;
     } else if (direct) {
       // kv_len = *d_pos + 1 on the device; max_pos bounds the shared memory.
@@ -1902,6 +1929,7 @@ int forward_positions(GpuCtx* g, const std::int32_t* d_tokens, int start, int en
     set_pos_kernel<<<1, 1>>>(g->d_pos, t);
     G4_CUDA_CHECK(cudaGetLastError());
     const RowOut ro = row_out(out, t, g->V, g->H);
+    g->decode_kv_hint = t + 1;
     if (forward_position(g, d_tokens, t, ro.logits, ro.argmax, nullptr,
                          bucketed ? &probe : nullptr, ro.hidden) != 0)
       return -1;
@@ -1970,7 +1998,8 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
           attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d,
                      start, nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out,
                      nullptr, nullptr, lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k,
-                     lw.kv4_v, true, g->d_pt, g->max_pos) != 0)
+                     lw.kv4_v, true, g->d_pt, g->max_pos, nullptr, nullptr, nullptr, 0,
+                     nullptr, nullptr, end) != 0)
         return -1;
     } else if (g->kv8) {
       // KV8: rotate Q/K (the bf16 stage's RoPE), append the verify rows to the
@@ -1992,7 +2021,8 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
           attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d,
                      start, nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, lw.kv8_k,
                      lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, true, nullptr, nullptr,
-                     false, g->d_pt, g->max_pos) != 0)
+                     false, g->d_pt, g->max_pos, nullptr, nullptr, nullptr, 0, nullptr,
+                     nullptr, end) != 0)
         return -1;
     } else if (granite4_kernel_verify_qkv_stage(
                    d_qf, d_k_new, d_v_new,
@@ -2003,7 +2033,8 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
                     ? attn_split(d_qf_rot, lw.kv_k, lw.kv_v, g->spec.attention_multiplier, Hq,
                                  Hk, d, start, nullptr, rows, g->kv_stride, g->attn_scratch,
                                  d_attn_out, nullptr, nullptr, nullptr, nullptr, false,
-                                  nullptr, nullptr, false, g->d_pt, g->max_pos)
+                                  nullptr, nullptr, false, g->d_pt, g->max_pos, nullptr,
+                                  nullptr, nullptr, 0, nullptr, nullptr, end)
                     : granite4_kernel_gqa_fused_batched(d_qf_rot, lw.kv_k, lw.kv_v,
                                                         g->spec.attention_multiplier, Hq, Hk, d,
                                                         start, rows, g->kv_stride,
@@ -2034,13 +2065,59 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
   return 0;
 }
 
+// G4_MULTI_PROFILE=1: per-phase GPU time of forward_multi_step (events at
+// phase boundaries; a mark closes the segment since the previous mark).
+struct MultiProfile {
+  enum { kNorm, kGemm, kRope, kAttn, kLm, kOther, kN };
+  static bool enabled() {
+    static const bool on = [] {
+      const char* e = std::getenv("G4_MULTI_PROFILE");
+      return e != nullptr && e[0] == '1';
+    }();
+    return on;
+  }
+  bool on = enabled();
+  std::vector<cudaEvent_t> ev;
+  std::vector<int> cat;
+  void mark(int c) {
+    if (!on) return;
+    cudaEvent_t e;
+    cudaEventCreate(&e);
+    cudaEventRecord(e, cudaStreamPerThread);
+    ev.push_back(e);
+    cat.push_back(c);
+  }
+  void finish(int rows) {
+    if (!on || ev.empty()) return;
+    static double tot[kN] = {};
+    static long calls = 0, rowsum = 0;
+    cudaEventSynchronize(ev.back());
+    for (std::size_t i = 1; i < ev.size(); ++i) {
+      float ms = 0;
+      cudaEventElapsedTime(&ms, ev[i - 1], ev[i]);
+      tot[cat[i]] += ms;
+    }
+    for (cudaEvent_t e : ev) cudaEventDestroy(e);
+    ++calls;
+    rowsum += rows;
+    if (calls % 64 == 0) {
+      const double c = static_cast<double>(calls);
+      std::fprintf(stderr, "G4_MULTI_PROFILE calls=%ld rows=%.1f norm=%.3f gemm=%.3f rope=%.3f "
+                   "attn=%.3f lm+tail=%.3f other=%.3f ms/call\n", calls, rowsum / c,
+                   tot[kNorm] / c, tot[kGemm] / c, tot[kRope] / c, tot[kAttn] / c, tot[kLm] / c,
+                   tot[kOther] / c);
+    }
+  }
+};
+
 // One multi-session decode step (see MultiRows): n rows, row r = session r's
 // next position. Weights and KV arena come from g (all sessions share them);
 // scratch_batched / attn_scratch are g's. Logits land in d_logits [n][V], the
 // greedy ids in d_ids, then each session's token and position advance.
 int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logits,
                        std::int32_t* d_ids, std::uint16_t* d_hidden_out = nullptr,
-                       bool advance = true, int ngroups = 0, bool tree = false) {
+                       bool advance = true, int ngroups = 0, bool tree = false,
+                       int kv_hint = 0) {
   const int rows = n;
   const int L = g->L, H = g->H, I = g->I, Hq = g->Hq, Hk = g->Hk, d = g->d, V = g->V;
   const float rms_eps = g->spec.rms_norm_eps;
@@ -2064,22 +2141,31 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
   const int* const row_tbase = tree ? d_mr->tbase : nullptr;
   const int* const row_tail = tree ? &d_mr->tail[0][0] : nullptr;
 
+  // G4_MULTI_PROFILE=1: events between the phases of every call (graph
+  // replays bypassed), per-call averages printed every 64 calls.
+  MultiProfile prof;
+  prof.mark(-1);
   embed_multi_kernel<<<dim3((H + 255) / 256, rows), 256>>>(d_mr, hv.embed,
                                                            g->spec.embedding_multiplier,
                                                            d_hidden, H);
   G4_CUDA_CHECK(cudaGetLastError());
+  prof.mark(MultiProfile::kOther);
   for (int layer = 0; layer < L; ++layer) {
     const LayerView lw = layer_view(g, layer);
     if (granite4_kernel_rmsnorm_batched(d_hidden, lw.attn_norm, rms_eps, rows, H,
-                                        d_normed) != 0 ||
-        granite4_verify_qkv(d_normed, lw.wq, lw.wk, lw.wv, lw.sc[0], lw.sc[1], lw.sc[2],
+                                        d_normed) != 0)
+      return -1;
+    prof.mark(MultiProfile::kNorm);
+    if (granite4_verify_qkv(d_normed, lw.wq, lw.wk, lw.wv, lw.sc[0], lw.sc[1], lw.sc[2],
                             rows, Hq * d, Hk * d, Hk * d, H, d_qf, d_k_new, d_v_new) != 0)
       return -1;
+    prof.mark(MultiProfile::kGemm);
     rope_multi_kernel<<<static_cast<unsigned>((rows * nq + 255) / 256), 256>>>(
         d_qf, g->cos_tbl, g->sin_tbl, d_mr, rows, Hq, d, d_qf_rot);
     rope_multi_kernel<<<static_cast<unsigned>((rows * nk + 255) / 256), 256>>>(
         d_k_new, g->cos_tbl, g->sin_tbl, d_mr, rows, Hk, d, d_k_new_rot);
     G4_CUDA_CHECK(cudaGetLastError());
+    prof.mark(MultiProfile::kRope);
     int rc;
     if (g->kv4) {
       kv_append_int4_multi_kernel<<<dim3(Hk, rows), d / 2>>>(
@@ -2089,7 +2175,7 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
                       nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, nullptr,
                       nullptr, lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
                       true, nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups, row_tbase,
-                      row_tail);
+                      row_tail, kv_hint);
     } else if (g->kv8) {
       kv_append_int8_multi_kernel<<<dim3(Hk, rows), d>>>(
           d_k_new_rot, d_v_new, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, d_mr,
@@ -2097,26 +2183,34 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
       rc = attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d, 0,
                       nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, lw.kv8_k,
                       lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, true, nullptr, nullptr, false,
-                      nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups, row_tbase, row_tail);
+                      nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups, row_tbase, row_tail,
+                      kv_hint);
     } else {
       kv_append_multi_kernel<<<dim3((Hk * d + 255) / 256, rows), 256>>>(
           d_k_new_rot, d_v_new, lw.kv_k, lw.kv_v, d_mr, rows, g->kv_stride, Hk, d);
       rc = attn_split(d_qf_rot, lw.kv_k, lw.kv_v, g->spec.attention_multiplier, Hq, Hk, d, 0,
                       nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, nullptr,
                       nullptr, nullptr, nullptr, false, nullptr, nullptr, false, nullptr,
-                      g->max_pos, row_pos, row_pt, row_grp, ngroups, row_tbase, row_tail);
+                      g->max_pos, row_pos, row_pt, row_grp, ngroups, row_tbase, row_tail,
+                      kv_hint);
     }
     G4_CUDA_CHECK(cudaGetLastError());
-    if (rc != 0 ||
-        granite4_verify_gemv_resid(d_attn_out, lw.wo, lw.sc[3], d_hidden, resid_scale, rows,
-                                   H, H, d_hidden) != 0 ||
-        granite4_kernel_rmsnorm_batched(d_hidden, lw.ffn_norm, rms_eps, rows, H,
-                                        d_normed2) != 0 ||
-        granite4_verify_silu(lw.wg, lw.wu, d_normed2, lw.sc[4], lw.sc[5], I, H, rows,
+    if (rc != 0) return -1;
+    prof.mark(MultiProfile::kAttn);  // KV append + split attention + combine
+    if (granite4_verify_gemv_resid(d_attn_out, lw.wo, lw.sc[3], d_hidden, resid_scale, rows,
+                                   H, H, d_hidden) != 0)
+      return -1;
+    prof.mark(MultiProfile::kGemm);
+    if (granite4_kernel_rmsnorm_batched(d_hidden, lw.ffn_norm, rms_eps, rows, H,
+                                        d_normed2) != 0)
+      return -1;
+    prof.mark(MultiProfile::kNorm);
+    if (granite4_verify_silu(lw.wg, lw.wu, d_normed2, lw.sc[4], lw.sc[5], I, H, rows,
                              d_gate_out) != 0 ||
         granite4_verify_gemv_resid(d_gate_out, lw.wd, lw.sc[6], d_hidden, resid_scale, rows,
                                    H, I, d_hidden) != 0)
       return -1;
+    prof.mark(MultiProfile::kGemm);
   }
   if (granite4_kernel_rmsnorm_batched(d_hidden, hv.final_norm, rms_eps, rows, H, d_normed) !=
           0 ||
@@ -2128,6 +2222,8 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
   argmax_rows_kernel<<<rows, kArgmaxThreads>>>(d_logits, V, d_ids, nullptr);
   if (advance) multi_scatter_advance_kernel<<<1, 32>>>(d_mr, d_ids);
   G4_CUDA_CHECK(cudaGetLastError());
+  prof.mark(MultiProfile::kLm);
+  prof.finish(rows);
   return 0;
 }
 
@@ -2425,7 +2521,9 @@ int forward_impl(GpuCtx* g, const std::int32_t* d_tokens, int end,
 // bound to (d_tokens, d_logits_row).
 bool capture_decode_graph(GpuCtx* g, std::int32_t* d_tokens, std::uint16_t* d_logits_row) {
   if (g->decode_graph != nullptr) {
-    if (g->graph_tokens == d_tokens && g->graph_logits == d_logits_row) return true;
+    if (g->graph_tokens == d_tokens && g->graph_logits == d_logits_row &&
+        g->graph_kv_hint == g->decode_kv_hint)
+      return true;
     cudaGraphExecDestroy(g->decode_graph);
     g->decode_graph = nullptr;
   }
@@ -2448,6 +2546,7 @@ bool capture_decode_graph(GpuCtx* g, std::int32_t* d_tokens, std::uint16_t* d_lo
     return false;
   }
   g->graph_tokens = d_tokens;
+  g->graph_kv_hint = g->decode_kv_hint;
   g->graph_logits = d_logits_row;
   return true;
 }
@@ -2653,6 +2752,8 @@ int gpu_decode_greedy(GpuCtx* ctx, std::int32_t* d_tokens, int steps,
 
   set_pos_kernel<<<1, 1>>>(ctx->d_pos, ctx->written);
   if (cudaGetLastError() != cudaSuccess) return seterr("set_pos launch failed");
+  // Every step of this call attends to at most written + steps positions.
+  ctx->decode_kv_hint = decode_bucket(ctx->written + steps);
   const bool graph = env_enabled("G4_GRAPH") && capture_decode_graph(ctx, d_tokens, d_logits_row);
   std::vector<cudaEvent_t> ev;
   if (ts != nullptr) {
@@ -2715,7 +2816,10 @@ int gpu_decode_multi(GpuCtx* const* ctxs, std::int32_t* const* d_tokens, int n, 
   }
   MultiRows h{};
   h.n = n;
-  std::vector<const void*> key{d_logits};
+  int mpos = 0;
+  for (int i = 0; i < n; ++i) mpos = std::max(mpos, ctxs[i]->written + steps);
+  const int mhint = decode_bucket(mpos);
+  std::vector<const void*> key{d_logits, reinterpret_cast<const void*>(static_cast<std::intptr_t>(mhint))};
   for (int i = 0; i < n; ++i) {
     h.pos[i] = ctxs[i]->written;
     h.pt[i] = ctxs[i]->d_pt;
@@ -2739,7 +2843,8 @@ int gpu_decode_multi(GpuCtx* const* ctxs, std::int32_t* const* d_tokens, int n, 
         cudaSuccess) {
       graph = false;
     } else {
-      const int rc = forward_multi_step(g, g->d_multi, n, d_logits, g->d_multi_ids);
+      const int rc = forward_multi_step(g, g->d_multi, n, d_logits, g->d_multi_ids, nullptr,
+                                        true, 0, false, mhint);
       if (cudaStreamEndCapture(cudaStreamPerThread, &cg) != cudaSuccess || rc != 0 ||
           cudaGraphInstantiate(&g->multi_graph, cg, 0) != cudaSuccess) {
         g->multi_graph = nullptr;
@@ -2754,12 +2859,15 @@ int gpu_decode_multi(GpuCtx* const* ctxs, std::int32_t* const* d_tokens, int n, 
     const int rc = graph ? (cudaGraphLaunch(g->multi_graph, cudaStreamPerThread) == cudaSuccess
                                 ? 0
                                 : -1)
-                         : forward_multi_step(g, g->d_multi, n, d_logits, g->d_multi_ids);
+                         : forward_multi_step(g, g->d_multi, n, d_logits, g->d_multi_ids,
+                                              nullptr, true, 0, false, mhint);
     if (rc != 0) return seterr("multi-decode step failed");
   }
   for (int i = 0; i < n; ++i) ctxs[i]->written += steps;
   return 0;
 }
+int verify_step(GpuCtx* g, int n, std::uint16_t* d_logits, std::int32_t* d_argmax,
+                std::uint16_t* d_hidden, int ngroups, bool tree, int kv_hint);
 int gpu_forward_multi(GpuCtx* const* row_ctx, std::int32_t* const* row_tokens,
                       const int* row_pos, int n, std::uint16_t* d_logits,
                       std::int32_t* d_argmax, std::uint16_t* d_hidden, char* error,
@@ -2825,12 +2933,50 @@ int gpu_forward_multi(GpuCtx* const* row_ctx, std::int32_t* const* row_tokens,
   // its captured graph stays valid across this call.)
   if (cudaMemcpyAsync(g->d_multi, &h, sizeof h, cudaMemcpyHostToDevice, cudaStreamPerThread) !=
           cudaSuccess ||
-      forward_multi_step(g, g->d_multi, n, d_logits, d_argmax, d_hidden, false, ngroups) != 0)
+      verify_step(g, n, d_logits, d_argmax, d_hidden, ngroups, false,
+                  kv_bucket(max_pos_row + 1)) != 0)
     return seterr("multi-forward failed");
   for (std::size_t i = 0; i < seen.size(); ++i) seen[i]->written = next_pos[i];
   return 0;
 }
 int gpu_ctx_written(GpuCtx* ctx) { return ctx != nullptr ? ctx->written : -1; }
+
+// forward_multi_step(advance = false) for a verify, replayed from a captured
+// graph per shape (G4_VERIFY_GRAPH=0: direct launches). The ~11 kernels per
+// layer of a verify step are short; the graph removes their launch gaps.
+int verify_step(GpuCtx* g, int n, std::uint16_t* d_logits, std::int32_t* d_argmax,
+                std::uint16_t* d_hidden, int ngroups, bool tree, int kv_hint) {
+  static const bool on = env_enabled("G4_VERIFY_GRAPH") && !MultiProfile::enabled();
+  if (!on) return forward_multi_step(g, g->d_multi, n, d_logits, d_argmax, d_hidden, false,
+                                     ngroups, tree, kv_hint);
+  GpuCtx::VerifyGraph* vg = nullptr;
+  for (auto& v : g->verify_graphs)
+    if (v.n == n && v.ngroups == ngroups && v.tree == tree && v.kv_hint == kv_hint &&
+        v.logits == d_logits &&
+        v.argmax == d_argmax && v.hidden == d_hidden)
+      vg = &v;
+  if (vg == nullptr) {
+    GpuCtx::VerifyGraph v{n, ngroups, tree, kv_hint, d_logits, d_argmax, d_hidden, nullptr};
+    cudaGraph_t cg = nullptr;
+    if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) ==
+        cudaSuccess) {
+      const int rc = forward_multi_step(g, g->d_multi, n, d_logits, d_argmax, d_hidden, false,
+                                        ngroups, tree, kv_hint);
+      const cudaError_t ce = cudaStreamEndCapture(cudaStreamPerThread, &cg);
+      if (rc != 0 || ce != cudaSuccess || cg == nullptr ||
+          cudaGraphInstantiate(&v.exec, cg, 0) != cudaSuccess)
+        v.exec = nullptr;
+      if (cg != nullptr) cudaGraphDestroy(cg);
+    }
+    cudaGetLastError();  // a failed capture must not poison later calls
+    g->verify_graphs.push_back(v);
+    vg = &g->verify_graphs.back();
+  }
+  if (vg->exec != nullptr)
+    return cudaGraphLaunch(vg->exec, cudaStreamPerThread) == cudaSuccess ? 0 : -1;
+  return forward_multi_step(g, g->d_multi, n, d_logits, d_argmax, d_hidden, false, ngroups,
+                            tree, kv_hint);
+}
 
 int gpu_forward_tree(const GpuTreeRow* rows, int n, std::uint16_t* d_logits,
                      std::int32_t* d_argmax, std::uint16_t* d_hidden, char* error,
@@ -2848,6 +2994,7 @@ int gpu_forward_tree(const GpuTreeRow* rows, int n, std::uint16_t* d_logits,
   MultiRows h{};
   h.n = n;
   h.tree = 1;
+  int max_len = 0;
   std::vector<GpuCtx*> seen;
   std::vector<int> top;
   for (int r = 0; r < n; ++r) {
@@ -2877,6 +3024,7 @@ int gpu_forward_tree(const GpuTreeRow* rows, int n, std::uint16_t* d_logits,
     }
     top[i] = std::max(top[i], t.slot + 1);
     h.pos[r] = t.pos;
+    max_len = std::max(max_len, t.pos + 1);
     h.slot[r] = t.slot;
     h.pt[r] = c->d_pt;
     h.tok[r] = t.tokens;
@@ -2904,8 +3052,7 @@ int gpu_forward_tree(const GpuTreeRow* rows, int n, std::uint16_t* d_logits,
   }
   if (cudaMemcpyAsync(g->d_multi, &h, sizeof h, cudaMemcpyHostToDevice, cudaStreamPerThread) !=
           cudaSuccess ||
-      forward_multi_step(g, g->d_multi, n, d_logits, d_argmax, d_hidden, false, ngroups, true) !=
-          0)
+      verify_step(g, n, d_logits, d_argmax, d_hidden, ngroups, true, kv_bucket(max_len)) != 0)
     return seterr("tree-forward failed");
   for (std::size_t i = 0; i < seen.size(); ++i) seen[i]->written = top[i];
   return 0;
