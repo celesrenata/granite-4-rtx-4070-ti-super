@@ -872,6 +872,36 @@ per session, so a tree buys ~7% on chat for tree-masked verify attention and
 non-contiguous KV commits. Not implemented; more chat data is the larger
 lever.
 
+**Head r10** (deployed): r9 fine-tuned 2 epochs on 3276 self-distilled chat
+replies (conversations < 2159) + serve_train3 + 2000 base records. Held-out
+chat (conversations >= 2159) K=6: r9 1.913 -> r10 1.986; serving 2.310 ->
+2.351. Warm serve A/B on held-out prompts (`ab_heads.py` now takes the last 30
+conversations; the earlier 1700-1729 slice is inside r10's training set and
+overstated r10 at 151 tok/s): chat 92.6 -> 99.3, novel 79.1 -> 95.1, serving
+106.9 -> 109.1 tok/s, outputs == plain.
+
+**Multi-layer head (EAGLE-3 style) - measured, not adopted.** `dump-hidden
+--feat-layers 2,20 --feat-out` writes the residual stream after those layers;
+`train_eagle.py --extra-layers 2` feeds the first draft step
+fuse([ln low; ln mid; ln_h final]) (initialized to [0|0|I], i.e. exactly the
+warm-start head). From r10, same recipe, held-out K=6 chat / serving:
+
+| Head | chat | serving |
+|---|---:|---:|
+| r10 | 1.986 | 2.351 |
+| r10c (r10 + 2 epochs, final feature only) | 1.953 | 2.353 |
+| ml1 (r10 + 2 epochs, layers 2/20 fused) | 1.989 | 2.366 |
+
++1.8% over the matched control, +0.2% over r10: a fine-tuned fuse does not
+pay for capturing two more features on every target path plus a 100 MB fuse
+GEMV per round. Kept as tooling (`scripts/eagle/stage_ml.sh`).
+
+**Prefill fix.** `forward_prefill` ran the final norm + lm_head for the
+requested rows inside the layer loop (a misplaced brace), i.e. 40x per chunk;
+outputs were unaffected (the last layer's pass overwrote them), and dumps are
+bit-identical before/after. It cost 39 extra lm_head passes (~0.4 GB of FP8
+weights each, estimated ~24 ms) per prefill chunk with output rows.
+
 ## Rules across phases
 
 - No kernel or code is copied from `reference/qwen3-27b-5090/`; it is kept
