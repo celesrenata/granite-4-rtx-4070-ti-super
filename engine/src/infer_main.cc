@@ -1266,11 +1266,11 @@ int gpu_serve_cmd(const Args& cli) {
       a.draft_k = static_cast<int>(req.get_int("draft_lookup", 0));
       a.eos = static_cast<long>(req.get_int("eos", -1));
       a.eagle_k = static_cast<int>(req.get_int("eagle", 0));
-      // Delegate the session pick to the host-tested serve_decide:
-      // longest session whose KV prefix is a full prefix of a.tokens
-      // (watermark == history.size() required; a failed turn leaves the
-      // watermark stale and is treated as a miss). On a miss, the
-      // round-robin pointer's next session with a full re-prefill. EAGLE
+      // Delegate the session pick to the host-tested serve_decide: the
+      // session sharing the longest prefix with a.tokens (watermark ==
+      // history.size() required; a failed turn leaves the watermark stale
+      // and is treated as a miss). On a miss, an empty session or the
+      // round-robin pointer's, with a full re-prefill. EAGLE
       // requests resume like any other: every session has its own head, and
       // generate_eagle re-forwards only the few positions the head trails by.
       std::vector<ServeSessionState> state(n_sessions);
@@ -1278,7 +1278,10 @@ int gpu_serve_cmd(const Args& cli) {
         state[i].history = hist[i];
         state[i].watermark = sessions[i].written();
       }
-      const ServeDecision dec = serve_decide(state, next, a.tokens);
+      // Resume from the longest shared prefix (>= one 64-position page, so a
+      // shared system prompt alone never steals another conversation's
+      // session). Rows past the divergence are simply overwritten.
+      const ServeDecision dec = serve_decide(state, next, a.tokens, kPoolPage);
       picked = dec.picked;
       resume = dec.resume;
       // G4_FORCE_REPREFILL: override the resume decision so this request

@@ -104,6 +104,12 @@ All tests run without a GPU or CUDA toolkit:
 ## Limitations
 
 - Batch 1: the engine serves one request at a time (the API serializes them).
+  It can keep several conversations resident (`serve --sessions N`, NixOS
+  `sessions`), each with its own EAGLE head, on one shared paged KV pool plus
+  one draft-KV pool (`--kv-pool-tokens`, default N x `maxContext`). A request
+  resumes the session sharing the longest prefix with its prompt, so
+  interleaved chats skip re-prefilling their history. gremlin-1 runs 2 x 32768
+  with KV8 (5.2 GiB pool).
 - Greedy only on the GPU serving path; seeded top-p exists in the CLI.
 - `maxContext` (default 8192) bounds prompt + completion per request.
 - Weights are FP8 e4m3 with per-tensor scales; outputs agree with the fp32

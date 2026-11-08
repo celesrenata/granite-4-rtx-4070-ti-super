@@ -33,11 +33,19 @@ struct ServeSessionState {
 // (truncate(0)); `resume > 0` means the session's watermark starts at
 // `resume` and only the tail of the prompt is uploaded and forwarded.
 //
-// Picking rule: the session with the longest `history[i]` that is a
-// full prefix of `prompt` and whose `watermark[i] == history[i].size()`
-// (i.e. a "clean" session whose KV really is `history`). Ties break by
-// session index (lower index wins). On a miss, the round-robin pointer's
-// next session is used with `resume == 0`.
+// Picking rule: for every clean session (watermark == history.size(), so its
+// KV really is `history`), the reusable length is the longest common prefix of
+// `history` and `prompt`, capped at prompt.size() - 1 (at least one prompt
+// token is always forwarded: it yields the first generated token). KV rows
+// [0, lcp) are valid whatever follows them, so a session whose history merely
+// *diverges* from the prompt late - a chat template that re-renders the last
+// assistant turn differently, an edited or regenerated last message - still
+// resumes from the divergence point instead of re-prefilling everything. The
+// session with the longest such prefix wins (ties: lower index), provided it
+// is at least `min_resume` positions; a shorter overlap (e.g. a shared system
+// prompt) is a miss, so it never evicts another conversation's cache for a
+// negligible saving. On a miss, the first empty session at or after the
+// round-robin pointer is used, else the pointer's session, with resume == 0.
 //
 // `next` is the round-robin pointer the serve loop will advance to after
 // this request, so the next miss lands on the next session in order.
@@ -49,7 +57,8 @@ struct ServeDecision {
 
 ServeDecision serve_decide(const std::vector<ServeSessionState>& sessions,
                            int next,
-                           const std::vector<std::int32_t>& prompt);
+                           const std::vector<std::int32_t>& prompt,
+                           int min_resume = 1);
 
 }  // namespace granite4
 

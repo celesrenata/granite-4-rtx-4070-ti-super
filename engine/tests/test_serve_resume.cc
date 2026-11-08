@@ -1,6 +1,6 @@
 // Unit tests for serve_decide: the session-selection decision made by the
-// persistent serve loop. Picks the session whose KV prefix is the longest
-// full prefix of the new prompt (so only the tail is prefilled), with a
+// persistent serve loop. Picks the session sharing the longest prefix with
+// the new prompt (so only the rest is prefilled), with an empty-session /
 // round-robin fallback on a miss. Pure host logic, no CUDA.
 //
 // The serve loop (CUDA-only, in infer_main.cc) delegates to serve_decide
@@ -20,17 +20,12 @@ namespace {
 
 using Dec = gv::ServeDecision;
 
-Dec decide(const std::vector<gv::ServeSessionState>& sessions, int next,
-           std::vector<std::int32_t> prompt) {
-  return gv::serve_decide(sessions, next, prompt);
-}
-
 // Check a single decision: picked session, resume count, and the advanced
 // round-robin pointer.
 bool run_case(const char* name, const std::vector<gv::ServeSessionState>& sessions,
               int next, std::vector<std::int32_t> prompt, int want_picked,
-              int want_resume, int want_next) {
-  const Dec d = decide(sessions, next, std::move(prompt));
+              int want_resume, int want_next, int min_resume = 1) {
+  const Dec d = gv::serve_decide(sessions, next, prompt, min_resume);
   if (d.picked != want_picked || d.resume != want_resume || d.next != want_next) {
     std::fprintf(stderr, "FAIL(%s): picked=%d resume=%d next=%d; want %d %d %d\n",
                  name, d.picked, d.resume, d.next, want_picked, want_resume, want_next);
@@ -64,13 +59,16 @@ int main() {
     // History shorter than the prompt (prompt is a superset of the prefix):
     // still a hit, resume from the full history.
     ok = run_case("single hit short hist", s, 0, {1, 2, 3, 4}, 0, 3, 0) && ok;
-    // History longer than the prompt: cannot resume (would need to rewind).
-    ok = run_case("single miss (hist longer)", s, 0, {1, 2}, 0, 0, 0) && ok;
+    // History longer than the prompt (an edited / regenerated last turn):
+    // rewind to the shared prefix, capped at plen - 1 so one token is
+    // forwarded.
+    ok = run_case("rewind (hist longer)", s, 0, {1, 2}, 0, 1, 0) && ok;
+    // Prompt == history: still forward the last token (resume plen - 1).
+    ok = run_case("prompt == history", s, 0, {1, 2, 3}, 0, 2, 0) && ok;
     // Mismatch at j=0: miss, full re-prefill.
     ok = run_case("single miss (mismatch)", s, 0, {9, 2, 3}, 0, 0, 0) && ok;
-    // Mismatch at j=2 (prefix [1,2] matches but [1,2,3] doesn't): miss,
-    // because the session's cached KV is all of [1,2,3], not [1,2].
-    ok = run_case("single miss (mismatch j=2)", s, 0, {1, 2, 7}, 0, 0, 0) && ok;
+    // Mismatch at j=2: KV rows [0, 2) are still valid, so resume from 2.
+    ok = run_case("late mismatch resumes at the divergence", s, 0, {1, 2, 7}, 0, 2, 0) && ok;
   }
 
   // --- Two sessions, longest-prefix wins --------------------------------
@@ -152,6 +150,53 @@ int main() {
     b.watermark = 0;
     std::vector<gv::ServeSessionState> s{a, b};
     ok = run_case("all empty -> rrobin", s, 1, {1, 2}, 1, 0, 0) && ok;
+  }
+
+  // --- Chat-template divergence: history = turn N prompt + generated ids,
+  // but turn N+1 re-renders the end of turn N differently (e.g. the
+  // generation prompt's `<think></think>` is dropped from the history).
+  // The session must resume from the divergence, not re-prefill. ---------
+  {
+    gv::ServeSessionState a, b;
+    for (int i = 0; i < 1000; ++i) a.history.push_back(10 + i % 50);
+    a.history.push_back(7);  // "<think></think>" of the generation prompt
+    for (int i = 0; i < 40; ++i) a.history.push_back(500 + i);  // generated
+    a.watermark = static_cast<int>(a.history.size());
+    for (int i = 0; i < 800; ++i) b.history.push_back(900 + i);
+    b.watermark = 800;
+    std::vector<std::int32_t> p(a.history.begin(), a.history.begin() + 1000);
+    for (int i = 0; i < 40; ++i) p.push_back(500 + i);  // reply, no think tag
+    for (int i = 0; i < 30; ++i) p.push_back(3);        // next user turn
+    std::vector<gv::ServeSessionState> s{b, a};
+    ok = run_case("template divergence resumes near the end", s, 0, p, 1, 1000, 0, 64) && ok;
+  }
+
+  // --- min_resume: a short overlap (shared system prompt) is a miss and
+  // goes to an empty session instead of evicting a live conversation. -----
+  {
+    gv::ServeSessionState a, empty;
+    a.history = {1, 2, 3, 4, 5, 6, 7, 8};
+    a.watermark = 8;
+    std::vector<gv::ServeSessionState> s{a, empty};
+    ok = run_case("short overlap below min_resume -> empty session", s, 0,
+                  {1, 2, 3, 9, 9, 9}, 1, 0, 0, /*min_resume=*/4) && ok;
+    ok = run_case("overlap at min_resume is a hit", s, 0, {1, 2, 3, 4, 9}, 0, 4, 1,
+                  /*min_resume=*/4) && ok;
+  }
+
+  // --- Miss with no empty session: the round-robin pointer's session. ----
+  {
+    gv::ServeSessionState a, b, c;
+    a.history = {1};
+    a.watermark = 1;
+    b.history = {2};
+    b.watermark = 1;
+    std::vector<gv::ServeSessionState> s{a, b, c};
+    ok = run_case("miss prefers empty after pointer", s, 0, {9, 9}, 2, 0, 0) && ok;
+    c.history = {3};
+    c.watermark = 1;
+    s = {a, b, c};
+    ok = run_case("miss, none empty -> pointer", s, 1, {9, 9}, 1, 0, 2) && ok;
   }
 
   if (!ok) {
