@@ -54,6 +54,14 @@ def run(proc, reqs, inflight):
     return out, time.time() - t0
 
 
+def doc_sources():
+    """Eight stdlib modules (stable text for the doc family)."""
+    import argparse, configparser, difflib, json.decoder, pathlib, shutil, textwrap, \
+        urllib.parse  # noqa: E401
+    return [Path(m.__file__) for m in (argparse, configparser, difflib, json.decoder,
+                                       pathlib, shutil, textwrap, urllib.parse)]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", required=True)
@@ -73,10 +81,10 @@ def main():
     chat = [c["turns"][0] for c in json.load(open(a.prompts))[-12:]]
     serving = [d["prompt"] for d in json.load(open(
         "/opt/granite4-rtx-4070-ti-super/eagle/ds/serving/eval.json"))][:12]
-    # ~3K-token contexts (attention-heavy verify): engine sources + a question.
-    src = sorted((Path(__file__).resolve().parents[1] / "engine" / "src").glob("*.c[cu]"))
+    # ~3K-token contexts (attention-heavy verify): Python stdlib sources (fixed
+    # for a given interpreter, unlike this repo's files) + a question.
     doc = [f"Here is a source file:\n\n{p.read_text()[:10000]}\n\nExplain what this code does, "
-           "section by section." for p in src[:8]]
+           "section by section." for p in doc_sources()]
     allf = {"chat": chat, "novel": NOVEL, "serving": serving, "doc": doc}
     fams = {f: allf[f] for f in a.families.split(",")}
     env = dict(os.environ, G4_KV8=a.kv, G4_FORCE_REPREFILL="1")
