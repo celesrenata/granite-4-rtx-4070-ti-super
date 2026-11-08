@@ -49,6 +49,9 @@ std::size_t attn_split_scratch_bytes(int Hq, int rows, int stride);
 // (cache_k_scale/cache_v_scale, [Hk][stride]) and dequantized into the same
 // bf16 tiles; cache_k/cache_v are then ignored (pass nullptr). The bf16
 // path is bit-identical when int8 and int4 are both false (the default).
+// Tree rows: row_tbase[r] / row_tail[r * kAttnTailStride + j] remap logical
+// positions above tbase to ancestor slots (one row per block, no groups).
+constexpr int kAttnTailStride = 8;
 int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                int kv_base, const int* d_pos, int rows, int stride, void* scratch,
@@ -60,7 +63,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
                const int* d_pt = nullptr, int max_len = 0,
                const int* row_pos = nullptr, const int* const* row_pt = nullptr,
-               const int* row_grp = nullptr, int ngroups = 0);
+               const int* row_grp = nullptr, int ngroups = 0,
+               const int* row_tbase = nullptr, const int* row_tail = nullptr);
 
 }  // namespace granite4
 

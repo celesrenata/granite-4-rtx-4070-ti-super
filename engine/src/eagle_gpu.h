@@ -50,6 +50,32 @@ struct EagleRowsReq {
   std::int32_t* d_draft_out;
 };
 int eagle_forward_multi(EagleHead* const* heads, int n, const EagleRowsReq* req);
+// Draft-tree head rows (features only): row r runs the head for heads[head]
+// at RoPE position pos with its token at d_tokens[slot + 1] and input
+// feature d_feat, writes its head KV at slot and attends to head entries
+// [0, pos - depth] plus the depth slots in tail[] (its ancestors' head rows,
+// then its own slot). Slots must be >= the head's watermark, which does not
+// move (the next commit drops these entries). Predicted feature -> d_feat_out.
+struct EagleTreeRow {
+  int head;
+  std::int32_t* d_tokens;
+  int pos, slot, depth;
+  int tail[kMaxTreeDepth];
+  const std::uint16_t* d_feat;
+  std::uint16_t* d_feat_out;
+};
+int eagle_forward_tree(EagleHead* const* heads, int n, const EagleTreeRow* rows);
+// Draft tokens from predicted features: for each request, the k best
+// draft-vocab tokens of lm_head . d_feat (descending), as target ids, at
+// d_tokens[slot[0..k)]. h: any head of the base (its lm rows / vocab).
+constexpr int kMaxDraftBranch = 4;
+struct EagleDraftReq {
+  const std::uint16_t* d_feat;
+  std::int32_t* d_tokens;
+  int k;
+  int slot[kMaxDraftBranch];
+};
+int eagle_draft_topk(EagleHead* h, int n, const EagleDraftReq* reqs);
 
 // Head entries [pos0, pos0 + rows): entry j reads token d_tokens[j + 1] and
 // feature row d_feat[j - pos0] ([rows][H] bf16, device) and writes its

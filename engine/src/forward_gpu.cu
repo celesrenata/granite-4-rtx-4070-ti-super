@@ -282,6 +282,11 @@ using MultiRows = GpuMultiRows;  // forward_gpu_api.h
 // Multi-session verify groups a session's rows in attention from this
 // position on (attention_split.cu kShortCtx: below it one row per block).
 constexpr int kMultiGroupMinCtx = 1024;
+static_assert(kMaxTreeDepth == kAttnTailStride, "tree tail layout");
+// Token index / KV write position of multi row r (tree rows: their slot).
+__device__ __forceinline__ int multi_slot(const MultiRows* mr, int r) {
+  return mr->tree ? mr->slot[r] : mr->pos[r];
+}
 
 __global__ void embed_multi_kernel(const MultiRows* __restrict__ mr,
                                    const std::uint16_t* emb, float mult, std::uint16_t* out,
@@ -289,7 +294,7 @@ __global__ void embed_multi_kernel(const MultiRows* __restrict__ mr,
   const int r = blockIdx.y;
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
   if (j >= H) return;
-  const std::int32_t tok = mr->tok[r][mr->pos[r]];
+  const std::int32_t tok = mr->tok[r][multi_slot(mr, r)];
   out[static_cast<std::size_t>(r) * H + j] =
       f32_to_bf16(mult * bf16_to_f32(emb[static_cast<std::size_t>(tok) * H + j]));
 }
@@ -334,7 +339,7 @@ __global__ void kv_append_multi_kernel(const std::uint16_t* src_k, const std::ui
   if (r >= rows || idx >= Hk * d) return;
   const int hkv = idx / d;
   const int i = idx % d;
-  const int row = mr->pt[r][mr->pos[r]];
+  const int row = mr->pt[r][multi_slot(mr, r)];
   const std::size_t cache_row = static_cast<std::size_t>(hkv) * stride * d;
   const std::size_t src_off =
       static_cast<std::size_t>(r) * Hk * d + static_cast<std::size_t>(idx);
@@ -351,7 +356,7 @@ __global__ void kv_append_int8_multi_kernel(
   const int hkv = blockIdx.x;
   const int r = blockIdx.y;
   const int i = threadIdx.x;  // blockDim.x == d
-  const int row = mr->pt[r][mr->pos[r]];
+  const int row = mr->pt[r][multi_slot(mr, r)];
   const std::size_t src = (static_cast<std::size_t>(r) * Hk + hkv) * d + i;
   const std::size_t cache = (static_cast<std::size_t>(hkv) * stride + row) * d + i;
   const std::size_t sc = static_cast<std::size_t>(hkv) * stride + row;
@@ -397,7 +402,7 @@ __global__ void kv_append_int4_multi_kernel(
   const int hkv = blockIdx.x;
   const int r = blockIdx.y;
   const int w = threadIdx.x;  // blockDim.x == d/2
-  const int row = mr->pt[r][mr->pos[r]];
+  const int row = mr->pt[r][multi_slot(mr, r)];
   const int d0 = 2 * w;
   const int d1 = d0 + 1;
   const std::size_t src0 = (static_cast<std::size_t>(r) * Hk + hkv) * d + d0;
@@ -1038,6 +1043,8 @@ struct GpuCtx {
   // Positions [0, mapped) have a valid d_pt entry; nothing past it may be
   // forwarded. max_pos for the identity layout; set by gpu_ctx_set_kv_rows_n.
   int mapped = 0;
+  // Host mirror of d_pt[0, mapped) (gpu_ctx_kv_move); empty = identity.
+  std::vector<int> h_pt;
   GpuKvArena* kv_arena = nullptr;  // non-null: kv_* alias the arena (not owned)
   // Multi-session decode (gpu_decode_multi), owned by the step's lead context.
   MultiRows* d_multi = nullptr;      // device descriptor
@@ -2033,7 +2040,7 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
 // greedy ids in d_ids, then each session's token and position advance.
 int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logits,
                        std::int32_t* d_ids, std::uint16_t* d_hidden_out = nullptr,
-                       bool advance = true, int ngroups = 0) {
+                       bool advance = true, int ngroups = 0, bool tree = false) {
   const int rows = n;
   const int L = g->L, H = g->H, I = g->I, Hq = g->Hq, Hk = g->Hk, d = g->d, V = g->V;
   const float rms_eps = g->spec.rms_norm_eps;
@@ -2054,6 +2061,8 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
   const int* const row_pos = d_mr->pos;  // device addresses inside the descriptor
   const int* const* const row_pt = d_mr->pt;
   const int* const row_grp = ngroups > 0 ? d_mr->grp : nullptr;
+  const int* const row_tbase = tree ? d_mr->tbase : nullptr;
+  const int* const row_tail = tree ? &d_mr->tail[0][0] : nullptr;
 
   embed_multi_kernel<<<dim3((H + 255) / 256, rows), 256>>>(d_mr, hv.embed,
                                                            g->spec.embedding_multiplier,
@@ -2079,7 +2088,8 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
       rc = attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d, 0,
                       nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, nullptr,
                       nullptr, lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
-                      true, nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups);
+                      true, nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups, row_tbase,
+                      row_tail);
     } else if (g->kv8) {
       kv_append_int8_multi_kernel<<<dim3(Hk, rows), d>>>(
           d_k_new_rot, d_v_new, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, d_mr,
@@ -2087,14 +2097,14 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
       rc = attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d, 0,
                       nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, lw.kv8_k,
                       lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, true, nullptr, nullptr, false,
-                      nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups);
+                      nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups, row_tbase, row_tail);
     } else {
       kv_append_multi_kernel<<<dim3((Hk * d + 255) / 256, rows), 256>>>(
           d_k_new_rot, d_v_new, lw.kv_k, lw.kv_v, d_mr, rows, g->kv_stride, Hk, d);
       rc = attn_split(d_qf_rot, lw.kv_k, lw.kv_v, g->spec.attention_multiplier, Hq, Hk, d, 0,
                       nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, nullptr,
                       nullptr, nullptr, nullptr, false, nullptr, nullptr, false, nullptr,
-                      g->max_pos, row_pos, row_pt, row_grp, ngroups);
+                      g->max_pos, row_pos, row_pt, row_grp, ngroups, row_tbase, row_tail);
     }
     G4_CUDA_CHECK(cudaGetLastError());
     if (rc != 0 ||
@@ -2822,6 +2832,148 @@ int gpu_forward_multi(GpuCtx* const* row_ctx, std::int32_t* const* row_tokens,
 }
 int gpu_ctx_written(GpuCtx* ctx) { return ctx != nullptr ? ctx->written : -1; }
 
+int gpu_forward_tree(const GpuTreeRow* rows, int n, std::uint16_t* d_logits,
+                     std::int32_t* d_argmax, std::uint16_t* d_hidden, char* error,
+                     std::size_t error_size) {
+  auto seterr = [&](const char* what) {
+    if (error != nullptr && error_size > 0) std::snprintf(error, error_size, "%s", what);
+    return -1;
+  };
+  if (rows == nullptr || n < 1 || n > kMaxVerifyRows || d_logits == nullptr ||
+      d_argmax == nullptr)
+    return seterr("tree-forward: invalid arguments");
+  GpuCtx* const g = rows[0].ctx;
+  if (g == nullptr || g->weights == nullptr || !direct_path(g) || !g->split_attn)
+    return seterr("tree-forward: needs the direct split-attention path");
+  MultiRows h{};
+  h.n = n;
+  h.tree = 1;
+  std::vector<GpuCtx*> seen;
+  std::vector<int> top;
+  for (int r = 0; r < n; ++r) {
+    const GpuTreeRow& t = rows[r];
+    GpuCtx* c = t.ctx;
+    if (c == nullptr || t.tokens == nullptr || c->weights != g->weights ||
+        c->max_pos != g->max_pos || c->kv8 != g->kv8 || c->kv4 != g->kv4 || !c->split_attn ||
+        (c != g && (c->kv_arena == nullptr || c->kv_arena != g->kv_arena)))
+      return seterr("tree-forward: incompatible session");
+    if (t.depth < 0 || t.depth > kMaxTreeDepth || t.pos - t.depth < 0 ||
+        t.pos - t.depth > c->written || t.slot < c->written || t.slot >= c->mapped ||
+        t.slot >= c->max_pos || t.pos >= c->max_pos)
+      return seterr("tree-forward: row outside the session's writable rows");
+    for (int j = 0; j < t.depth; ++j)
+      if (t.tail[j] < c->written || t.tail[j] >= c->mapped)
+        return seterr("tree-forward: ancestor slot outside the session's rows");
+    if (t.depth > 0 && t.tail[t.depth - 1] != t.slot)
+      return seterr("tree-forward: a row's last tail entry must be its own slot");
+    for (int q = 0; q < r; ++q)
+      if (rows[q].ctx == c && rows[q].slot == t.slot)
+        return seterr("tree-forward: two rows write one slot");
+    std::size_t i = 0;
+    while (i < seen.size() && seen[i] != c) ++i;
+    if (i == seen.size()) {
+      seen.push_back(c);
+      top.push_back(c->written);
+    }
+    top[i] = std::max(top[i], t.slot + 1);
+    h.pos[r] = t.pos;
+    h.slot[r] = t.slot;
+    h.pt[r] = c->d_pt;
+    h.tok[r] = t.tokens;
+    // depth 0: nothing remapped (tbase = pos keeps p <= pos untouched).
+    h.tbase[r] = t.pos - t.depth;
+    for (int j = 0; j < kMaxTreeDepth; ++j) h.tail[r][j] = j < t.depth ? t.tail[j] : 0;
+  }
+  if (g->d_multi == nullptr) {
+    if (cudaMalloc(&g->d_multi, sizeof(MultiRows)) != cudaSuccess ||
+        cudaMalloc(&g->d_multi_ids, sizeof(std::int32_t) * kMaxVerifyRows) != cudaSuccess)
+      return seterr("tree-forward: cudaMalloc failed");
+  }
+  // One attention group per session's rows (shared tbase, up to 8): the
+  // prefix tiles are read once per group (G4_TREE_GROUP=0: one row per block).
+  int ngroups = 0;
+  static const bool tgroup = env_enabled("G4_TREE_GROUP");
+  if (tgroup) {
+    for (int r = 0; r < n;) {
+      int e = r + 1;
+      while (e < n && e - r < 8 && rows[e].ctx == rows[r].ctx && h.tbase[e] == h.tbase[r]) ++e;
+      h.grp[ngroups++] = r | ((e - r) << 8);
+      r = e;
+    }
+    if (ngroups == n) ngroups = 0;
+  }
+  if (cudaMemcpyAsync(g->d_multi, &h, sizeof h, cudaMemcpyHostToDevice, cudaStreamPerThread) !=
+          cudaSuccess ||
+      forward_multi_step(g, g->d_multi, n, d_logits, d_argmax, d_hidden, false, ngroups, true) !=
+          0)
+    return seterr("tree-forward failed");
+  for (std::size_t i = 0; i < seen.size(); ++i) seen[i]->written = top[i];
+  return 0;
+}
+
+namespace {
+// One layer's K/V rows src[i] -> dst[i] (physical rows), i in order; per-row
+// scales follow the codes. bits: 16 (bf16), 8 (int8 codes), 4 (two per byte).
+struct KvMove {
+  int n;
+  int src[kMaxTreeDepth], dst[kMaxTreeDepth];
+};
+__global__ void kv_move_kernel(KvMove mv, void* ck, void* cv, float* ks, float* vs, int bits,
+                               int stride, int d) {
+  const int hkv = blockIdx.x;
+  const int bytes = bits == 16 ? 2 * d : (bits == 8 ? d : d / 2);
+  auto* const k = static_cast<std::uint8_t*>(ck);
+  auto* const v = static_cast<std::uint8_t*>(cv);
+  // In order: a later move may read a row an earlier one wrote only if
+  // dst == src there, which the caller rules out.
+  for (int i = 0; i < mv.n; ++i) {
+    const std::size_t so = (static_cast<std::size_t>(hkv) * stride + mv.src[i]) * bytes;
+    const std::size_t dd = (static_cast<std::size_t>(hkv) * stride + mv.dst[i]) * bytes;
+    for (int b = threadIdx.x; b < bytes; b += blockDim.x) {
+      k[dd + b] = k[so + b];
+      v[dd + b] = v[so + b];
+    }
+    if (bits != 16 && threadIdx.x == 0) {
+      ks[static_cast<std::size_t>(hkv) * stride + mv.dst[i]] =
+          ks[static_cast<std::size_t>(hkv) * stride + mv.src[i]];
+      vs[static_cast<std::size_t>(hkv) * stride + mv.dst[i]] =
+          vs[static_cast<std::size_t>(hkv) * stride + mv.src[i]];
+    }
+    __syncthreads();
+  }
+}
+}  // namespace
+
+int gpu_ctx_kv_move(GpuCtx* ctx, const int* src, const int* dst, int n) {
+  if (ctx == nullptr || n < 0 || n > kMaxTreeDepth || src == nullptr || dst == nullptr) return -1;
+  if (n == 0) return 0;
+  KvMove mv{};
+  mv.n = n;
+  // Logical -> physical through the session's row table (host mirror).
+  for (int i = 0; i < n; ++i) {
+    if (src[i] < 0 || dst[i] < 0 || src[i] >= ctx->mapped || dst[i] >= ctx->mapped ||
+        dst[i] > src[i])
+      return -1;
+    for (int j = i + 1; j < n; ++j)
+      if (src[j] == dst[i]) return -1;
+    mv.src[i] = ctx->h_pt.empty() ? src[i] : ctx->h_pt[static_cast<std::size_t>(src[i])];
+    mv.dst[i] = ctx->h_pt.empty() ? dst[i] : ctx->h_pt[static_cast<std::size_t>(dst[i])];
+  }
+  for (int layer = 0; layer < ctx->L; ++layer) {
+    const LayerView lw = layer_view(ctx, layer);
+    if (ctx->kv4)
+      kv_move_kernel<<<ctx->Hk, 64>>>(mv, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale, 4,
+                                      ctx->kv_stride, ctx->d);
+    else if (ctx->kv8)
+      kv_move_kernel<<<ctx->Hk, 128>>>(mv, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, 8,
+                                       ctx->kv_stride, ctx->d);
+    else
+      kv_move_kernel<<<ctx->Hk, 256>>>(mv, lw.kv_k, lw.kv_v, nullptr, nullptr, 16,
+                                       ctx->kv_stride, ctx->d);
+  }
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
 int gpu_ctx_shared_weights(GpuCtx* ctx, const std::uint16_t** d_embed,
                            const std::uint8_t** d_lm_head, float* lm_scale) {
   if (ctx == nullptr || ctx->weights == nullptr || ctx->scales == nullptr) return -1;
@@ -2868,6 +3020,7 @@ int gpu_ctx_set_kv_rows_n(GpuCtx* ctx, const int* h_rows, int n) {
                           cudaMemcpyHostToDevice) != cudaSuccess)
     return -1;
   ctx->mapped = n;
+  ctx->h_pt.assign(h_rows, h_rows + n);
   return 0;
 }
 // All max_pos positions at once; nullptr restores the identity layout
