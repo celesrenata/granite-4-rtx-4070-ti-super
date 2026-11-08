@@ -173,7 +173,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const int* d_pt = nullptr, int max_len = 0,
                const int* row_pos = nullptr, const int* const* row_pt = nullptr,
                const int* row_grp = nullptr, int ngroups = 0,
-               const int* row_tbase = nullptr, const int* row_tail = nullptr);
+               const int* row_tbase = nullptr, const int* row_tail = nullptr,
+               int kv_hint = 0);
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                       int base_pos, int rows, int stride, std::uint16_t* out,

@@ -672,7 +672,8 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
                                                   h->d, d_pt) != 0 ||
             attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
                        h->kv_stride, h->attn_scratch, att, h->kv8_k, h->kv8_v, h->kv8_k_scale,
-                       h->kv8_v_scale, true, nullptr, nullptr, false, d_pt, h->max_pos) != 0)
+                       h->kv8_v_scale, true, nullptr, nullptr, false, d_pt, h->max_pos,
+                       nullptr, nullptr, nullptr, 0, nullptr, nullptr, p + R) != 0)
           return -1;
       } else {
         if (granite4_kernel_kv_append_int4_batched(kr, v, h->kv4_k, h->kv4_v, h->kv4_k_scale,
@@ -681,7 +682,7 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
             attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
                        h->kv_stride, h->attn_scratch, att, nullptr, nullptr, h->kv4_k_scale,
                        h->kv4_v_scale, false, h->kv4_k, h->kv4_v, true, d_pt,
-                       h->max_pos) != 0)
+                       h->max_pos, nullptr, nullptr, nullptr, 0, nullptr, nullptr, p + R) != 0)
           return -1;
       }
     } else if (granite4_kernel_verify_qkv_stage(
@@ -690,7 +691,8 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
                    h->kv_stride, qr, kr, h->kv_k, h->kv_v, d_pt) != 0 ||
                attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
                           h->kv_stride, h->attn_scratch, att, nullptr, nullptr, nullptr,
-                          nullptr, false, nullptr, nullptr, false, d_pt, h->max_pos) != 0) {
+                          nullptr, false, nullptr, nullptr, false, d_pt, h->max_pos, nullptr,
+                          nullptr, nullptr, 0, nullptr, nullptr, p + R) != 0) {
       return -1;
     }
     if (granite4_verify_gemv_resid(att, h->wo, h->sc[4], x, 1.0f, R, H, nq, hh) != 0 ||
@@ -774,7 +776,7 @@ __global__ void topk_map_kernel(const std::uint16_t* logits, int Vd, const std::
 // The head layer over R rows described by md (device), input features in
 // h->multi_feat, predicted features out in h->multi_out. tree: md rows carry
 // slots + ancestor tails (attention remap). Weights: h's (shared by forks).
-int head_rows(EagleHead* h, GpuMultiRows* md, int R, bool tree) {
+int head_rows(EagleHead* h, GpuMultiRows* md, int R, bool tree, int kv_hint) {
   const int H = h->H, I = h->I, nq = h->Hq * h->d, nk = h->Hk * h->d;
   std::uint16_t* s = h->scratch;
   auto take = [&](std::size_t per_row) {
@@ -809,7 +811,7 @@ int head_rows(EagleHead* h, GpuMultiRows* md, int R, bool tree) {
       rc = attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
                       h->kv_stride, h->attn_scratch, att, h->kv8_k, h->kv8_v, h->kv8_k_scale,
                       h->kv8_v_scale, true, nullptr, nullptr, false, nullptr, h->max_pos,
-                      row_pos, row_pt, nullptr, 0, tb, tl);
+                      row_pos, row_pt, nullptr, 0, tb, tl, kv_hint);
   } else if (h->kv_bits == 4) {
     rc = gpu_multi_kv_append(kr, v, 4, h->kv4_k, h->kv4_v, h->kv4_k_scale, h->kv4_v_scale, md, R,
                              h->kv_stride, h->Hk, h->d);
@@ -817,7 +819,7 @@ int head_rows(EagleHead* h, GpuMultiRows* md, int R, bool tree) {
       rc = attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
                       h->kv_stride, h->attn_scratch, att, nullptr, nullptr, h->kv4_k_scale,
                       h->kv4_v_scale, false, h->kv4_k, h->kv4_v, true, nullptr, h->max_pos,
-                      row_pos, row_pt, nullptr, 0, tb, tl);
+                      row_pos, row_pt, nullptr, 0, tb, tl, kv_hint);
   } else {
     rc = gpu_multi_kv_append(kr, v, 16, h->kv_k, h->kv_v, nullptr, nullptr, md, R, h->kv_stride,
                              h->Hk, h->d);
@@ -825,7 +827,7 @@ int head_rows(EagleHead* h, GpuMultiRows* md, int R, bool tree) {
       rc = attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
                       h->kv_stride, h->attn_scratch, att, nullptr, nullptr, nullptr, nullptr,
                       false, nullptr, nullptr, false, nullptr, h->max_pos, row_pos, row_pt,
-                      nullptr, 0, tb, tl);
+                      nullptr, 0, tb, tl, kv_hint);
   }
   if (rc != 0 ||
       granite4_verify_gemv_resid(att, h->wo, h->sc[4], x, 1.0f, R, H, nq, hh) != 0 ||
@@ -883,7 +885,9 @@ int eagle_forward_multi(EagleHead* const* heads, int n, const EagleRowsReq* req)
                       cudaStreamPerThread) != cudaSuccess)
     return -1;
   GpuMultiRows* const md = static_cast<GpuMultiRows*>(h->multi_desc);
-  if (head_rows(h, md, R, false) != 0) return -1;
+  int kv_hint = 0;
+  for (int i = 0; i < R; ++i) kv_hint = std::max(kv_hint, desc.pos[i] + 1);
+  if (head_rows(h, md, R, false, kv_hint) != 0) return -1;
   std::uint16_t* const f = h->multi_out;
   // Scatter the predicted features; gather each session's last row for its draft.
   r = 0;
@@ -953,7 +957,9 @@ int eagle_forward_tree(EagleHead* const* heads, int n, const EagleTreeRow* rows)
   if (cudaMemcpyAsync(h->multi_desc, &desc, sizeof desc, cudaMemcpyHostToDevice,
                       cudaStreamPerThread) != cudaSuccess)
     return -1;
-  if (head_rows(h, static_cast<GpuMultiRows*>(h->multi_desc), n, true) != 0) return -1;
+  int kv_hint = 0;
+  for (int r = 0; r < n; ++r) kv_hint = std::max(kv_hint, desc.pos[r] + 1);
+  if (head_rows(h, static_cast<GpuMultiRows*>(h->multi_desc), n, true, kv_hint) != 0) return -1;
   for (int r = 0; r < n; ++r)
     if (cudaMemcpyAsync(rows[r].d_feat_out, h->multi_out + static_cast<std::size_t>(r) * H,
                         sizeof(std::uint16_t) * H, cudaMemcpyDeviceToDevice,
