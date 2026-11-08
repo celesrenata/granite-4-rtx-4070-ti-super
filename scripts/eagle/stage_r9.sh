@@ -20,12 +20,17 @@ podrun() {
     -v $E:/w/eagle -v $CK:/w/ckpt --entrypoint "" localhost/granite4-eagle:latest \
     /opt/conda/bin/python "$@"
 }
-log "waiting for gen_chat to finish"
-until grep -q "^DONE" gen_chat_r9.log; do sleep 60; done
+if pgrep -f "[g]en_chat.py" > /dev/null; then
+  log "waiting for gen_chat to finish"
+  until grep -q "^DONE" gen_chat_r9.log; do sleep 60; done
+fi
+# Hold out the last ~10% of generated conversations (override with EVAL_FROM).
+EVAL_FROM=${EVAL_FROM:-$($PY -c "import json;c=[json.loads(l)['conv'] for l in open('ds/chat_r9/gen.jsonl')];print(int(max(c)*0.9))")}
+log "eval split: conv >= $EVAL_FROM"
 log "gen: $(tail -1 gen_chat_r9.log); $(wc -l < ds/chat_r9/gen.jsonl) replies"
 log "== P prep records"
 $PY prep_chat.py --data ds/chat_r9/gen.jsonl --tokenizer $CK/tokenizer.json \
-  --train-out ds/chat_r9_train --eval-out ds/chat_r9_eval --eval-from 1100 --max-len 4096 >> $LOG 2>&1 || { log "prep failed"; exit 1; }
+  --train-out ds/chat_r9_train --eval-out ds/chat_r9_eval --eval-from $EVAL_FROM --max-len 4096 >> $LOG 2>&1 || { log "prep failed"; exit 1; }
 log "== stopping granite4-rtx (GPU stages)"
 trap restart EXIT
 systemctl stop granite4-rtx

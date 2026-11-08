@@ -817,6 +817,61 @@ decode path, and re-forwarding them through prefill rounds bf16 differently
 the same resume path). Known gap: the policy decides once per request, so a
 reply whose acceptance rises late stays plain (novel: -9% vs always-on).
 
+### P4 round 5 — concurrent sessions, batched EAGLE, skinny GEMM (2026-11-07, gremlin-1)
+
+Goal: 2 concurrent runners on one shared KV8 pool (65536 positions, 2 x
+32768), ~250 tok/s aggregate, lossless. A single stream is weight-bandwidth
+bound (every ~15.8 ms decode step streams all FP8 weights), so the gains
+have to come from batching across sessions and from EAGLE acceptance.
+
+1. **Concurrent serve.** `serve` reads stdin on its own thread and schedules
+   requests by id; the API (`ServeProcess`) multiplexes in-flight requests
+   onto one process. Plain jobs from different sessions decode together in
+   `gpu_decode_multi` (one weight pass, per-row page tables, CUDA graph per
+   row-set); EAGLE jobs draft together (`eagle_forward_multi`) and verify
+   together (`gpu_forward_multi`). The adaptive policy still decides per job.
+2. **Skinny tensor-core GEMM** (`skinny_gemm.cu`, `G4_SKINNY=0` reverts) for
+   1-16 rows replaces the per-row GEMVs in decode, verify, multi and the
+   head. T <= 4 stages A per warp, T > 4 shares A per block; both reduce each
+   row in the same order, so outputs do not depend on T. Cost is flat in T:
+   16.3 ms/step at T=1, 16.6 ms at T=14/16 (per-row GEMV: 15.8 / 25.9 /
+   30.3 ms). Rejected: larger-block layouts (440-482 GB/s) and split-K (changes
+   summation order, slower at large T).
+3. **INT4 weights rejected.** Teacher-forced vs FP8 on held-out text: RTN g128
+   83.6% top-1 agreement (KL 0.28, ppl x1.35), g32 86.2%, MLP-only 88.2%
+   (KL 0.14); int8 control 97.2% (KL 0.008). Tooling in `scripts/int4/`.
+
+| Measurement (KV8, 2 sessions) | Result |
+|---|---:|
+| plain decode, 1K ctx (skinny) | 68.1 tok/s |
+| plain decode, 30K ctx (skinny) | 47.6 tok/s |
+| `conc_bench` plain, 2 in flight | 121-129 tok/s |
+| `conc_bench` EAGLE r8 adaptive, 2 in flight: chat / novel / serving | 146.1 / 153.1 / 202.9 tok/s |
+| live API, 1 client | 80.7 tok/s |
+| live API, 2 clients | 141.2 tok/s aggregate |
+
+Outputs are identical sequential vs 2 in flight (`conc_bench`, live API) and
+the parity gate passes (24/24 within 2 ULP). Remaining gap to 250 tok/s is
+head acceptance: r3/r5/r8 accept ~13% per drafted token on general chat
+(~1.8 tokens per round); ~3 tokens per round per session is needed. r9 is
+fine-tuned from r8 on self-distilled chat replies (`scripts/eagle/gen_chat.py`,
+`prep_chat.py`, `stage_r9.sh`).
+
+**Head r9** (deployed): r8 fine-tuned 2 epochs on 1342 self-distilled chat
+replies (generated through the live API) + serve_train3 + 2000 base records.
+Offline exact-gate tokens/round at K=6, held-out: chat 1.72 -> 1.93, serving
+2.22 -> 2.31. Warm serve A/B (adaptive, held-out prompts): chat 83.9 -> 94.9,
+novel 76.6 -> 78.4, serving 103.4 -> 105.2 tok/s, all outputs == plain. Live
+API: 85.2 tok/s with 1 client, 163.4 tok/s with 2 clients (was 80.7 / 141.2).
+
+**Tree drafting estimate** (`scripts/eagle/tree_estimate.py`, r9, best static
+tree per node budget vs chain K=6, tokens/round over every start position):
+chat 2.12 -> 2.28 (7 nodes) / 2.52 (14 nodes); serving 3.02 -> 3.11 / 3.35.
+With 2 sessions the skinny GEMM stays flat only up to 16 rows, i.e. ~7 nodes
+per session, so a tree buys ~7% on chat for tree-masked verify attention and
+non-contiguous KV commits. Not implemented; more chat data is the larger
+lever.
+
 ## Rules across phases
 
 - No kernel or code is copied from `reference/qwen3-27b-5090/`; it is kept
