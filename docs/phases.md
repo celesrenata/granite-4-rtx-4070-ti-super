@@ -857,6 +857,21 @@ head acceptance: r3/r5/r8 accept ~13% per drafted token on general chat
 fine-tuned from r8 on self-distilled chat replies (`scripts/eagle/gen_chat.py`,
 `prep_chat.py`, `stage_r9.sh`).
 
+**Head r9** (deployed): r8 fine-tuned 2 epochs on 1342 self-distilled chat
+replies (generated through the live API) + serve_train3 + 2000 base records.
+Offline exact-gate tokens/round at K=6, held-out: chat 1.72 -> 1.93, serving
+2.22 -> 2.31. Warm serve A/B (adaptive, held-out prompts): chat 83.9 -> 94.9,
+novel 76.6 -> 78.4, serving 103.4 -> 105.2 tok/s, all outputs == plain. Live
+API: 85.2 tok/s with 1 client, 163.4 tok/s with 2 clients (was 80.7 / 141.2).
+
+**Tree drafting estimate** (`scripts/eagle/tree_estimate.py`, r9, best static
+tree per node budget vs chain K=6, tokens/round over every start position):
+chat 2.12 -> 2.28 (7 nodes) / 2.52 (14 nodes); serving 3.02 -> 3.11 / 3.35.
+With 2 sessions the skinny GEMM stays flat only up to 16 rows, i.e. ~7 nodes
+per session, so a tree buys ~7% on chat for tree-masked verify attention and
+non-contiguous KV commits. Not implemented; more chat data is the larger
+lever.
+
 ## Rules across phases
 
 - No kernel or code is copied from `reference/qwen3-27b-5090/`; it is kept
