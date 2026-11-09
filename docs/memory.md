@@ -206,7 +206,8 @@ Read:
   bf16. That is ~4.3 KiB/pos better than the 82.5 KiB planning estimate
   (the Q8_0 per-row scale packs tighter than the estimate assumed), so the
   capacity ceiling is slightly above the ~78K-position figure in the table
-  above. This is what unlocks `reader/standard` (64K × 2 slots).
+  above. This is what unlocks `reader/standard` at 64K × 1 (or 32K × 2);
+  64K × 2 (131072 positions, ~9.8 GiB of int8 KV) does not fit and needs KV4.
 - **Latency: int8 is slightly slower, not faster** — prefill pays
   quantize-on-append (+3.7…13.9%), decode pays dequant-on-load (−1.9…3.5%
   tok/s). At these contexts the KV traffic is small next to the weights, so
@@ -286,7 +287,7 @@ Read:
   arithmetic because the bf16 run also reserves per-position scratch the
   quantized runs skip). That is ~1.5× the saving of int8 (~82 KiB/pos)
   — for the same budget int4 fits ~2× the positions, which is what unlocks
-  the full 131072-position reader pool where int8 tops out at ~64K × 2.
+  the full 131072-position reader pool where int8 tops out at ~64K × 1.
 - **Decode: int4 tracks int8** (−1.8…3.1% t/s) — both are
   dequant-on-load and bandwidth-bound, so the halved-vs-quartered KV
   bandwidth does not pay back the dequant cost; int4 is not faster than
@@ -298,7 +299,7 @@ Read:
   quantized K/V the attention reads. At 8K ctx int4 prefill is 1.25× bf16 vs
   int8's 1.14×.
 - **Net: int4 is a pure capacity play.** Pick int8 when latency matters and
-  64K × 2 fits; pick int4 only when the context pool must exceed what int8
+  the pool fits int8 (~64K positions: 64K × 1 or 32K × 2); pick int4 only when the context pool must exceed what int8
   can hold (the 131K reader path), accepting the larger prefill penalty.
 
 

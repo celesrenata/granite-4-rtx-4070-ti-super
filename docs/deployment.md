@@ -120,6 +120,9 @@ granite4.nixosModules.granite4Rtx
     checkpoint = "/opt/granite4-rtx-4070-ti-super/ckpt";  # BF16 safetensors + tokenizer
     maxContext = 8192;            # positions per request (160 KiB VRAM each, bf16 KV)
     kv8 = true;                   # int8 KV cache (opt-in; ~52% less KV VRAM, gate stays bf16)
+    # 64K context x 2 sessions (131072-position pool) needs int4 KV and a
+    # quantized EAGLE draft KV instead (see the table below):
+    #   kv4 = true; maxContext = 65536; sessions = 2; eagle.draftKv = 8;
     listenAddress = "127.0.0.1";
     listenPort = 2701;
   };
@@ -173,8 +176,8 @@ the ~16376 MiB card alongside the ~9.2–9.8 GiB weights/scratch floor
 ~122 KiB/pos less than bf16 (~1.5× int8's saving, ~2× the positions for
 the same budget) but is **slower, not faster** — prefill +6.7…24.8%
 (worse than int8's +3.7…13.9%, the penalty grows with context) and decode
-−1.8…3.1% t/s (tracking int8). Pick int8 when latency matters and 64K × 2
-fits; pick int4 only when the context pool must exceed what int8 can hold.
+−1.8…3.1% t/s (tracking int8). Pick int8 when latency matters and the pool
+fits int8 (~64K positions: 64K × 1 or 32K × 2); pick int4 only when the context pool must exceed what int8 can hold.
 The speculative EAGLE drafter keeps its own persistent KV, which scales
 with the pool and is a separate budget — at 131072 positions the draft
 head's bf16 KV alone is ~537 MiB, which OOMs the 131K int4-reader config

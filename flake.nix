@@ -359,7 +359,7 @@
               example = "/opt/granite4-rtx-4070-ti-super/ckpt";
             };
             maxContext = lib.mkOption {
-              description = "Positions (prompt + completion) per request for the GPU engine; its KV cache costs 160 KiB of VRAM per position (bf16 KV) or ~78.2 KiB (int8 KV, kv8 = true; measured, docs/memory.md).";
+              description = "Positions (prompt + completion) per request for the GPU engine; its KV cache costs 160 KiB of VRAM per position (bf16 KV), ~78.2 KiB (int8 KV, kv8 = true; measured) or 42.5 KiB (int4 KV, kv4 = true), see docs/memory.md.";
               type = lib.types.ints.positive;
               default = 8192;
             };
@@ -443,6 +443,19 @@
               type = lib.types.ints.between 1 15;
               default = 5;
             };
+            eagle.draftKv = lib.mkOption {
+              description = ''
+                Storage width of the EAGLE head's draft KV cache (sets
+                G4_DRAFT_KV): 16 bf16, 8 int8 (Q8_0), 4 int4 (Q4_0). The draft
+                KV scales with the KV pool, so large pools need it quantized:
+                a 131072-position int4 reader pool OOMs with a bf16 draft KV.
+                8 is lossless (same accept rate as bf16); 4 costs ~1% accept
+                rate for ~128 MiB more headroom. Drafts are verified in full
+                precision, so this never changes the output (docs/deployment.md).
+              '';
+              type = lib.types.enum [ 16 8 4 ];
+              default = 16;
+            };
             gate.minMatch = lib.mkOption {
               description = "Fraction of reference positions that must pass the teacher-forced gate.";
               type = lib.types.numbers.between 0 1;
@@ -506,6 +519,7 @@
               } // lib.optionalAttrs (cfg.eagle.head != null) {
                 GRANITE4_EAGLE_HEAD = cfg.eagle.head;
                 GRANITE4_EAGLE_K = toString cfg.eagle.k;
+                G4_DRAFT_KV = toString cfg.eagle.draftKv;
               });
               serviceConfig = {
                 User = "granite4-rtx";
