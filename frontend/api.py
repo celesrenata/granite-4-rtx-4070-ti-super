@@ -189,10 +189,17 @@ def _validate_chat_request(raw: bytes) -> dict[str, Any]:
                 f"messages[{i}].role must be one of system|user|assistant|tool, got {role!r}",
             )
         content = msg.get("content")
-        if content is not None and not isinstance(content, str):
-            raise ApiError(400, "invalid_content", f"messages[{i}].content must be a string")
+        if content is not None and not isinstance(content, (str, list)):
+            raise ApiError(400, "invalid_content", f"messages[{i}].content must be a string or an array of parts")
         if content is None and role == "user":
             raise ApiError(400, "missing_content", f"messages[{i}].content is required for role=user")
+
+    tools = body.get("tools")
+    if tools is not None and (
+        not isinstance(tools, list)
+        or not all(isinstance(t, dict) and isinstance(t.get("function", t).get("name"), str) for t in tools)
+    ):
+        raise ApiError(400, "invalid_tools", "'tools' must be an array of function definitions with a name")
 
     for key, typ in (("max_tokens", int), ("temperature", (int, float))):
         if key in body and not isinstance(body[key], typ):
@@ -228,6 +235,25 @@ def chat_completions_response() -> tuple[int, dict[str, Any]]:
     return int(status), body
 
 
+def _stream_chunks(resp: dict[str, Any]) -> list[dict[str, Any]]:
+    """chat.completion.chunk events for a finished completion: role, content / reasoning / tool calls
+    in one delta, then the finish chunk with usage."""
+    choice = resp["choices"][0]
+    message = choice["message"]
+    delta: dict[str, Any] = {"role": "assistant"}
+    for key in ("reasoning_content", "content"):
+        if message.get(key):
+            delta[key] = message[key]
+    if message.get("tool_calls"):
+        delta["tool_calls"] = [{"index": i, **c} for i, c in enumerate(message["tool_calls"])]
+    base = {"id": resp["id"], "object": "chat.completion.chunk", "model": resp["model"]}
+    return [
+        {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+        {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}],
+         "usage": resp["usage"]},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Request handler
 # ---------------------------------------------------------------------------
@@ -243,6 +269,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
+
+    def _send_sse(self, events: list[dict[str, Any]]) -> None:
+        """A finished completion as a server-sent-event stream (the engine generates it whole)."""
+        data = "".join(f"data: {json.dumps(e, separators=(',', ':'))}\n\n" for e in events)
+        data = (data + "data: [DONE]\n\n").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_get(self, path: str) -> None:
         if path == "/health":
@@ -297,7 +334,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             except engine_service.ServingError as exc:
                 self._send_json(exc.status, exc.to_body())
                 return
-            self._send_json(200, resp)
+            if body.get("stream"):
+                self._send_sse(_stream_chunks(resp))
+            else:
+                self._send_json(200, resp)
             return
         status, resp_body = chat_completions_response()
         self._send_json(status, resp_body)

@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from frontend import chat_template, tokenizer
+from frontend import chat_template, tokenizer, tool_calls
 
 # Hard ceiling per request on the host-oracle path (its forward replays the
 # whole context every step). The GPU engine allows up to its context
@@ -401,8 +401,13 @@ class EngineService:
 
     def chat_completions(self, body: dict[str, Any], request_id: str) -> dict[str, Any]:
         messages = body.get("messages")
+        tools = body.get("tools") or None
+        kwargs = body.get("chat_template_kwargs")
+        thinking = bool(kwargs.get("enable_thinking", False)) if isinstance(kwargs, dict) else False
+        if body.get("tool_choice") == "none":
+            tools = None
         try:
-            text = chat_template.render(messages)
+            text = chat_template.render(messages, tools=tools, enable_thinking=thinking)
         except ValueError as e:
             raise ServingError(400, "invalid_body", str(e))
         if self._tok is None:
@@ -438,13 +443,21 @@ class EngineService:
         text_ids = gen_ids[:-1] if stopped else gen_ids
         text_out = self._tok.decode(text_ids) if text_ids else ""
         finish = "stop" if stopped or (gen_ids and len(gen_ids) < max_tokens) else "length"
+        reasoning, text_out, calls = tool_calls.parse_output(text_out, thinking, tools)
+        message: dict[str, Any] = {"role": "assistant", "content": text_out}
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        if calls:
+            message["content"] = text_out or None
+            message["tool_calls"] = [tool_calls.openai_call(c) for c in calls]
+            finish = "tool_calls"
         return {
             "id": request_id,
             "object": "chat.completion",
             "model": body.get("model"),
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": text_out},
+                "message": message,
                 "finish_reason": finish,
             }],
             "usage": {
