@@ -795,9 +795,19 @@ int head_rows(EagleHead* h, GpuMultiRows* md, int R, bool tree, int kv_hint) {
   bias_kernel<<<dim3((H + 255) / 256, R), 256>>>(x, h->bias, H);
   if (granite4_kernel_rmsnorm(x, h->ln1, h->eps, R, H, xn) != 0 ||
       granite4_verify_qkv(xn, h->wq, h->wk, h->wv, h->sc[1], h->sc[2], h->sc[3], R, nq, nk, nk, H,
-                          q, k, v) != 0 ||
-      gpu_multi_rope(q, h->cos_tbl, h->sin_tbl, md, R, h->Hq, h->d, qr) != 0 ||
-      gpu_multi_rope(k, h->cos_tbl, h->sin_tbl, md, R, h->Hk, h->d, kr) != 0)
+                          q, k, v) != 0)
+    return -1;
+  void* const ckv = h->kv_bits == 8 ? static_cast<void*>(h->kv8_k)
+                    : (h->kv_bits == 4 ? static_cast<void*>(h->kv4_k) : static_cast<void*>(h->kv_k));
+  void* const cvv = h->kv_bits == 8 ? static_cast<void*>(h->kv8_v)
+                    : (h->kv_bits == 4 ? static_cast<void*>(h->kv4_v) : static_cast<void*>(h->kv_v));
+  float* const kss = h->kv_bits == 8 ? h->kv8_k_scale : h->kv4_k_scale;
+  float* const vss = h->kv_bits == 8 ? h->kv8_v_scale : h->kv4_v_scale;
+  const bool fused = gpu_multi_rope_append(q, k, v, h->cos_tbl, h->sin_tbl, md, R, h->Hq, h->Hk,
+                                           h->d, h->kv_bits, ckv, cvv, kss, vss, h->kv_stride,
+                                           qr) == 0;
+  if (!fused && (gpu_multi_rope(q, h->cos_tbl, h->sin_tbl, md, R, h->Hq, h->d, qr) != 0 ||
+                 gpu_multi_rope(k, h->cos_tbl, h->sin_tbl, md, R, h->Hk, h->d, kr) != 0))
     return -1;
   const int* const row_pos = md->pos;
   const int* const* const row_pt = md->pt;
@@ -805,24 +815,24 @@ int head_rows(EagleHead* h, GpuMultiRows* md, int R, bool tree, int kv_hint) {
   const int* const tl = tree ? &md->tail[0][0] : nullptr;
   int rc;
   if (h->kv_bits == 8) {
-    rc = gpu_multi_kv_append(kr, v, 8, h->kv8_k, h->kv8_v, h->kv8_k_scale, h->kv8_v_scale, md, R,
-                             h->kv_stride, h->Hk, h->d);
+    rc = fused ? 0 : gpu_multi_kv_append(kr, v, 8, h->kv8_k, h->kv8_v, h->kv8_k_scale,
+                                         h->kv8_v_scale, md, R, h->kv_stride, h->Hk, h->d);
     if (rc == 0)
       rc = attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
                       h->kv_stride, h->attn_scratch, att, h->kv8_k, h->kv8_v, h->kv8_k_scale,
                       h->kv8_v_scale, true, nullptr, nullptr, false, nullptr, h->max_pos,
                       row_pos, row_pt, nullptr, 0, tb, tl, kv_hint);
   } else if (h->kv_bits == 4) {
-    rc = gpu_multi_kv_append(kr, v, 4, h->kv4_k, h->kv4_v, h->kv4_k_scale, h->kv4_v_scale, md, R,
-                             h->kv_stride, h->Hk, h->d);
+    rc = fused ? 0 : gpu_multi_kv_append(kr, v, 4, h->kv4_k, h->kv4_v, h->kv4_k_scale,
+                                         h->kv4_v_scale, md, R, h->kv_stride, h->Hk, h->d);
     if (rc == 0)
       rc = attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
                       h->kv_stride, h->attn_scratch, att, nullptr, nullptr, h->kv4_k_scale,
                       h->kv4_v_scale, false, h->kv4_k, h->kv4_v, true, nullptr, h->max_pos,
                       row_pos, row_pt, nullptr, 0, tb, tl, kv_hint);
   } else {
-    rc = gpu_multi_kv_append(kr, v, 16, h->kv_k, h->kv_v, nullptr, nullptr, md, R, h->kv_stride,
-                             h->Hk, h->d);
+    rc = fused ? 0 : gpu_multi_kv_append(kr, v, 16, h->kv_k, h->kv_v, nullptr, nullptr, md, R,
+                                         h->kv_stride, h->Hk, h->d);
     if (rc == 0)
       rc = attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
                       h->kv_stride, h->attn_scratch, att, nullptr, nullptr, nullptr, nullptr,

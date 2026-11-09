@@ -204,6 +204,12 @@ int gpu_ctx_kv_move(GpuCtx* ctx, const int* src, const int* dst, int n);
 // head's batched steps use them on its own KV pool). bits: 16 / 8 / 4.
 int gpu_multi_rope(const std::uint16_t* x, const float* cos_tbl, const float* sin_tbl,
                    const GpuMultiRows* d_rows, int rows, int heads, int d, std::uint16_t* out);
+// RoPE of q and k + the KV append in one launch (bit-identical to
+// gpu_multi_rope x2 + gpu_multi_kv_append); -1 when G4_FUSED_ROPE=0.
+int gpu_multi_rope_append(const std::uint16_t* q, const std::uint16_t* k, const std::uint16_t* v,
+                          const float* cos_tbl, const float* sin_tbl, const GpuMultiRows* d_rows,
+                          int rows, int Hq, int Hk, int d, int bits, void* cache_k, void* cache_v,
+                          float* k_scale, float* v_scale, int stride, std::uint16_t* q_rot);
 int gpu_multi_kv_append(const std::uint16_t* k, const std::uint16_t* v, int bits,
                         void* cache_k, void* cache_v, float* k_scale, float* v_scale,
                         const GpuMultiRows* d_rows, int rows, int stride, int Hk, int d);
