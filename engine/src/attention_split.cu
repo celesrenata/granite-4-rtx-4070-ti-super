@@ -54,14 +54,25 @@ constexpr int kThreads = kG * 32;
 // Shared K row pitch: 65 words, so lane j reading row j hits bank (j + i)
 // mod 32 - conflict free. Rows are therefore only 4-byte aligned.
 constexpr int kPitchWords = kD / 2 + 1;
-constexpr int kMaxSplits = 256;
+constexpr int kMaxSplitsDefault = 256;
+// Splits of the longest sequence (split width = ceil(tiles / max splits)).
+// One value per process (G4_ATTN_MAX_SPLITS), so decode, verify and every
+// session share one split layout and stay bit-identical to each other.
+int max_splits() {
+  static const int v = [] {
+    const char* e = std::getenv("G4_ATTN_MAX_SPLITS");
+    const int x = e != nullptr ? std::atoi(e) : 0;
+    return x >= 8 && x <= 1024 ? x : kMaxSplitsDefault;
+  }();
+  return v;
+}
 // Verify rows sharing one block's K/V tiles (rows > 1).
 constexpr int kRowsPerBlock = 8;
 constexpr int kShortCtx = 1024;
 
 int tiles_per_split(int stride) {
   const int tiles = (stride + kTile - 1) / kTile;
-  return (tiles + kMaxSplits - 1) / kMaxSplits;
+  return (tiles + max_splits() - 1) / max_splits();
 }
 
 // RB query rows share each block (RB = 1 for decode, kRowsPerBlock for a
@@ -92,7 +103,7 @@ __global__ void __launch_bounds__(kThreads)
                       const int* const* __restrict__ row_pt,
                       const int* __restrict__ row_grp,
                       const int* __restrict__ row_tbase,
-                      const int* __restrict__ row_tail) {
+                      const int* __restrict__ row_tail, bool attn_pipe_on) {
   const int hkv = blockIdx.x;
   const int split = blockIdx.y;
   // row_grp (multi-sequence rows): block z owns rows [r0, r0 + nr) of ONE
@@ -168,6 +179,31 @@ __global__ void __launch_bounds__(kThreads)
     if (lp > tb) lp = row_tail[(r0 + rr) * kAttnTailStride + lp - tb - 1];
     return pt != nullptr ? pt[lp] : lp;
   };
+  // KV8 without tree tails (decode, verify, multi rows): the next tile's
+  // codes and scales are loaded into registers before the current tile is
+  // attended, so the loads overlap the compute (same values, same order).
+  // G4_ATTN_PIPE=0 disables.
+  constexpr int kItems = (kTile * (kD / 16) + kThreads - 1) / kThreads;
+  const bool pipe = Int8 && row_tail == nullptr && attn_pipe_on;
+  uint4 pk[kItems], pv[kItems];
+  float psk[kItems], psv[kItems];
+  auto prefetch = [&](int tn) {
+    const int nn = min(kTile, t_end_max - tn);
+#pragma unroll
+    for (int it = 0; it < kItems; ++it) {
+      const int idx = threadIdx.x + it * kThreads;
+      if (idx < nn * (kD / 16)) {
+        const int r = idx / (kD / 16), c = (idx % (kD / 16)) * 16;
+        const int pos = phys(0, tn + r);
+        const std::size_t base8 = static_cast<std::size_t>(pos) * kD + c;
+        psk[it] = ksc[pos];
+        psv[it] = vsc[pos];
+        pk[it] = *reinterpret_cast<const uint4*>(k8 + base8);
+        pv[it] = *reinterpret_cast<const uint4*>(v8 + base8);
+      }
+    }
+  };
+  if (pipe) prefetch(t_begin);
   for (int t0 = t_begin; t0 < t_end_max; t0 += kTile) {
     const int n = min(kTile, t_end_max - t0);
     const bool specific = row_tail != nullptr && t0 + n - 1 > tb;
@@ -177,7 +213,31 @@ __global__ void __launch_bounds__(kThreads)
     // from pass 0 and only rewrite the tail positions with row fr's keys.
     const int rs = fr > 0 ? max(0, tb + 1 - t0) : 0;
     __syncthreads();  // previous tile's readers (and the q preload) are done
-    if (!quantized) {
+    if (pipe) {
+#pragma unroll
+      for (int it = 0; it < kItems; ++it) {
+        const int idx = threadIdx.x + it * kThreads;
+        if (idx < n * (kD / 16)) {
+          const int r = idx / (kD / 16), c = (idx % (kD / 16)) * 16;
+          const std::int8_t* const kc = reinterpret_cast<const std::int8_t*>(&pk[it]);
+          const std::int8_t* const vc = reinterpret_cast<const std::int8_t*>(&pv[it]);
+          const float sk = psk[it], sv = psv[it];
+          std::uint16_t vout[16];
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            const std::uint16_t klo = f32_to_bf16(dev::kv8_dequant(kc[2 * e], sk));
+            const std::uint16_t khi = f32_to_bf16(dev::kv8_dequant(kc[2 * e + 1], sk));
+            Ks[r][c / 2 + e] =
+                static_cast<std::uint32_t>(klo) | (static_cast<std::uint32_t>(khi) << 16);
+            vout[2 * e] = f32_to_bf16(dev::kv8_dequant(vc[2 * e], sv));
+            vout[2 * e + 1] = f32_to_bf16(dev::kv8_dequant(vc[2 * e + 1], sv));
+          }
+          *reinterpret_cast<uint4*>(&Vs[r][c]) = *reinterpret_cast<const uint4*>(&vout[0]);
+          *reinterpret_cast<uint4*>(&Vs[r][c + 8]) = *reinterpret_cast<const uint4*>(&vout[8]);
+        }
+      }
+      if (t0 + kTile < t_end_max) prefetch(t0 + kTile);
+    } else if (!quantized) {
       for (int idx = threadIdx.x; idx < (n - rs) * (kD / 8); idx += kThreads) {
         const int r = rs + idx / (kD / 8), c = (idx % (kD / 8)) * 8;
         const int row = phys(fr, t0 + r);
@@ -632,6 +692,10 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
   float* const po = reinterpret_cast<float*>(pml + static_cast<std::size_t>(rows) * Hq * splits);
   // One block per (kv head, split, group of RB rows). Decode (rows == 1) uses
   // the single-row instance (smallest shared-memory footprint).
+  static const bool pipe_on = [] {
+    const char* e = std::getenv("G4_ATTN_PIPE");
+    return e == nullptr || e[0] != '0';
+  }();
   auto launch = [&](auto rbtag, const int* grp, int nz) {
     constexpr int RB = decltype(rbtag)::value;
     const dim3 grid(Hk, lsplits, nz);
@@ -639,17 +703,17 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
       attn_split_kernel<true, false, RB><<<grid, kThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
           cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr, d_pt, row_pos, row_pt,
-          grp, row_tbase, row_tail);
+          grp, row_tbase, row_tail, pipe_on);
     else if (int4)
       attn_split_kernel<false, true, RB><<<grid, kThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
           nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt, row_pos, row_pt,
-          grp, row_tbase, row_tail);
+          grp, row_tbase, row_tail, pipe_on);
     else
       attn_split_kernel<false, false, RB><<<grid, kThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, d_pt, row_pos, row_pt, grp,
-          row_tbase, row_tail);
+          row_tbase, row_tail, pipe_on);
   };
   using One = std::integral_constant<int, 1>;
   using Many = std::integral_constant<int, kRowsPerBlock>;
