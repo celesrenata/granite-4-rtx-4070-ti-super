@@ -425,7 +425,9 @@ def main():
             raise SystemExit(f"--head mismatch: missing {missing} unexpected {unexpected}")
         print(f"fine-tune from {args.head} (step 0, fresh optimizer; new: {missing})", flush=True)
 
-    ds = RecordDataset(args.train)
+    # --train a,b,c: several Records dirs used as one dataset (no merged copy).
+    parts = [RecordDataset(t) for t in args.train.split(",") if t]
+    ds = parts[0] if len(parts) == 1 else torch.utils.data.ConcatDataset(parts)
     total_steps = int(math.ceil(len(ds) * args.epochs / args.accum))
     if args.max_steps:
         total_steps = min(total_steps, args.max_steps)
