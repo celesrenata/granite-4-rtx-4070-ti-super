@@ -985,8 +985,15 @@ kernel (one warp per row x head, tree tails in a per-row buffer;
 Rejected here: an EAGLE-3-style multi-layer head (`dump-hidden
 --feat-layers`, `train_eagle.py --extra-layers`; +1.8% over its matched
 control, +0.2% over r10 - not worth capturing two more features on every
-target path). r11 (r10 + ~2.7x more self-distilled chat,
-`scripts/eagle/stage_r11.sh`) is in progress.
+target path).
+
+**Head r11** (deployed): r10 fine-tuned 2 epochs on 11.2M tokens (8215 new
+self-distilled chat replies from `ds/chat_prompts2.json` + the r10 set;
+`scripts/eagle/stage_r11.sh`, eval prompts deduped against training).
+Offline K=6 tokens/round: chat_r9_eval 1.986 -> 2.116, chat_r11_eval 2.010 ->
+2.140, serving 2.351 -> 2.418. Warm serve with trees, held-out prompts: chat
+124.5 -> 140.2, novel 127.5 -> 131.3, serving 140.5 -> 144.7 tok/s, outputs ==
+plain. Live API: 126.8 tok/s with 1 client, 233.8 with 2 (r10: 121.9 / 225.5).
 
 ## Rules across phases
 
