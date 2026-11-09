@@ -184,8 +184,10 @@ Q4_K_M *weight* path is
 not yet supported by this engine (FP8/BF16 only), so the llama.cpp server
 remains the reference deployment until it lands. The FP8 paged pool
 (`kv_pool.h`, `kernels_phase3.cu`) stays test-only until the live path
-switches to it; the EAGLE draft head keeps its 1-layer BF16 KV (per-session
-footprint is negligible; conversion is deferred with the quality evidence).
+switches to it; the EAGLE draft head keeps a 1-layer KV that defaults to bf16
+but can be quantized with `G4_DRAFT_KV=8|4` (measured in
+`docs/deployment.md`); at 131072 positions the bf16 draft KV is ~537 MiB
+and does not fit beside the int4 reader pool.
 
 ## Measured KV8 A/B (gremlin-1, 2026-11-05)
 
