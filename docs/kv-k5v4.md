@@ -1,9 +1,12 @@
 # K5:V4 KV cache (design and status)
 
-Status: **phases 1-6 implemented and measured on gremlin-1 (2026-11-09); NOT deployed.** The change lives on
-branch `kv-k5v4` (uncommitted working tree). It is opt-in (`G4_KV8=5`); nothing changes unless that is set.
-The live service was restored to its original int4 config after testing. Not yet done: NixOS module option
-(`kv5`), upstreaming, and a soak test under real agent traffic.
+Status: **DEPLOYED on gremlin-1 (2026-11-09, NixOS generation 793).** Branch `kv-k5v4` (commit 4993580, pushed, NOT yet
+merged to `main`); the host flake input `granite4` is pinned to that branch/revision. It is opt-in
+(`services.granite4-rtx.kv5 = true` / `G4_KV8=5`); nothing changes for other deploys. gremlin-1 runs kv5 with pool 114688.
+Production verification after the switch: parity gate pass; engine `KV pool 114688 positions, main KV 5.20 GiB`; two concurrent
+54.9K-token agents correct and resident (0.7 s resume); GPU peak 15,999 of 16,376 MiB; Menagerie golden set 300/300 valid.
+Rollback: `nixos-rebuild switch --rollback` (generation 792, int4) or set `kv4 = true; kvPoolTokens = 122880;`.
+Not yet done: merge to `main` (then point the host input back at the bare repo), a soak test under real agent traffic.
 
 ## Format (fixed; see `kernel_math.h`, "K5")
 
