@@ -456,6 +456,148 @@ __global__ void kv_append_int4_multi_kernel(
   cache_v[cache] = cv;
 }
 
+// RoPE of q and k plus the KV append of multi rows in ONE launch (it was
+// three): block (h, r), d threads. h < Hq rotates query head h of row r into
+// q_rot; h >= Hq rotates KV head h - Hq's key and appends it with the value
+// at the row's slot - exactly rope_multi_kernel's rotation and the
+// kv_append_*_multi_kernel quantization (the scales are maxima, exact in any
+// order), so the cache and q_rot are bit-identical to the three launches.
+template <int BITS>
+__global__ void rope_append_multi_kernel(const std::uint16_t* __restrict__ q,
+                                         const std::uint16_t* __restrict__ k,
+                                         const std::uint16_t* __restrict__ v, const float* cos_tbl,
+                                         const float* sin_tbl, const MultiRows* __restrict__ mr,
+                                         int Hq, int Hk, int d, int stride,
+                                         std::uint16_t* __restrict__ q_rot, void* cache_k,
+                                         void* cache_v, float* k_scale, float* v_scale) {
+  const int hh = blockIdx.x, r = blockIdx.y, i = threadIdx.x;  // blockDim.x == d
+  const int half = d / 2;
+  const int ii = i < half ? i : i - half;
+  const std::size_t t = static_cast<std::size_t>(mr->pos[r]) * half + ii;
+  const float c = cos_tbl[t], s = sin_tbl[t];
+  auto rot = [&](const std::uint16_t* x) {
+    const float a = bf16_to_f32(x[i]);
+    const float b = bf16_to_f32(x[i < half ? i + half : i - half]);
+    return f32_to_bf16(i < half ? a * c - b * s : a * c + b * s);
+  };
+  if (hh < Hq) {
+    const std::size_t base = (static_cast<std::size_t>(r) * Hq + hh) * d;
+    q_rot[base + i] = rot(q + base);
+    return;
+  }
+  const int hkv = hh - Hq;
+  const std::size_t src = (static_cast<std::size_t>(r) * Hk + hkv) * d;
+  const std::uint16_t kr = rot(k + src);
+  const std::uint16_t vr = v[src + i];
+  const int row = mr->pt[r][multi_slot(mr, r)];
+  if (BITS == 16) {
+    const std::size_t o = (static_cast<std::size_t>(hkv) * stride + row) * d + i;
+    static_cast<std::uint16_t*>(cache_k)[o] = kr;
+    static_cast<std::uint16_t*>(cache_v)[o] = vr;
+    return;
+  }
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + row;
+  __shared__ float wmax[2][32];
+  __shared__ float smax[2];
+  if (BITS == 8) {
+    const float x = bf16_to_f32(kr), y = bf16_to_f32(vr);
+    const int lane = i & 31;
+    float ax = fabsf(x), ay = fabsf(y);
+    for (int off = 16; off > 0; off >>= 1) {
+      ax = fmaxf(ax, __shfl_down_sync(0xffffffffu, ax, off));
+      ay = fmaxf(ay, __shfl_down_sync(0xffffffffu, ay, off));
+    }
+    if (lane == 0) {
+      wmax[0][i >> 5] = ax;
+      wmax[1][i >> 5] = ay;
+    }
+    __syncthreads();
+    float mk = 0.0f, mv = 0.0f;
+    for (int w = 0; w < (d + 31) >> 5; ++w) {
+      mk = fmaxf(mk, wmax[0][w]);
+      mv = fmaxf(mv, wmax[1][w]);
+    }
+    if (i == 0) {
+      const float sk = dev::kv8_scale(mk), sv = dev::kv8_scale(mv);
+      smax[0] = sk;
+      smax[1] = sv;
+      k_scale[sc] = sk;
+      v_scale[sc] = sv;
+    }
+    __syncthreads();
+    const std::size_t o = (static_cast<std::size_t>(hkv) * stride + row) * d + i;
+    static_cast<std::int8_t*>(cache_k)[o] = dev::kv8_quant(x, smax[0]);
+    static_cast<std::int8_t*>(cache_v)[o] = dev::kv8_quant(y, smax[1]);
+    return;
+  }
+  // BITS == 4: threads w < d / 2 pack dims (2w, 2w + 1), as the int4 append.
+  __shared__ float sk_[256], sv_[256];
+  sk_[i] = bf16_to_f32(kr);
+  sv_[i] = bf16_to_f32(vr);
+  __syncthreads();
+  const int w = i;
+  const bool act = w < half;
+  float x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+  if (act) {
+    x0 = sk_[2 * w];
+    x1 = sk_[2 * w + 1];
+    y0 = sv_[2 * w];
+    y1 = sv_[2 * w + 1];
+  }
+  float ax = fmaxf(fabsf(x0), fabsf(x1)), ay = fmaxf(fabsf(y0), fabsf(y1));
+  for (int off = 16; off > 0; off >>= 1) {
+    ax = fmaxf(ax, __shfl_down_sync(0xffffffffu, ax, off));
+    ay = fmaxf(ay, __shfl_down_sync(0xffffffffu, ay, off));
+  }
+  if (act && (w & 31) == 0) {
+    wmax[0][w >> 5] = ax;
+    wmax[1][w >> 5] = ay;
+  }
+  __syncthreads();
+  if (w == 0) {
+    float mk = 0.0f, mv = 0.0f;
+    for (int wp = 0; wp < (half + 31) >> 5; ++wp) {
+      mk = fmaxf(mk, wmax[0][wp]);
+      mv = fmaxf(mv, wmax[1][wp]);
+    }
+    const float sk = dev::q4_scale(mk), sv = dev::q4_scale(mv);
+    smax[0] = sk;
+    smax[1] = sv;
+    k_scale[sc] = sk;
+    v_scale[sc] = sv;
+  }
+  __syncthreads();
+  if (!act) return;
+  const std::size_t o = (static_cast<std::size_t>(hkv) * stride + row) * (d / 2) + w;
+  static_cast<std::uint8_t*>(cache_k)[o] = static_cast<unsigned char>(
+      (dev::q4_quant(x0, smax[0]) & 0x0fu) | (dev::q4_quant(x1, smax[0]) << 4));
+  static_cast<std::uint8_t*>(cache_v)[o] = static_cast<unsigned char>(
+      (dev::q4_quant(y0, smax[1]) & 0x0fu) | (dev::q4_quant(y1, smax[1]) << 4));
+}
+
+int rope_append_multi(const std::uint16_t* q, const std::uint16_t* k, const std::uint16_t* v,
+                      const float* cos_tbl, const float* sin_tbl, const MultiRows* d_rows,
+                      int rows, int Hq, int Hk, int d, int stride, int bits,
+                      std::uint16_t* q_rot, void* ck, void* cv, float* ks, float* vs) {
+  if (d > 256 || (d & 63) != 0) return -1;
+  const dim3 grid(Hq + Hk, rows);
+  if (bits == 8)
+    rope_append_multi_kernel<8><<<grid, d>>>(q, k, v, cos_tbl, sin_tbl, d_rows, Hq, Hk, d, stride,
+                                            q_rot, ck, cv, ks, vs);
+  else if (bits == 4)
+    rope_append_multi_kernel<4><<<grid, d>>>(q, k, v, cos_tbl, sin_tbl, d_rows, Hq, Hk, d, stride,
+                                            q_rot, ck, cv, ks, vs);
+  else
+    rope_append_multi_kernel<16><<<grid, d>>>(q, k, v, cos_tbl, sin_tbl, d_rows, Hq, Hk, d,
+                                             stride, q_rot, ck, cv, ks, vs);
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+bool env_enabled(const char* name);
+bool fused_rope_append() {
+  static const bool on = env_enabled("G4_FUSED_ROPE");
+  return on;
+}
+
 // Row r's greedy id becomes its session's next token; positions advance.
 __global__ void multi_scatter_advance_kernel(MultiRows* mr, const std::int32_t* ids) {
   const int r = threadIdx.x;
@@ -2160,14 +2302,30 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
                             rows, Hq * d, Hk * d, Hk * d, H, d_qf, d_k_new, d_v_new) != 0)
       return -1;
     prof.mark(MultiProfile::kGemm);
-    rope_multi_kernel<<<static_cast<unsigned>((rows * nq + 255) / 256), 256>>>(
-        d_qf, g->cos_tbl, g->sin_tbl, d_mr, rows, Hq, d, d_qf_rot);
-    rope_multi_kernel<<<static_cast<unsigned>((rows * nk + 255) / 256), 256>>>(
-        d_k_new, g->cos_tbl, g->sin_tbl, d_mr, rows, Hk, d, d_k_new_rot);
+    // G4_FUSED_ROPE=0: separate RoPE (q, k) and KV-append launches.
+    const bool fused = fused_rope_append();
+    if (fused) {
+      const int bits = g->kv4 ? 4 : (g->kv8 ? 8 : 16);
+      void* const ck = g->kv4 ? static_cast<void*>(lw.kv4_k)
+                              : (g->kv8 ? static_cast<void*>(lw.kv8_k) : static_cast<void*>(lw.kv_k));
+      void* const cv = g->kv4 ? static_cast<void*>(lw.kv4_v)
+                              : (g->kv8 ? static_cast<void*>(lw.kv8_v) : static_cast<void*>(lw.kv_v));
+      float* const ks = g->kv4 ? lw.kv4_k_scale : lw.kv8_k_scale;
+      float* const vs = g->kv4 ? lw.kv4_v_scale : lw.kv8_v_scale;
+      if (rope_append_multi(d_qf, d_k_new, d_v_new, g->cos_tbl, g->sin_tbl, d_mr, rows, Hq, Hk, d,
+                            g->kv_stride, bits, d_qf_rot, ck, cv, ks, vs) != 0)
+        return -1;
+    } else {
+      rope_multi_kernel<<<static_cast<unsigned>((rows * nq + 255) / 256), 256>>>(
+          d_qf, g->cos_tbl, g->sin_tbl, d_mr, rows, Hq, d, d_qf_rot);
+      rope_multi_kernel<<<static_cast<unsigned>((rows * nk + 255) / 256), 256>>>(
+          d_k_new, g->cos_tbl, g->sin_tbl, d_mr, rows, Hk, d, d_k_new_rot);
+    }
     G4_CUDA_CHECK(cudaGetLastError());
     prof.mark(MultiProfile::kRope);
     int rc;
     if (g->kv4) {
+      if (!fused)
       kv_append_int4_multi_kernel<<<dim3(Hk, rows), d / 2>>>(
           d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale, d_mr,
           g->kv_stride, Hk, d);
@@ -2177,6 +2335,7 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
                       true, nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups, row_tbase,
                       row_tail, kv_hint);
     } else if (g->kv8) {
+      if (!fused)
       kv_append_int8_multi_kernel<<<dim3(Hk, rows), d>>>(
           d_k_new_rot, d_v_new, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, d_mr,
           g->kv_stride, Hk, d);
@@ -2186,6 +2345,7 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
                       nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups, row_tbase, row_tail,
                       kv_hint);
     } else {
+      if (!fused)
       kv_append_multi_kernel<<<dim3((Hk * d + 255) / 256, rows), 256>>>(
           d_k_new_rot, d_v_new, lw.kv_k, lw.kv_v, d_mr, rows, g->kv_stride, Hk, d);
       rc = attn_split(d_qf_rot, lw.kv_k, lw.kv_v, g->spec.attention_multiplier, Hq, Hk, d, 0,
@@ -3447,6 +3607,14 @@ int gpu_multi_rope(const std::uint16_t* x, const float* cos_tbl, const float* si
   rope_multi_kernel<<<static_cast<unsigned>((n + 255) / 256), 256>>>(x, cos_tbl, sin_tbl, d_rows,
                                                                     rows, heads, d, out);
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+int gpu_multi_rope_append(const std::uint16_t* q, const std::uint16_t* k, const std::uint16_t* v,
+                          const float* cos_tbl, const float* sin_tbl, const GpuMultiRows* d_rows,
+                          int rows, int Hq, int Hk, int d, int bits, void* cache_k, void* cache_v,
+                          float* k_scale, float* v_scale, int stride, std::uint16_t* q_rot) {
+  if (!fused_rope_append() || d_rows == nullptr || rows < 1 || rows > kMaxVerifyRows) return -1;
+  return rope_append_multi(q, k, v, cos_tbl, sin_tbl, d_rows, rows, Hq, Hk, d, stride, bits, q_rot,
+                           cache_k, cache_v, k_scale, v_scale);
 }
 int gpu_multi_kv_append(const std::uint16_t* k, const std::uint16_t* v, int bits,
                         void* cache_k, void* cache_v, float* k_scale, float* v_scale,
