@@ -167,6 +167,48 @@ __device__ __forceinline__ void q4_dequant_pair(unsigned char byte, float scale,
   hi = scale * h;
 }
 
+// ---------------------------------------------------------------------------
+// K5 (5-bit K cache), device twin of k5_*_host in kernel_math.h (design: docs/kv-k5v4.md).
+//
+// s = amax / 15; code = clamp(round_away(x / s), -15, 15) + 16 (1..31); dequant = s * (code - 16).
+// A (head, position) K row is 80 bytes: bytes [0, 64) hold the LOW 4 bits of each code exactly
+// like int4 (dim 2j in the low nibble, 2j+1 in the high nibble); bytes [64, 80) hold the HIGH
+// bit of each code, bit (d % 8) of byte 64 + d / 8. V stays int4 (q4_*).
+// ---------------------------------------------------------------------------
+constexpr int kK5RowBytes = 80;
+constexpr int kK5NibbleBytes = 64;
+
+__device__ __forceinline__ float k5_scale(float amax) {
+  return amax / 15.0f;
+}
+
+// Quantize one value to a 0..31 code; scale == 0 -> 16 (zero).
+__device__ __forceinline__ unsigned char k5_quant(float x, float scale) {
+  if (scale == 0.0f) return 16;
+  const long r = kv8_round_away(x / scale);
+  const long clamped = r > 15 ? 15 : (r < -15 ? -15 : r);
+  return static_cast<unsigned char>(clamped + 16);
+}
+
+// Dequantize the 5-bit codes of dims (2j, 2j+1) from one nibble byte and their two high bits.
+__device__ __forceinline__ void k5_dequant_pair(unsigned char nibbles, unsigned hi_even,
+                                               unsigned hi_odd, float scale, float& lo, float& hi) {
+  const int c0 = static_cast<int>(nibbles & 0x0fu) | static_cast<int>((hi_even & 1u) << 4);
+  const int c1 = static_cast<int>((nibbles >> 4) & 0x0fu) | static_cast<int>((hi_odd & 1u) << 4);
+  lo = scale * static_cast<float>(c0 - 16);
+  hi = scale * static_cast<float>(c1 - 16);
+}
+
+// Writes the 16-byte high-bit plane of one K5 row. The caller has stored each dim's code >> 4 in
+// hi[0..127] and synchronized the block; thread w < 16 packs dims [8w, 8w + 8) into byte w
+// (bit d % 8 of byte d / 8), matching k5_pack_row_host.
+__device__ __forceinline__ void k5_write_plane(const unsigned char* hi, unsigned char* row, int w) {
+  unsigned plane = 0;
+#pragma unroll
+  for (int bit = 0; bit < 8; ++bit) plane |= static_cast<unsigned>(hi[8 * w + bit] & 1u) << bit;
+  row[kK5NibbleBytes + w] = static_cast<unsigned char>(plane);
+}
+
 }  // namespace dev
 }  // namespace granite4
 

@@ -65,7 +65,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const int* row_pos = nullptr, const int* const* row_pt = nullptr,
                const int* row_grp = nullptr, int ngroups = 0,
                const int* row_tbase = nullptr, const int* row_tail = nullptr,
-               int kv_hint = 0);
+               int kv_hint = 0, bool k5 = false);
 
 }  // namespace granite4
 

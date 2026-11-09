@@ -117,6 +117,61 @@ inline void q4_dequant_pair_host(unsigned char byte, float scale, float& lo, flo
 }
 
 // ---------------------------------------------------------------------------
+// K5 (5-bit K cache) - host twin of the future dev::k5_* (design: docs/kv-k5v4.md).
+//
+// Why: measured on the reference model (docs/kv-quant-sim.md), the K half of the KV cache is
+// what int4 damages; V tolerates 4 bits. A K5:V4 cache costs 47.5 KiB/position (K 25 KiB +
+// V 20 KiB + 2.5 KiB scales) against 42.5 for int4 and 82.5 for int8.
+//
+// Per-row semantics (one row = 128 dims of one KV head at one position), same family as int4:
+//   s = amax / 15 (IEEE RNE); code = clamp(round_half_away(x / s), -15, 15) + 16  (1..31);
+//   dequant = s * (code - 16).  s == 0 -> code 16 (exact zero).
+//
+// Storage (80 bytes per 128-dim row, 16-byte aligned):
+//   bytes [0, 64)  the LOW 4 bits of every code, packed two per byte EXACTLY as int4:
+//                  byte j holds dim 2j in its low nibble and dim 2j+1 in its high nibble;
+//   bytes [64, 80) the HIGH bit (bit 4) of every code, one bit per dim: bit (d % 8) of byte
+//                  64 + d / 8.
+// Splitting the 5th bit into its own plane keeps every load 16-byte aligned and lets the
+// kernels reuse the proven nibble unpack, adding one bit-test per element.
+// ---------------------------------------------------------------------------
+constexpr int kK5RowDim = 128;
+constexpr int kK5NibbleBytes = kK5RowDim / 2;               // 64
+constexpr int kK5PlaneBytes = kK5RowDim / 8;                // 16
+constexpr int kK5RowBytes = kK5NibbleBytes + kK5PlaneBytes; // 80
+inline float k5_scale_host(float amax) {
+  return amax / 15.0f;
+}
+inline unsigned char k5_quant_host(float x, float scale) {
+  if (scale == 0.0f) return 16;
+  const float r = x / scale;
+  const long long clamped =
+      r > 15.0f ? 15 : (r < -15.0f ? -15 : static_cast<long long>(std::round(r)));
+  return static_cast<unsigned char>(clamped + 16);
+}
+inline float k5_dequant_host(unsigned char code, float scale) {
+  return scale * static_cast<float>(static_cast<int>(code) - 16);
+}
+// Pack 128 codes (each 0..31) into the 80-byte row.
+inline void k5_pack_row_host(const unsigned char* codes, unsigned char* out) {
+  for (int j = 0; j < kK5NibbleBytes; ++j) {
+    out[j] = static_cast<unsigned char>((codes[2 * j] & 0x0fu) | ((codes[2 * j + 1] & 0x0fu) << 4));
+  }
+  for (int b = 0; b < kK5PlaneBytes; ++b) {
+    unsigned plane = 0;
+    for (int bit = 0; bit < 8; ++bit) plane |= ((codes[8 * b + bit] >> 4) & 1u) << bit;
+    out[kK5NibbleBytes + b] = static_cast<unsigned char>(plane);
+  }
+}
+inline void k5_unpack_row_host(const unsigned char* in, unsigned char* codes) {
+  for (int d = 0; d < kK5RowDim; ++d) {
+    const unsigned char byte = in[d / 2];
+    const unsigned low = (d & 1) ? ((byte >> 4) & 0x0fu) : (byte & 0x0fu);
+    const unsigned high = (in[kK5NibbleBytes + d / 8] >> (d % 8)) & 1u;
+    codes[d] = static_cast<unsigned char>(low | (high << 4));
+  }
+}
+// ---------------------------------------------------------------------------
 // RMSNorm (float reference). n is the hidden size (one row).
 // ---------------------------------------------------------------------------
 

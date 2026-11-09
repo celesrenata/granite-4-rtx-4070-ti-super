@@ -213,6 +213,61 @@ __global__ void __launch_bounds__(kKvAppendInt4Threads)
   cache_v[cache] = cv;
 }
 
+// K5:V4 (docs/kv-k5v4.md): kv_append_int4_kernel with a 5-bit K. K goes to an 80-byte row (64
+// nibble bytes laid out exactly like int4, then a 16-byte high-bit plane); V stays int4.
+__global__ void __launch_bounds__(kKvAppendInt4Threads)
+    kv_append_k5v4_kernel(const std::uint16_t* __restrict__ src_k,
+                          const std::uint16_t* __restrict__ src_v,
+                          std::uint8_t* __restrict__ cache_k,
+                          std::uint8_t* __restrict__ cache_v,
+                          float* __restrict__ cache_k_scale,
+                          float* __restrict__ cache_v_scale,
+                          const int* __restrict__ d_pos, int stride, int Hk, int d,
+                          const int* __restrict__ d_pt) {
+  const int hkv = blockIdx.x;
+  const int t = *d_pos;
+  const int row = (d_pt != nullptr) ? d_pt[t] : t;
+  const int w = threadIdx.x;
+  const int d0 = 2 * w;
+  const int d1 = d0 + 1;
+  const std::size_t src0 = static_cast<std::size_t>(hkv) * d + d0;
+  const std::size_t src1 = static_cast<std::size_t>(hkv) * d + d1;
+  const std::size_t krow = (static_cast<std::size_t>(hkv) * stride + row) * dev::kK5RowBytes;
+  const std::size_t vcache = (static_cast<std::size_t>(hkv) * stride + row) * (d / 2) + w;
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + row;
+  __shared__ float s_amax[2];
+  __shared__ unsigned char s_hi[128];
+  if (w == 0) {
+    float a = 0.0f, b = 0.0f;
+    for (int j = 0; j < d; ++j) {
+      const float x = bf16_to_f32(src_k[static_cast<std::size_t>(hkv) * d + j]);
+      const float y = bf16_to_f32(src_v[static_cast<std::size_t>(hkv) * d + j]);
+      a = fmaxf(a, fabsf(x));
+      b = fmaxf(b, fabsf(y));
+    }
+    s_amax[0] = a;
+    s_amax[1] = b;
+  }
+  __syncthreads();
+  const float sk = dev::k5_scale(s_amax[0]);
+  const float sv = dev::q4_scale(s_amax[1]);
+  if (w == 0) {
+    cache_k_scale[sc] = sk;
+    cache_v_scale[sc] = sv;
+  }
+  __syncthreads();
+  const unsigned char c0 = dev::k5_quant(bf16_to_f32(src_k[src0]), sk);
+  const unsigned char c1 = dev::k5_quant(bf16_to_f32(src_k[src1]), sk);
+  cache_k[krow + w] = static_cast<unsigned char>((c0 & 0x0fu) | ((c1 & 0x0fu) << 4));
+  s_hi[d0] = static_cast<unsigned char>(c0 >> 4);
+  s_hi[d1] = static_cast<unsigned char>(c1 >> 4);
+  cache_v[vcache] =
+      static_cast<unsigned char>((dev::q4_quant(bf16_to_f32(src_v[src0]), sv) & 0x0fu) |
+                                 (dev::q4_quant(bf16_to_f32(src_v[src1]), sv) << 4));
+  __syncthreads();
+  if (w < dev::kK5RowBytes - dev::kK5NibbleBytes) dev::k5_write_plane(s_hi, cache_k + krow, w);
+}
+
 // Greedy pick per logits row: the first index of the row maximum (the host
 // sample_greedy_f32 / argmax_f32 tie rule). One block per row. With d_pos
 // (single-row decode) the token goes to out[*d_pos + 1] and *d_pos advances,
@@ -456,6 +511,67 @@ __global__ void kv_append_int4_multi_kernel(
   cache_v[cache] = cv;
 }
 
+// K5:V4 mirror of kv_append_int4_multi_kernel (per-row position / table).
+__global__ void kv_append_k5v4_multi_kernel(
+    const std::uint16_t* __restrict__ src_k, const std::uint16_t* __restrict__ src_v,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    float* __restrict__ cache_k_scale, float* __restrict__ cache_v_scale,
+    const MultiRows* __restrict__ mr, int stride, int Hk, int d) {
+  const int hkv = blockIdx.x;
+  const int r = blockIdx.y;
+  const int w = threadIdx.x;  // blockDim.x == d/2 == 64
+  const int row = mr->pt[r][multi_slot(mr, r)];
+  const int d0 = 2 * w;
+  const int d1 = d0 + 1;
+  const std::size_t src0 = (static_cast<std::size_t>(r) * Hk + hkv) * d + d0;
+  const std::size_t src1 = (static_cast<std::size_t>(r) * Hk + hkv) * d + d1;
+  const std::size_t krow = (static_cast<std::size_t>(hkv) * stride + row) * dev::kK5RowBytes;
+  const std::size_t vcache = (static_cast<std::size_t>(hkv) * stride + row) * (d / 2) + w;
+  const std::size_t sc = static_cast<std::size_t>(hkv) * stride + row;
+  const float x0 = bf16_to_f32(src_k[src0]);
+  const float x1 = bf16_to_f32(src_k[src1]);
+  const float y0 = bf16_to_f32(src_v[src0]);
+  const float y1 = bf16_to_f32(src_v[src1]);
+  __shared__ float smax[2];
+  __shared__ unsigned char s_hi[128];
+  const int lane = w & 31;
+  float ax = fmaxf(fabsf(x0), fabsf(x1));
+  float ay = fmaxf(fabsf(y0), fabsf(y1));
+  for (int off = 16; off > 0; off >>= 1) {
+    ax = fmaxf(ax, __shfl_down_sync(0xffffffffu, ax, off));
+    ay = fmaxf(ay, __shfl_down_sync(0xffffffffu, ay, off));
+  }
+  __shared__ float wmax[2][32];
+  if (lane == 0) {
+    wmax[0][w >> 5] = ax;
+    wmax[1][w >> 5] = ay;
+  }
+  __syncthreads();
+  float mk = 0.0f, mv = 0.0f;
+  for (int wp = 0; wp < ((d / 2) + 31) >> 5; ++wp) {
+    mk = fmaxf(mk, wmax[0][wp]);
+    mv = fmaxf(mv, wmax[1][wp]);
+  }
+  if (w == 0) {
+    const float sk = dev::k5_scale(mk);
+    const float sv = dev::q4_scale(mv);
+    smax[0] = sk;
+    smax[1] = sv;
+    cache_k_scale[sc] = sk;
+    cache_v_scale[sc] = sv;
+  }
+  __syncthreads();
+  const unsigned char c0 = dev::k5_quant(x0, smax[0]);
+  const unsigned char c1 = dev::k5_quant(x1, smax[0]);
+  cache_k[krow + w] = static_cast<unsigned char>((c0 & 0x0fu) | ((c1 & 0x0fu) << 4));
+  s_hi[d0] = static_cast<unsigned char>(c0 >> 4);
+  s_hi[d1] = static_cast<unsigned char>(c1 >> 4);
+  cache_v[vcache] = static_cast<unsigned char>((dev::q4_quant(y0, smax[1]) & 0x0fu) |
+                                               (dev::q4_quant(y1, smax[1]) << 4));
+  __syncthreads();
+  if (w < dev::kK5RowBytes - dev::kK5NibbleBytes) dev::k5_write_plane(s_hi, cache_k + krow, w);
+}
+
 // RoPE of q and k plus the KV append of multi rows in ONE launch (it was
 // three): block (h, r), d threads. h < Hq rotates query head h of row r into
 // q_rot; h >= Hq rotates KV head h - Hq's key and appends it with the value
@@ -530,7 +646,8 @@ __global__ void rope_append_multi_kernel(const std::uint16_t* __restrict__ q,
     static_cast<std::int8_t*>(cache_v)[o] = dev::kv8_quant(y, smax[1]);
     return;
   }
-  // BITS == 4: threads w < d / 2 pack dims (2w, 2w + 1), as the int4 append.
+  // BITS == 4 / 5: threads w < d / 2 pack dims (2w, 2w + 1), as the int4 append. BITS == 5 is
+  // K5:V4 (K 5-bit in an 80-byte row; docs/kv-k5v4.md) and requires d == 128.
   __shared__ float sk_[256], sv_[256];
   sk_[i] = bf16_to_f32(kr);
   sv_[i] = bf16_to_f32(vr);
@@ -560,13 +677,32 @@ __global__ void rope_append_multi_kernel(const std::uint16_t* __restrict__ q,
       mk = fmaxf(mk, wmax[0][wp]);
       mv = fmaxf(mv, wmax[1][wp]);
     }
-    const float sk = dev::q4_scale(mk), sv = dev::q4_scale(mv);
+    const float sk = BITS == 5 ? dev::k5_scale(mk) : dev::q4_scale(mk), sv = dev::q4_scale(mv);
     smax[0] = sk;
     smax[1] = sv;
     k_scale[sc] = sk;
     v_scale[sc] = sv;
   }
   __syncthreads();
+  if (BITS == 5) {
+    __shared__ unsigned char s_hi[128];
+    const std::size_t krow = (static_cast<std::size_t>(hkv) * stride + row) * dev::kK5RowBytes;
+    if (act) {
+      const unsigned char c0 = dev::k5_quant(x0, smax[0]);
+      const unsigned char c1 = dev::k5_quant(x1, smax[0]);
+      static_cast<std::uint8_t*>(cache_k)[krow + w] =
+          static_cast<unsigned char>((c0 & 0x0fu) | ((c1 & 0x0fu) << 4));
+      s_hi[2 * w] = static_cast<unsigned char>(c0 >> 4);
+      s_hi[2 * w + 1] = static_cast<unsigned char>(c1 >> 4);
+      const std::size_t vo = (static_cast<std::size_t>(hkv) * stride + row) * (d / 2) + w;
+      static_cast<std::uint8_t*>(cache_v)[vo] = static_cast<unsigned char>(
+          (dev::q4_quant(y0, smax[1]) & 0x0fu) | (dev::q4_quant(y1, smax[1]) << 4));
+    }
+    __syncthreads();  // every thread reaches this barrier, active or not
+    if (act && w < dev::kK5RowBytes - dev::kK5NibbleBytes)
+      dev::k5_write_plane(s_hi, static_cast<std::uint8_t*>(cache_k) + krow, w);
+    return;
+  }
   if (!act) return;
   const std::size_t o = (static_cast<std::size_t>(hkv) * stride + row) * (d / 2) + w;
   static_cast<std::uint8_t*>(cache_k)[o] = static_cast<unsigned char>(
@@ -583,6 +719,9 @@ int rope_append_multi(const std::uint16_t* q, const std::uint16_t* k, const std:
   const dim3 grid(Hq + Hk, rows);
   if (bits == 8)
     rope_append_multi_kernel<8><<<grid, d>>>(q, k, v, cos_tbl, sin_tbl, d_rows, Hq, Hk, d, stride,
+                                            q_rot, ck, cv, ks, vs);
+  else if (bits == 5)
+    rope_append_multi_kernel<5><<<grid, d>>>(q, k, v, cos_tbl, sin_tbl, d_rows, Hq, Hk, d, stride,
                                             q_rot, ck, cv, ks, vs);
   else if (bits == 4)
     rope_append_multi_kernel<4><<<grid, d>>>(q, k, v, cos_tbl, sin_tbl, d_rows, Hq, Hk, d, stride,
@@ -980,6 +1119,14 @@ int granite4_kernel_kv_append_int4_batched(const std::uint16_t* d_src_k,
                                            float* d_cache_v_scale, int base_pos,
                                            int rows, int stride, int Hk, int d,
                                            const int* d_pt = nullptr);
+int granite4_kernel_kv_append_k5v4_batched(const std::uint16_t* d_src_k,
+                                           const std::uint16_t* d_src_v,
+                                           std::uint8_t* d_cache_k,
+                                           std::uint8_t* d_cache_v,
+                                           float* d_cache_k_scale,
+                                           float* d_cache_v_scale, int base_pos,
+                                           int rows, int stride, int Hk, int d,
+                                           const int* d_pt = nullptr);
 int granite4_kernel_gqa_fused_batched(const std::uint16_t* d_q,
                                       const std::uint16_t* d_k,
                                       const std::uint16_t* d_v, float att_scale,
@@ -1122,6 +1269,7 @@ struct GpuKvArena {
   int rows = 0;  // positions per (layer, kv head): the pool, in rows
   int L = 0, Hk = 0, d = 0;
   bool kv8 = false, kv4 = false;
+  bool k5 = false;  // K5:V4 (implies kv4): K is 5-bit in 80-byte rows, V int4
   std::uint16_t* kv_k = nullptr;
   std::uint16_t* kv_v = nullptr;
   std::int8_t* kv8_k = nullptr;
@@ -1170,6 +1318,9 @@ struct GpuCtx {
   float* kv4_k_scale = nullptr;    // [L][Hk][max_pos]
   float* kv4_v_scale = nullptr;    // [L][Hk][max_pos]
   bool kv4 = false;                // store the persistent cache as int4
+  // K5:V4 (docs/kv-k5v4.md): implies kv4. K rows are 80 bytes (64 nibble bytes + a 16-byte
+  // high-bit plane), V rows stay d/2. G4_KV8=5 selects it.
+  bool k5 = false;
   std::uint16_t* compact_k = nullptr;  // [Hk][max_pos][d] working prefix
   std::uint16_t* compact_v = nullptr;  // [Hk][max_pos][d]
   std::uint16_t* logits_scratch = nullptr;  // [Hq][max_pos] (fallback path)
@@ -1258,13 +1409,14 @@ namespace {
 // The persistent-KV format a context (or arena) resolves to for `model`:
 // split-KV attention is the only path that reads the quantized caches, so a
 // KV8/KV4 request on a shape it cannot serve falls back to bf16.
-void resolve_kv_mode(const ModelConfig& model, bool* kv8, bool* kv4, bool* split) {
+void resolve_kv_mode(const ModelConfig& model, bool* kv8, bool* kv4, bool* split, bool* k5) {
   *split = model.head_dim == 128 && model.num_attention_heads == 4 * model.num_key_value_heads;
   const char* const sa = std::getenv("G4_SPLIT_ATTN");
   if (sa != nullptr && sa[0] == '0') *split = false;
   const char* const kvfmt = std::getenv("G4_KV8");
   *kv8 = kvfmt != nullptr && kvfmt[0] == '1' && *split;
-  *kv4 = kvfmt != nullptr && kvfmt[0] == '4' && *split;
+  *kv4 = kvfmt != nullptr && (kvfmt[0] == '4' || kvfmt[0] == '5') && *split;
+  *k5 = kvfmt != nullptr && kvfmt[0] == '5' && *split;
 }
 GpuCtx* create_ctx(const ModelConfig& model, const ForwardSpec& spec, int max_positions,
                    GpuKvArena* arena);
@@ -1388,7 +1540,8 @@ GpuCtx* create_ctx(const ModelConfig& model, const ForwardSpec& spec, int max_po
   // formats store codes + a per-row float scale.
   const char* const kvfmt = std::getenv("G4_KV8");
   g->kv8 = kvfmt != nullptr && kvfmt[0] == '1';
-  g->kv4 = kvfmt != nullptr && kvfmt[0] == '4';
+  g->kv4 = kvfmt != nullptr && (kvfmt[0] == '4' || kvfmt[0] == '5');
+  g->k5 = kvfmt != nullptr && kvfmt[0] == '5';
   // Split-KV attention is the only int8 dequant-on-load path wired (decode,
   // verify and prefill); the fused-GQA variants read the bf16 cache, which is
   // not allocated under KV8. Resolve split_attn before allocating so a kv8
@@ -1406,11 +1559,13 @@ GpuCtx* create_ctx(const ModelConfig& model, const ForwardSpec& spec, int max_po
                          "(d==128, Hq==4*Hk); falling back to bf16 cache\n");
   g->kv8 = g->kv8 && g->split_attn;
   g->kv4 = g->kv4 && g->split_attn;
+  g->k5 = g->k5 && g->kv4;
   if (arena != nullptr) {
     // The arena fixes the format; a context on it needs the split-KV path
     // (the compact-prefix fallback indexes by position, not by arena row).
     g->kv8 = arena->kv8;
     g->kv4 = arena->kv4;
+    g->k5 = arena->k5;
     if (!g->split_attn) {
       std::fprintf(stderr, "granite4: a shared KV arena needs split-KV attention "
                            "(d==128, Hq==4*Hk, G4_SPLIT_ATTN != 0)\n");
@@ -1419,6 +1574,7 @@ GpuCtx* create_ctx(const ModelConfig& model, const ForwardSpec& spec, int max_po
     }
   }
   std::size_t kv_bytes = 0;
+  std::size_t kv_k_bytes = 0;  // K buffer: wider than V under K5 (80-byte rows)
   std::size_t kv8_scale_bytes = 0;
   std::size_t compact_bytes = 0;
   std::size_t token_scratch_elems = 0;
@@ -1432,6 +1588,8 @@ GpuCtx* create_ctx(const ModelConfig& model, const ForwardSpec& spec, int max_po
              : (g->kv8 ? static_cast<std::size_t>(g->d)
                        : static_cast<std::size_t>(g->d) * sizeof(std::uint16_t));
   if (!checked_mul(kv_rows, kv_row_bytes, &kv_bytes) ||
+      !checked_mul(kv_rows, g->k5 ? static_cast<std::size_t>(dev::kK5RowBytes) : kv_row_bytes,
+                   &kv_k_bytes) ||
       !checked_mul(kv8_scale_elems, sizeof(float), &kv8_scale_bytes) ||
       !checked_mul(compact_elems, sizeof(std::uint16_t), &compact_bytes) ||
       !checked_mul(static_cast<std::size_t>(g->Hq),
@@ -1468,7 +1626,7 @@ GpuCtx* create_ctx(const ModelConfig& model, const ForwardSpec& spec, int max_po
   } else if (g->kv4) {
     // KV4: int4 codes (d/2 bytes/row) + a per-row float scale; no bf16
     // persistent cache and no compact-prefix scratch (both left null).
-    e = cudaMalloc(&g->kv4_k, kv_bytes);
+    e = cudaMalloc(&g->kv4_k, kv_k_bytes);
     if (e == cudaSuccess) e = cudaMalloc(&g->kv4_v, kv_bytes);
     if (e == cudaSuccess) e = cudaMalloc(&g->kv4_k_scale, kv8_scale_bytes);
     if (e == cudaSuccess) e = cudaMalloc(&g->kv4_v_scale, kv8_scale_bytes);
@@ -1630,6 +1788,7 @@ struct LayerView {
   float* kv4_k_scale;
   float* kv4_v_scale;
   bool kv4;
+  bool k5;  // K5:V4: kv4_k rows are kK5RowBytes
 };
 
 LayerView layer_view(const GpuCtx* g, int layer) {
@@ -1641,6 +1800,7 @@ LayerView layer_view(const GpuCtx* g, int layer) {
       g->weights + lay.embed_bytes() + static_cast<std::size_t>(layer) * lay.layer_bytes();
   const std::size_t kv = static_cast<std::size_t>(layer) * g->Hk * g->kv_stride * g->d;
   const std::size_t kv4 = static_cast<std::size_t>(layer) * g->Hk * g->kv_stride * (g->d / 2);
+  const std::size_t kv4k = g->k5 ? static_cast<std::size_t>(layer) * g->Hk * g->kv_stride * dev::kK5RowBytes : kv4;
   const std::size_t kv8 = static_cast<std::size_t>(layer) * g->Hk * g->kv_stride;
   LayerView v;
   v.attn_norm = reinterpret_cast<const std::uint16_t*>(b + lay.off_attn_norm());
@@ -1661,7 +1821,8 @@ LayerView layer_view(const GpuCtx* g, int layer) {
   v.kv8_k_scale = g->kv8 ? g->kv8_k_scale + kv8 : nullptr;
   v.kv8_v_scale = g->kv8 ? g->kv8_v_scale + kv8 : nullptr;
   v.kv4 = g->kv4;
-  v.kv4_k = g->kv4 ? g->kv4_k + kv4 : nullptr;
+  v.k5 = g->k5;
+  v.kv4_k = g->kv4 ? g->kv4_k + kv4k : nullptr;
   v.kv4_v = g->kv4 ? g->kv4_v + kv4 : nullptr;
   v.kv4_k_scale = g->kv4 ? g->kv4_k_scale + kv8 : nullptr;
   v.kv4_v_scale = g->kv4 ? g->kv4_v_scale + kv8 : nullptr;
@@ -1914,7 +2075,11 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
         d_k_new_rot);
     G4_CUDA_CHECK(cudaGetLastError());
     const int kv_len = t_host + 1;
-    if (g->kv4) {
+    if (g->kv4 && g->k5) {
+      kv_append_k5v4_kernel<<<Hk, kKvAppendInt4Threads>>>(
+          d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale,
+          g->d_pos, kv_stride, Hk, d, g->d_pt);
+    } else if (g->kv4) {
       kv_append_int4_kernel<<<Hk, kKvAppendInt4Threads>>>(
           d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale,
           g->d_pos, kv_stride, Hk, d, g->d_pt);
@@ -1944,7 +2109,7 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
                      kv_stride, g->attn_scratch, d_attn_out, nullptr, nullptr,
                      lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
                      true, g->d_pt, max_pos, nullptr, nullptr, nullptr, 0, nullptr, nullptr,
-                     g->decode_kv_hint) != 0)
+                     g->decode_kv_hint, g->k5) != 0)
         return -1;
     } else if (g->kv8) {
       // KV8: the persistent cache is int8, so only the split-KV attention
@@ -2134,14 +2299,17 @@ int forward_rows_batched(GpuCtx* g, const std::int32_t* d_tokens, int start, int
               d_k_new, g->cos_tbl + static_cast<std::size_t>(start) * half,
               g->sin_tbl + static_cast<std::size_t>(start) * half, rows, Hk, d,
               d_k_new_rot) != 0 ||
-          granite4_kernel_kv_append_int4_batched(
-              d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale,
-              start, rows, g->kv_stride, Hk, d, g->d_pt) != 0 ||
+          (g->k5 ? granite4_kernel_kv_append_k5v4_batched(
+                       d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale,
+                       start, rows, g->kv_stride, Hk, d, g->d_pt)
+                 : granite4_kernel_kv_append_int4_batched(
+                       d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale,
+                       start, rows, g->kv_stride, Hk, d, g->d_pt)) != 0 ||
           attn_split(d_qf_rot, nullptr, nullptr, g->spec.attention_multiplier, Hq, Hk, d,
                      start, nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out,
                      nullptr, nullptr, lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k,
                      lw.kv4_v, true, g->d_pt, g->max_pos, nullptr, nullptr, nullptr, 0,
-                     nullptr, nullptr, end) != 0)
+                     nullptr, nullptr, end, g->k5) != 0)
         return -1;
     } else if (g->kv8) {
       // KV8: rotate Q/K (the bf16 stage's RoPE), append the verify rows to the
@@ -2305,7 +2473,7 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
     // G4_FUSED_ROPE=0: separate RoPE (q, k) and KV-append launches.
     const bool fused = fused_rope_append();
     if (fused) {
-      const int bits = g->kv4 ? 4 : (g->kv8 ? 8 : 16);
+      const int bits = g->k5 ? 5 : (g->kv4 ? 4 : (g->kv8 ? 8 : 16));
       void* const ck = g->kv4 ? static_cast<void*>(lw.kv4_k)
                               : (g->kv8 ? static_cast<void*>(lw.kv8_k) : static_cast<void*>(lw.kv_k));
       void* const cv = g->kv4 ? static_cast<void*>(lw.kv4_v)
@@ -2325,7 +2493,11 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
     prof.mark(MultiProfile::kRope);
     int rc;
     if (g->kv4) {
-      if (!fused)
+      if (!fused && g->k5)
+      kv_append_k5v4_multi_kernel<<<dim3(Hk, rows), d / 2>>>(
+          d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale, d_mr,
+          g->kv_stride, Hk, d);
+      else if (!fused)
       kv_append_int4_multi_kernel<<<dim3(Hk, rows), d / 2>>>(
           d_k_new_rot, d_v_new, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale, d_mr,
           g->kv_stride, Hk, d);
@@ -2333,7 +2505,7 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
                       nullptr, rows, g->kv_stride, g->attn_scratch, d_attn_out, nullptr,
                       nullptr, lw.kv4_k_scale, lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
                       true, nullptr, g->max_pos, row_pos, row_pt, row_grp, ngroups, row_tbase,
-                      row_tail, kv_hint);
+                      row_tail, kv_hint, g->k5);
     } else if (g->kv8) {
       if (!fused)
       kv_append_int8_multi_kernel<<<dim3(Hk, rows), d>>>(
@@ -2545,14 +2717,17 @@ int forward_prefill(GpuCtx* g, const std::int32_t* d_tokens, int start, int end,
         // K, quantizing K and V per row as two-per-byte int4 codes), then run
         // the int4 tensor-core causal attention. The fused-GQA rows fallback
         // reads the unallocated bf16 cache, so it is unavailable under KV4.
-        if (prefill_rope_split_append_int4(
-                s.qkv, g->cos_tbl, g->sin_tbl, c0, M, Hq, Hk, d, g->kv_stride,
-                s.q_rot, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale, g->d_pt) != 0 ||
+        if ((g->k5 ? prefill_rope_split_append_k5v4(
+                         s.qkv, g->cos_tbl, g->sin_tbl, c0, M, Hq, Hk, d, g->kv_stride, s.q_rot,
+                         lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale, g->d_pt)
+                   : prefill_rope_split_append_int4(
+                         s.qkv, g->cos_tbl, g->sin_tbl, c0, M, Hq, Hk, d, g->kv_stride, s.q_rot,
+                         lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale, g->d_pt)) != 0 ||
             prefill_attention(s.q_rot, nullptr, nullptr,
                               g->spec.attention_multiplier, Hq, Hk, d, c0, M,
                               g->kv_stride, s.attn, nullptr, nullptr, lw.kv4_k_scale,
                               lw.kv4_v_scale, false, lw.kv4_k, lw.kv4_v,
-                              true, g->d_pt) != 0)
+                              true, g->d_pt, g->k5) != 0)
           return -1;
       } else if (g->kv8) {
         // KV8: append the chunk's K/V to the int8 persistent cache (rotating
@@ -2961,7 +3136,7 @@ int gpu_decode_multi(GpuCtx* const* ctxs, std::int32_t* const* d_tokens, int n, 
     const GpuCtx* c = ctxs[i];
     if (c == nullptr || d_tokens[i] == nullptr || c->weights == nullptr ||
         c->weights != g->weights || c->max_pos != g->max_pos || c->kv8 != g->kv8 ||
-        c->kv4 != g->kv4 || !c->split_attn || c->written <= 0 ||
+        c->kv4 != g->kv4 || c->k5 != g->k5 || !c->split_attn || c->written <= 0 ||
         c->written > c->max_pos - 1 - steps || c->written + steps > c->mapped)
       return seterr("multi-decode: a session is not ready (weights, format, or rows)");
     if (n > 1 && (c->kv_arena == nullptr || c->kv_arena != g->kv_arena))
@@ -3046,7 +3221,7 @@ int gpu_forward_multi(GpuCtx* const* row_ctx, std::int32_t* const* row_tokens,
   for (int r = 0; r < n; ++r) {
     GpuCtx* c = row_ctx[r];
     if (c == nullptr || row_tokens[r] == nullptr || c->weights != g->weights ||
-        c->max_pos != g->max_pos || c->kv8 != g->kv8 || c->kv4 != g->kv4 || !c->split_attn ||
+        c->max_pos != g->max_pos || c->kv8 != g->kv8 || c->kv4 != g->kv4 || c->k5 != g->k5 || !c->split_attn ||
         (c != g && (c->kv_arena == nullptr || c->kv_arena != g->kv_arena)))
       return seterr("multi-forward: incompatible session");
     std::size_t i = 0;
@@ -3161,7 +3336,7 @@ int gpu_forward_tree(const GpuTreeRow* rows, int n, std::uint16_t* d_logits,
     const GpuTreeRow& t = rows[r];
     GpuCtx* c = t.ctx;
     if (c == nullptr || t.tokens == nullptr || c->weights != g->weights ||
-        c->max_pos != g->max_pos || c->kv8 != g->kv8 || c->kv4 != g->kv4 || !c->split_attn ||
+        c->max_pos != g->max_pos || c->kv8 != g->kv8 || c->kv4 != g->kv4 || c->k5 != g->k5 || !c->split_attn ||
         (c != g && (c->kv_arena == nullptr || c->kv_arena != g->kv_arena)))
       return seterr("tree-forward: incompatible session");
     if (t.depth < 0 || t.depth > kMaxTreeDepth || t.pos - t.depth < 0 ||
@@ -3228,7 +3403,9 @@ struct KvMove {
 __global__ void kv_move_kernel(KvMove mv, void* ck, void* cv, float* ks, float* vs, int bits,
                                int stride, int d) {
   const int hkv = blockIdx.x;
+  // bits == 5 is K5:V4: K rows are kK5RowBytes, V rows d / 2.
   const int bytes = bits == 16 ? 2 * d : (bits == 8 ? d : d / 2);
+  const int kbytes = bits == 5 ? dev::kK5RowBytes : bytes;
   auto* const k = static_cast<std::uint8_t*>(ck);
   auto* const v = static_cast<std::uint8_t*>(cv);
   // In order: a later move may read a row an earlier one wrote only if
@@ -3236,10 +3413,10 @@ __global__ void kv_move_kernel(KvMove mv, void* ck, void* cv, float* ks, float* 
   for (int i = 0; i < mv.n; ++i) {
     const std::size_t so = (static_cast<std::size_t>(hkv) * stride + mv.src[i]) * bytes;
     const std::size_t dd = (static_cast<std::size_t>(hkv) * stride + mv.dst[i]) * bytes;
-    for (int b = threadIdx.x; b < bytes; b += blockDim.x) {
-      k[dd + b] = k[so + b];
-      v[dd + b] = v[so + b];
-    }
+    const std::size_t kso = (static_cast<std::size_t>(hkv) * stride + mv.src[i]) * kbytes;
+    const std::size_t kdd = (static_cast<std::size_t>(hkv) * stride + mv.dst[i]) * kbytes;
+    for (int b = threadIdx.x; b < kbytes; b += blockDim.x) k[kdd + b] = k[kso + b];
+    for (int b = threadIdx.x; b < bytes; b += blockDim.x) v[dd + b] = v[so + b];
     if (bits != 16 && threadIdx.x == 0) {
       ks[static_cast<std::size_t>(hkv) * stride + mv.dst[i]] =
           ks[static_cast<std::size_t>(hkv) * stride + mv.src[i]];
@@ -3269,8 +3446,8 @@ int gpu_ctx_kv_move(GpuCtx* ctx, const int* src, const int* dst, int n) {
   for (int layer = 0; layer < ctx->L; ++layer) {
     const LayerView lw = layer_view(ctx, layer);
     if (ctx->kv4)
-      kv_move_kernel<<<ctx->Hk, 64>>>(mv, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale, 4,
-                                      ctx->kv_stride, ctx->d);
+      kv_move_kernel<<<ctx->Hk, 64>>>(mv, lw.kv4_k, lw.kv4_v, lw.kv4_k_scale, lw.kv4_v_scale,
+                                      ctx->k5 ? 5 : 4, ctx->kv_stride, ctx->d);
     else if (ctx->kv8)
       kv_move_kernel<<<ctx->Hk, 128>>>(mv, lw.kv8_k, lw.kv8_v, lw.kv8_k_scale, lw.kv8_v_scale, 8,
                                        ctx->kv_stride, ctx->d);
@@ -3367,7 +3544,7 @@ int gpu_ctx_share_prefill_scratch(GpuCtx* ctx, GpuCtx* owner) {
   if (ctx == nullptr || owner == nullptr || ctx == owner || ctx->prefill != nullptr ||
       owner->prefill_owner != nullptr || ctx->L != owner->L || ctx->H != owner->H ||
       ctx->I != owner->I || ctx->max_pos != owner->max_pos || ctx->kv8 != owner->kv8 ||
-      ctx->kv4 != owner->kv4)
+      ctx->kv4 != owner->kv4 || ctx->k5 != owner->k5)
     return -1;
   ctx->prefill_owner = owner;
   return 0;
@@ -3386,7 +3563,7 @@ GpuKvArena* gpu_kv_arena_create(const ModelConfig& model, int rows, char* error,
     return fail("invalid KV arena arguments");
   auto a = std::make_unique<GpuKvArena>();
   bool split = false;
-  resolve_kv_mode(model, &a->kv8, &a->kv4, &split);
+  resolve_kv_mode(model, &a->kv8, &a->kv4, &split, &a->k5);
   if (!split)
     return fail("a shared KV arena needs split-KV attention (d==128, Hq==4*Hk)");
   a->rows = rows;
@@ -3401,14 +3578,18 @@ GpuKvArena* gpu_kv_arena_create(const ModelConfig& model, int rows, char* error,
                        : static_cast<std::size_t>(a->d) * sizeof(std::uint16_t));
   if (slices > SIZE_MAX / row_bytes) return fail("KV arena size overflow");
   const std::size_t code_bytes = slices * row_bytes;
+  // K5:V4: the K buffer is wider than the V buffer (80-byte vs d/2 rows).
+  const std::size_t k_row_bytes = a->k5 ? static_cast<std::size_t>(dev::kK5RowBytes) : row_bytes;
+  if (slices > SIZE_MAX / k_row_bytes) return fail("KV arena size overflow");
+  const std::size_t k_code_bytes = slices * k_row_bytes;
   const std::size_t scale_bytes = slices * sizeof(float);
   cudaError_t e = cudaSuccess;
   if (a->kv4) {
-    e = cudaMalloc(&a->kv4_k, code_bytes);
+    e = cudaMalloc(&a->kv4_k, k_code_bytes);
     if (e == cudaSuccess) e = cudaMalloc(&a->kv4_v, code_bytes);
     if (e == cudaSuccess) e = cudaMalloc(&a->kv4_k_scale, scale_bytes);
     if (e == cudaSuccess) e = cudaMalloc(&a->kv4_v_scale, scale_bytes);
-    a->bytes = 2 * code_bytes + 2 * scale_bytes;
+    a->bytes = k_code_bytes + code_bytes + 2 * scale_bytes;
   } else if (a->kv8) {
     e = cudaMalloc(&a->kv8_k, code_bytes);
     if (e == cudaSuccess) e = cudaMalloc(&a->kv8_v, code_bytes);
@@ -3439,6 +3620,9 @@ bool gpu_ctx_is_kv4(const GpuCtx* ctx) {
   return ctx != nullptr && ctx->kv4;
 }
 
+bool gpu_ctx_is_k5v4(const GpuCtx* ctx) {
+  return ctx != nullptr && ctx->k5;
+}
 bool gpu_ctx_is_split_attn(const GpuCtx* ctx) {
   return ctx != nullptr && ctx->split_attn;
 }
@@ -3623,6 +3807,10 @@ int gpu_multi_kv_append(const std::uint16_t* k, const std::uint16_t* v, int bits
   if (bits == 8)
     kv_append_int8_multi_kernel<<<dim3(Hk, rows), d>>>(
         k, v, static_cast<std::int8_t*>(cache_k), static_cast<std::int8_t*>(cache_v), k_scale,
+        v_scale, d_rows, stride, Hk, d);
+  else if (bits == 5)
+    kv_append_k5v4_multi_kernel<<<dim3(Hk, rows), d / 2>>>(
+        k, v, static_cast<std::uint8_t*>(cache_k), static_cast<std::uint8_t*>(cache_v), k_scale,
         v_scale, d_rows, stride, Hk, d);
   else if (bits == 4)
     kv_append_int4_multi_kernel<<<dim3(Hk, rows), d / 2>>>(

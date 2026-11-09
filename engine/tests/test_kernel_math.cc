@@ -789,6 +789,104 @@ static void test_rng() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// K5 (5-bit K cache): scale/quant/dequant semantics and the 80-byte row layout.
+static void test_k5_quant_semantics() {
+  expect(k5_scale_host(15.0f) == 1.0f, "k5 scale = amax / 15");
+  expect(k5_scale_host(0.0f) == 0.0f, "k5 scale of an all-zero row is 0");
+  // Zero scale encodes the exact-zero code (16), never a garbage level.
+  expect(k5_quant_host(3.0f, 0.0f) == 16, "k5 zero scale -> code 16");
+  expect(k5_dequant_host(16, 0.0f) == 0.0f, "k5 code 16 dequantizes to 0");
+  // With scale 1: +/-15 are the extremes; codes span 1..31, never 0 (symmetric, like int4's 1..15).
+  expect(k5_quant_host(15.0f, 1.0f) == 31, "k5 +amax -> 31");
+  expect(k5_quant_host(-15.0f, 1.0f) == 1, "k5 -amax -> 1");
+  expect(k5_quant_host(1e9f, 1.0f) == 31, "k5 clamps high");
+  expect(k5_quant_host(-1e9f, 1.0f) == 1, "k5 clamps low (code 0 is never produced)");
+  // Round half AWAY from zero, mirroring int4/int8 and the device __float2round.
+  expect(k5_quant_host(0.5f, 1.0f) == 17, "k5 +0.5 rounds away to +1");
+  expect(k5_quant_host(-0.5f, 1.0f) == 15, "k5 -0.5 rounds away to -1");
+  expect(k5_quant_host(0.49f, 1.0f) == 16, "k5 +0.49 rounds to 0");
+  expect(k5_dequant_host(31, 2.0f) == 30.0f && k5_dequant_host(1, 2.0f) == -30.0f, "k5 dequant = s * (code - 16)");
+}
+static void test_k5_roundtrip_error_bound() {
+  // For any |x| <= amax the round-trip error is at most s/2 (one half step).
+  unsigned seed = 12345;
+  auto rnd = [&]() {
+    seed = seed * 1664525u + 1013904223u;
+    return (static_cast<float>(seed >> 8) / 8388608.0f) - 1.0f;  // [-1, 1)
+  };
+  for (int trial = 0; trial < 200; ++trial) {
+    std::vector<float> row(kK5RowDim);
+    float amax = 0.0f;
+    for (auto& v : row) {
+      v = rnd() * (1.0f + trial % 7);
+      amax = std::fmax(amax, std::fabs(v));
+    }
+    const float s = k5_scale_host(amax);
+    for (float v : row) {
+      const float back = k5_dequant_host(k5_quant_host(v, s), s);
+      if (std::fabs(back - v) > 0.5f * s * 1.0001f) expect(false, "k5 round-trip error <= s/2");
+    }
+  }
+}
+static void test_k5_is_finer_than_q4_by_the_level_ratio() {
+  // Same row, same amax: int4 has 7 levels per side, K5 has 15, so the step shrinks by 7/15
+  // and the worst-case error with it. This pins "5 bits is genuinely better than 4", not just different.
+  const float amax = 3.0f;
+  expect(k5_scale_host(amax) < q4_scale_host(amax), "k5 step smaller than q4 step");
+  const float ratio = q4_scale_host(amax) / k5_scale_host(amax);
+  expect(std::fabs(ratio - 15.0f / 7.0f) < 1e-5f, "step ratio is 15/7");
+}
+static void test_k5_pack_layout_is_exact() {
+  unsigned char codes[kK5RowDim];
+  for (int d = 0; d < kK5RowDim; ++d) codes[d] = static_cast<unsigned char>((d * 7 + 3) & 31);
+  unsigned char row[kK5RowBytes];
+  std::memset(row, 0xAA, sizeof(row));  // proves every byte is written
+  k5_pack_row_host(codes, row);
+  expect(kK5RowBytes == 80 && kK5NibbleBytes == 64 && kK5PlaneBytes == 16, "k5 row geometry is 64 + 16");
+  // Low nibbles are laid out exactly as int4: dim 2j in the low nibble, dim 2j+1 in the high nibble.
+  for (int j = 0; j < kK5NibbleBytes; ++j) {
+    const unsigned char want = static_cast<unsigned char>((codes[2 * j] & 0x0f) | ((codes[2 * j + 1] & 0x0f) << 4));
+    if (row[j] != want) expect(false, "k5 low nibbles match the int4 layout byte-for-byte");
+  }
+  // High-bit plane: bit (d % 8) of byte 64 + d / 8.
+  for (int d = 0; d < kK5RowDim; ++d) {
+    const unsigned got = (row[kK5NibbleBytes + d / 8] >> (d % 8)) & 1u;
+    if (got != static_cast<unsigned>((codes[d] >> 4) & 1)) expect(false, "k5 high-bit plane position");
+  }
+  unsigned char back[kK5RowDim];
+  k5_unpack_row_host(row, back);
+  expect(std::memcmp(codes, back, sizeof(codes)) == 0, "k5 pack/unpack is lossless for every 5-bit code");
+}
+static void test_k5_pack_all_codes_and_neighbours_independent() {
+  // Every code value in every position, and flipping one dim never disturbs another.
+  for (int c = 0; c < 32; ++c) {
+    unsigned char codes[kK5RowDim], row[kK5RowBytes], back[kK5RowDim];
+    for (int d = 0; d < kK5RowDim; ++d) codes[d] = static_cast<unsigned char>((c + d) & 31);
+    k5_pack_row_host(codes, row);
+    k5_unpack_row_host(row, back);
+    if (std::memcmp(codes, back, sizeof(codes)) != 0) expect(false, "k5 pack/unpack for all code values");
+  }
+  unsigned char zeros[kK5RowDim] = {}, row0[kK5RowBytes], row1[kK5RowBytes];
+  k5_pack_row_host(zeros, row0);
+  for (int d = 0; d < kK5RowDim; ++d) {
+    unsigned char one[kK5RowDim] = {};
+    one[d] = 31;
+    k5_pack_row_host(one, row1);
+    int changed_bits = 0;
+    for (int b = 0; b < kK5RowBytes; ++b) changed_bits += __builtin_popcount(row0[b] ^ row1[b]);
+    if (changed_bits != 5) expect(false, "k5 one dim touches exactly its own 5 bits");
+  }
+}
+static void test_k5_row_footprint_vs_other_formats() {
+  // Bytes per position over 40 layers x 8 KV heads: K5 25 KiB + V int4 20 KiB + 2.5 KiB of scales.
+  const int rows = 40 * 8;
+  const double k5 = rows * 80.0, v4 = rows * 64.0, scales = rows * 2 * 4.0;
+  expect((k5 + v4 + scales) / 1024.0 == 47.5, "K5:V4 is 47.5 KiB per position");
+  expect((rows * 64.0 * 2 + scales) / 1024.0 == 42.5, "int4 (K4:V4) reference is 42.5 KiB per position");
+  expect((rows * 128.0 * 2 + scales) / 1024.0 == 82.5, "int8 reference is 82.5 KiB per position");
+}
+
 int main() {
   test_bf16();
   test_rmsnorm();
@@ -804,6 +902,12 @@ int main() {
   test_sampling();
   test_gemm_dequant();
   test_kv8();
+  test_k5_quant_semantics();
+  test_k5_roundtrip_error_bound();
+  test_k5_is_finer_than_q4_by_the_level_ratio();
+  test_k5_pack_layout_is_exact();
+  test_k5_pack_all_codes_and_neighbours_independent();
+  test_k5_row_footprint_vs_other_formats();
   test_rng();
   if (g_failures == 0) std::printf("all kernel-math reference tests passed\n");
   return g_failures == 0 ? 0 : 1;

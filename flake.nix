@@ -412,6 +412,22 @@
               type = lib.types.bool;
               default = false;
             };
+            kv5 = lib.mkOption {
+              description = ''
+                Store the engine's persistent KV cache as K5:V4: K as 5-bit codes
+                (80-byte rows: int4-layout nibbles plus a 16-byte high-bit plane,
+                one scale per row) and V as int4, 47.5 KiB per position (K 25 KiB
+                + V 20 KiB + 2.5 KiB scales; int4 is 42.5, int8 82.5). Sets
+                G4_KV8=5. Mutually exclusive with kv4 and kv8. Why: measured
+                on the reference model (docs/kv-quant-sim.md), the K half of the
+                cache carries almost all of int4's quantization damage; K5:V4
+                recovers int8-class output quality for ~12% more VRAM than int4.
+                Evidence and caveats: docs/kv-k5v4.md. Needs split-KV attention
+                (d == 128, Hq == 4 * Hk), like kv4/kv8.
+              '';
+              type = lib.types.bool;
+              default = false;
+            };
             kv4 = lib.mkOption {
               description = ''
                 Store the engine's persistent KV cache as int4 (Q4_0: per-row
@@ -489,6 +505,10 @@
                 assertion = !(cfg.kv8 && cfg.kv4);
                 message = "services.granite4-rtx.kv8 and services.granite4-rtx.kv4 are mutually exclusive - pick one quantized KV format";
               }
+              {
+                assertion = !(cfg.kv5 && (cfg.kv4 || cfg.kv8));
+                message = "services.granite4-rtx.kv5 is mutually exclusive with kv4 and kv8 - pick one quantized KV format";
+              }
             ];
             users = {
               groups."granite4-rtx" = { };
@@ -516,7 +536,7 @@
                 # engine subprocesses (scripts/parity_gate.py _gate_env), so
                 # this value only changes the *serve* engine's KV format,
                 # never what the gate validates.
-                G4_KV8 = if cfg.kv4 then "4" else (if cfg.kv8 then "1" else "0");
+                G4_KV8 = if cfg.kv5 then "5" else (if cfg.kv4 then "4" else (if cfg.kv8 then "1" else "0"));
               } // lib.optionalAttrs (cfg.kvPoolTokens != null) {
                 GRANITE4_KV_POOL_TOKENS = toString cfg.kvPoolTokens;
               } // lib.optionalAttrs (cfg.eagle.head != null) {

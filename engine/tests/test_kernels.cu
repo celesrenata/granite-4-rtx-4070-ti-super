@@ -174,7 +174,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const int* row_pos = nullptr, const int* const* row_pt = nullptr,
                const int* row_grp = nullptr, int ngroups = 0,
                const int* row_tbase = nullptr, const int* row_tail = nullptr,
-               int kv_hint = 0);
+               int kv_hint = 0, bool k5 = false);
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                       int base_pos, int rows, int stride, std::uint16_t* out,
@@ -183,8 +183,22 @@ int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const float* k_scale = nullptr, const float* v_scale = nullptr,
                       bool int8 = false, const std::uint8_t* cache_k4 = nullptr,
                       const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
-                      const int* d_pt = nullptr);
+                      const int* d_pt = nullptr, bool k5 = false);
+int prefill_rope_split_append_int4(const std::uint16_t* qkv, const float* cos_tbl,
+                                   const float* sin_tbl, int base_pos, int rows, int Hq, int Hk,
+                                   int d, int stride, std::uint16_t* q_rot, std::uint8_t* cache_k,
+                                   std::uint8_t* cache_v, float* cache_k_scale,
+                                   float* cache_v_scale, const int* d_pt = nullptr);
+int prefill_rope_split_append_k5v4(const std::uint16_t* qkv, const float* cos_tbl,
+                                   const float* sin_tbl, int base_pos, int rows, int Hq, int Hk,
+                                   int d, int stride, std::uint16_t* q_rot, std::uint8_t* cache_k,
+                                   std::uint8_t* cache_v, float* cache_k_scale,
+                                   float* cache_v_scale, const int* d_pt = nullptr);
 }
+extern "C" int granite4_kernel_kv_append_k5v4_batched(
+    const std::uint16_t* d_src_k, const std::uint16_t* d_src_v, std::uint8_t* d_cache_k,
+    std::uint8_t* d_cache_v, float* d_cache_k_scale, float* d_cache_v_scale, int base_pos,
+    int rows, int stride, int Hk, int d, const int* d_pt);
 
 namespace {
 
@@ -665,6 +679,343 @@ static void test_kv4_attn_split_device() {
   cudaFree(scratch);
 }
 
+
+// ---------------------------------------------------------------------------
+// K5:V4 (docs/kv-k5v4.md): K 5-bit in 80-byte rows, V int4. Host-built cache helpers.
+struct K5V4Cache {
+  std::vector<std::uint8_t> k;   // [Hk][stride][80]
+  std::vector<std::uint8_t> v;   // [Hk][stride][64]
+  std::vector<float> sk, sv;     // [Hk][stride]
+  std::vector<std::uint16_t> dqk, dqv;  // dequantized bf16 [Hk][stride][d] (what attention must see)
+};
+static K5V4Cache host_build_k5v4(const std::vector<std::uint16_t>& ck,
+                                 const std::vector<std::uint16_t>& cv, int Hk, int stride, int d) {
+  K5V4Cache c;
+  c.k.assign(static_cast<std::size_t>(Hk) * stride * kK5RowBytes, 0);
+  c.v.assign(static_cast<std::size_t>(Hk) * stride * (d / 2), 0);
+  c.sk.assign(static_cast<std::size_t>(Hk) * stride, 0.0f);
+  c.sv.assign(static_cast<std::size_t>(Hk) * stride, 0.0f);
+  c.dqk.assign(ck.size(), 0);
+  c.dqv.assign(cv.size(), 0);
+  for (int h = 0; h < Hk; ++h)
+    for (int p = 0; p < stride; ++p) {
+      const std::size_t row = static_cast<std::size_t>(h) * stride + p;
+      const std::size_t src = row * d;
+      float ak = 0.0f, av = 0.0f;
+      for (int i = 0; i < d; ++i) {
+        ak = std::max(ak, std::fabs(bf16_to_f32_host(ck[src + i])));
+        av = std::max(av, std::fabs(bf16_to_f32_host(cv[src + i])));
+      }
+      const float sks = k5_scale_host(ak), svs = q4_scale_host(av);
+      c.sk[row] = sks;
+      c.sv[row] = svs;
+      unsigned char codes[kK5RowDim];
+      for (int i = 0; i < d; ++i) {
+        codes[i] = k5_quant_host(bf16_to_f32_host(ck[src + i]), sks);
+        c.dqk[src + i] = f32_to_bf16_host(k5_dequant_host(codes[i], sks));
+      }
+      k5_pack_row_host(codes, &c.k[row * kK5RowBytes]);
+      for (int w = 0; w < d / 2; ++w) {
+        const unsigned char a = q4_quant_host(bf16_to_f32_host(cv[src + 2 * w]), svs);
+        const unsigned char b = q4_quant_host(bf16_to_f32_host(cv[src + 2 * w + 1]), svs);
+        c.v[row * (d / 2) + w] = static_cast<std::uint8_t>((a & 0x0fu) | (b << 4));
+        c.dqv[src + 2 * w] = f32_to_bf16_host(svs * static_cast<float>(static_cast<int>(a) - 8));
+        c.dqv[src + 2 * w + 1] = f32_to_bf16_host(svs * static_cast<float>(static_cast<int>(b) - 8));
+      }
+    }
+  return c;
+}
+
+// The device append must write EXACTLY the bytes and scales the host twin computes.
+static void test_k5v4_append_device() {
+  const int Hk = 2, d = 128, stride = 256, base = 40, rows = 8;
+  Xorshift64 rng(0x5a5a);
+  const std::size_t sn = static_cast<std::size_t>(rows) * Hk * d;
+  std::vector<std::uint16_t> sk(sn), sv(sn);
+  for (auto& x : sk) x = f32_to_bf16_host(rng.next_float_range(3.0));
+  for (auto& x : sv) x = f32_to_bf16_host(rng.next_float_range(3.0));
+  sk[5] = f32_to_bf16_host(0.0f);  // exercise zero values
+  for (int i = 0; i < d; ++i) sk[(2 * Hk + 1) * d + i] = 0;  // an all-zero K row (scale 0)
+  std::uint16_t *dsk, *dsv;
+  std::uint8_t *dck, *dcv;
+  float *dks, *dvs;
+  const std::size_t kb = static_cast<std::size_t>(Hk) * stride * kK5RowBytes;
+  const std::size_t vb = static_cast<std::size_t>(Hk) * stride * (d / 2);
+  const std::size_t nsc = static_cast<std::size_t>(Hk) * stride;
+  if (cudaMalloc(&dsk, sn * 2) || cudaMalloc(&dsv, sn * 2) || cudaMalloc(&dck, kb) ||
+      cudaMalloc(&dcv, vb) || cudaMalloc(&dks, nsc * 4) || cudaMalloc(&dvs, nsc * 4)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemset(dck, 0xEE, kb));
+  CUDA_CHECK(cudaMemset(dcv, 0xEE, vb));
+  CUDA_CHECK(cudaMemset(dks, 0, nsc * 4));
+  CUDA_CHECK(cudaMemset(dvs, 0, nsc * 4));
+  CUDA_CHECK(cudaMemcpy(dsk, sk.data(), sn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsv, sv.data(), sn * 2, cudaMemcpyHostToDevice));
+  expect(granite4_kernel_kv_append_k5v4_batched(dsk, dsv, dck, dcv, dks, dvs, base, rows, stride,
+                                                Hk, d, nullptr) == 0,
+         "k5v4 append: launch");
+  std::vector<std::uint8_t> gk(kb), gv(vb);
+  std::vector<float> gks(nsc), gvs(nsc);
+  CUDA_CHECK(cudaMemcpy(gk.data(), dck, kb, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(gv.data(), dcv, vb, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(gks.data(), dks, nsc * 4, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(gvs.data(), dvs, nsc * 4, cudaMemcpyDeviceToHost));
+  int bad_k = 0, bad_v = 0, bad_s = 0, untouched = 0;
+  for (int r = 0; r < rows; ++r)
+    for (int h = 0; h < Hk; ++h) {
+      const std::size_t src = (static_cast<std::size_t>(r) * Hk + h) * d;
+      float ak = 0.0f, av = 0.0f;
+      for (int i = 0; i < d; ++i) {
+        ak = std::max(ak, std::fabs(bf16_to_f32_host(sk[src + i])));
+        av = std::max(av, std::fabs(bf16_to_f32_host(sv[src + i])));
+      }
+      const float sks = k5_scale_host(ak), svs = q4_scale_host(av);
+      unsigned char codes[kK5RowDim], want[kK5RowBytes];
+      for (int i = 0; i < d; ++i) codes[i] = k5_quant_host(bf16_to_f32_host(sk[src + i]), sks);
+      k5_pack_row_host(codes, want);
+      const std::size_t row = static_cast<std::size_t>(h) * stride + base + r;
+      if (std::memcmp(&gk[row * kK5RowBytes], want, kK5RowBytes) != 0) ++bad_k;
+      for (int w = 0; w < d / 2; ++w) {
+        const unsigned char a = q4_quant_host(bf16_to_f32_host(sv[src + 2 * w]), svs);
+        const unsigned char b = q4_quant_host(bf16_to_f32_host(sv[src + 2 * w + 1]), svs);
+        if (gv[row * (d / 2) + w] != static_cast<std::uint8_t>((a & 0x0fu) | (b << 4))) ++bad_v;
+      }
+      if (std::memcmp(&gks[row], &sks, 4) != 0 || std::memcmp(&gvs[row], &svs, 4) != 0) ++bad_s;
+    }
+  // Rows outside [base, base + rows) must be untouched (still the 0xEE fill).
+  for (int h = 0; h < Hk; ++h)
+    for (int p : {0, base - 1, base + rows, stride - 1})
+      for (int b = 0; b < kK5RowBytes; ++b)
+        if (gk[(static_cast<std::size_t>(h) * stride + p) * kK5RowBytes + b] != 0xEE) ++untouched;
+  std::printf("  k5v4 append: bad K rows %d, bad V bytes %d, bad scales %d, clobbered %d\n", bad_k,
+              bad_v, bad_s, untouched);
+  expect(bad_k == 0, "k5v4 append: K bytes match the host twin exactly");
+  expect(bad_v == 0, "k5v4 append: V bytes match the host twin exactly");
+  expect(bad_s == 0, "k5v4 append: scales match the host twin bit-for-bit");
+  expect(untouched == 0, "k5v4 append: neighbouring rows are not clobbered");
+  cudaFree(dsk); cudaFree(dsv); cudaFree(dck); cudaFree(dcv); cudaFree(dks); cudaFree(dvs);
+}
+
+// K5:V4 split-KV attention vs (a) a bf16 attention over the DEQUANTIZED cache (must match tightly:
+// proves indexing / decoding) and (b) the original bf16 data (K5 must be closer than K4).
+static void test_k5v4_attn_split_device() {
+  const int Hq = 8, Hk = 2, d = 128, stride = 512, base = 200, rows = 8;
+  Xorshift64 rng(0x4a11);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  const K5V4Cache c = host_build_k5v4(ck, cv, Hk, stride, d);
+  // int4 (K4:V4) cache from the same data, for the accuracy comparison.
+  std::vector<std::uint8_t> c4k(Hk * stride * (d / 2)), c4v(Hk * stride * (d / 2));
+  std::vector<float> s4k(Hk * stride), s4v(Hk * stride);
+  for (int h = 0; h < Hk; ++h)
+    for (int p = 0; p < stride; ++p) {
+      const std::size_t row = static_cast<std::size_t>(h) * stride + p, src = row * d;
+      float ak = 0.0f, av = 0.0f;
+      for (int i = 0; i < d; ++i) {
+        ak = std::max(ak, std::fabs(bf16_to_f32_host(ck[src + i])));
+        av = std::max(av, std::fabs(bf16_to_f32_host(cv[src + i])));
+      }
+      s4k[row] = q4_scale_host(ak);
+      s4v[row] = q4_scale_host(av);
+      for (int w = 0; w < d / 2; ++w) {
+        c4k[row * (d / 2) + w] = static_cast<std::uint8_t>(
+            (q4_quant_host(bf16_to_f32_host(ck[src + 2 * w]), s4k[row]) & 0x0fu) |
+            (q4_quant_host(bf16_to_f32_host(ck[src + 2 * w + 1]), s4k[row]) << 4));
+        c4v[row * (d / 2) + w] = static_cast<std::uint8_t>(
+            (q4_quant_host(bf16_to_f32_host(cv[src + 2 * w]), s4v[row]) & 0x0fu) |
+            (q4_quant_host(bf16_to_f32_host(cv[src + 2 * w + 1]), s4v[row]) << 4));
+      }
+    }
+  std::uint16_t *dq, *dk, *dv, *ddk, *ddv, *dref, *dorig, *dgot5, *dgot4;
+  std::uint8_t *d5k, *d5v, *d4k, *d4v;
+  float *d5sk, *d5sv, *d4sk, *d4sv;
+  void* scratch;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dk, cn * 2) || cudaMalloc(&dv, cn * 2) ||
+      cudaMalloc(&ddk, cn * 2) || cudaMalloc(&ddv, cn * 2) || cudaMalloc(&dref, qn * 2) ||
+      cudaMalloc(&dorig, qn * 2) || cudaMalloc(&dgot5, qn * 2) || cudaMalloc(&dgot4, qn * 2) ||
+      cudaMalloc(&d5k, c.k.size()) || cudaMalloc(&d5v, c.v.size()) || cudaMalloc(&d4k, c4k.size()) ||
+      cudaMalloc(&d4v, c4v.size()) || cudaMalloc(&d5sk, c.sk.size() * 4) ||
+      cudaMalloc(&d5sv, c.sv.size() * 4) || cudaMalloc(&d4sk, s4k.size() * 4) ||
+      cudaMalloc(&d4sv, s4v.size() * 4) ||
+      cudaMalloc(&scratch, granite4::attn_split_scratch_bytes(Hq, rows, stride))) {
+    ++g_failures;
+    return;
+  }
+  auto up = [](void* dst, const void* src, std::size_t n) {
+    CUDA_CHECK(cudaMemcpy(dst, src, n, cudaMemcpyHostToDevice));
+  };
+  up(dq, q.data(), qn * 2); up(dk, ck.data(), cn * 2); up(dv, cv.data(), cn * 2);
+  up(ddk, c.dqk.data(), cn * 2); up(ddv, c.dqv.data(), cn * 2);
+  up(d5k, c.k.data(), c.k.size()); up(d5v, c.v.data(), c.v.size());
+  up(d5sk, c.sk.data(), c.sk.size() * 4); up(d5sv, c.sv.data(), c.sv.size() * 4);
+  up(d4k, c4k.data(), c4k.size()); up(d4v, c4v.data(), c4v.size());
+  up(d4sk, s4k.data(), s4k.size() * 4); up(d4sv, s4v.data(), s4v.size() * 4);
+  // A realistic 1/sqrt(d) scale makes the softmax peaky, so the output actually depends on how
+  // precisely K was stored (the flat 0.0078 scale of the int4 test is dominated by V error).
+  const float scale = 0.0883883f;
+  expect(granite4_kernel_gqa_fused_rows(dq, ddk, ddv, scale, Hq, Hk, d, base, rows, stride, dref) == 0,
+         "k5v4 attention: dequantized-reference launch");
+  expect(granite4_kernel_gqa_fused_rows(dq, dk, dv, scale, Hq, Hk, d, base, rows, stride, dorig) == 0,
+         "k5v4 attention: original-bf16 reference launch");
+  expect(granite4::attn_split(dq, nullptr, nullptr, scale, Hq, Hk, d, base, nullptr, rows, stride,
+                              scratch, dgot5, nullptr, nullptr, d5sk, d5sv, false, d5k, d5v, true,
+                              nullptr, 0, nullptr, nullptr, nullptr, 0, nullptr, nullptr, 0,
+                              true) == 0,
+         "k5v4 attention: launch");
+  expect(granite4::attn_split(dq, nullptr, nullptr, scale, Hq, Hk, d, base, nullptr, rows, stride,
+                              scratch, dgot4, nullptr, nullptr, d4sk, d4sv, false, d4k, d4v,
+                              true) == 0,
+         "k4v4 attention: launch");
+  std::vector<std::uint16_t> ref(qn), orig(qn), got5(qn), got4(qn);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(orig.data(), dorig, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got5.data(), dgot5, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got4.data(), dgot4, qn * 2, cudaMemcpyDeviceToHost));
+  double max_vs_deq = 0.0, mean5 = 0.0, mean4 = 0.0;
+  for (std::size_t i = 0; i < qn; ++i) {
+    max_vs_deq = std::max(max_vs_deq, static_cast<double>(std::fabs(bf16_to_f32_host(got5[i]) - bf16_to_f32_host(ref[i]))));
+    mean5 += std::fabs(bf16_to_f32_host(got5[i]) - bf16_to_f32_host(orig[i]));
+    mean4 += std::fabs(bf16_to_f32_host(got4[i]) - bf16_to_f32_host(orig[i]));
+  }
+  mean5 /= static_cast<double>(qn);
+  mean4 /= static_cast<double>(qn);
+  std::printf("  k5v4 attention: max |delta| vs dequantized bf16 = %.5f; mean |err| vs original: K5V4 %.5f, K4V4 %.5f\n",
+              max_vs_deq, mean5, mean4);
+  expect(max_vs_deq < 0.02, "k5v4 attention: matches bf16 attention over the dequantized cache");
+  // K5 must clearly beat K4 once K matters; require a real margin, not a rounding-level win.
+  expect(mean5 < 0.8 * mean4, "k5v4 attention: at least 20% closer to the original than int4");
+  for (void* p : {static_cast<void*>(dq), static_cast<void*>(dk), static_cast<void*>(dv), static_cast<void*>(ddk), static_cast<void*>(ddv),
+                  static_cast<void*>(dref), static_cast<void*>(dorig), static_cast<void*>(dgot5), static_cast<void*>(dgot4), static_cast<void*>(d5k),
+                  static_cast<void*>(d5v), static_cast<void*>(d4k), static_cast<void*>(d4v), static_cast<void*>(d5sk), static_cast<void*>(d5sv),
+                  static_cast<void*>(d4sk), static_cast<void*>(d4sv), scratch})
+    cudaFree(p);
+}
+
+// Prefill: attention over a K5:V4 cache == bf16 prefill attention over the dequantized cache, and
+// the prefill append agrees with the int4 append where it should (q_rot, V) and within one
+// quantization step per K element.
+static void test_k5v4_prefill_device() {
+  const int Hq = 8, Hk = 2, d = 128, stride = 256, base = 64, rows = 16;
+  Xorshift64 rng(0x7e57);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  const K5V4Cache c = host_build_k5v4(ck, cv, Hk, stride, d);
+  std::uint16_t *dq, *ddk, *ddv, *dref, *dgot;
+  std::uint8_t *d5k, *d5v;
+  float *d5sk, *d5sv;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&ddk, cn * 2) || cudaMalloc(&ddv, cn * 2) ||
+      cudaMalloc(&dref, qn * 2) || cudaMalloc(&dgot, qn * 2) || cudaMalloc(&d5k, c.k.size()) ||
+      cudaMalloc(&d5v, c.v.size()) || cudaMalloc(&d5sk, c.sk.size() * 4) ||
+      cudaMalloc(&d5sv, c.sv.size() * 4)) {
+    ++g_failures;
+    return;
+  }
+  auto up = [](void* dst, const void* src, std::size_t n) {
+    CUDA_CHECK(cudaMemcpy(dst, src, n, cudaMemcpyHostToDevice));
+  };
+  up(dq, q.data(), qn * 2); up(ddk, c.dqk.data(), cn * 2); up(ddv, c.dqv.data(), cn * 2);
+  up(d5k, c.k.data(), c.k.size()); up(d5v, c.v.data(), c.v.size());
+  up(d5sk, c.sk.data(), c.sk.size() * 4); up(d5sv, c.sv.data(), c.sv.size() * 4);
+  const float scale = 0.0078125f;
+  expect(granite4::prefill_attention(dq, ddk, ddv, scale, Hq, Hk, d, base, rows, stride, dref) == 0,
+         "k5v4 prefill attention: dequantized-bf16 reference launch");
+  expect(granite4::prefill_attention(dq, nullptr, nullptr, scale, Hq, Hk, d, base, rows, stride,
+                                     dgot, nullptr, nullptr, d5sk, d5sv, false, d5k, d5v, true,
+                                     nullptr, true) == 0,
+         "k5v4 prefill attention: launch");
+  std::vector<std::uint16_t> ref(qn), got(qn);
+  CUDA_CHECK(cudaMemcpy(ref.data(), dref, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(got.data(), dgot, qn * 2, cudaMemcpyDeviceToHost));
+  double max_err = 0.0;
+  for (std::size_t i = 0; i < qn; ++i)
+    max_err = std::max(max_err, static_cast<double>(std::fabs(bf16_to_f32_host(got[i]) - bf16_to_f32_host(ref[i]))));
+  std::printf("  k5v4 prefill attention: max |delta| vs dequantized bf16 = %.5f\n", max_err);
+  expect(max_err < 0.02, "k5v4 prefill attention: matches bf16 prefill attention over the dequantized cache");
+  cudaFree(dq); cudaFree(ddk); cudaFree(ddv); cudaFree(dref); cudaFree(dgot);
+  cudaFree(d5k); cudaFree(d5v); cudaFree(d5sk); cudaFree(d5sv);
+
+  // ---- prefill append: K5V4 vs the int4 append on the same qkv ----
+  const int half = d / 2, nq = Hq * d, nk = Hk * d, row_w = nq + 2 * nk;
+  std::vector<std::uint16_t> qkv(static_cast<std::size_t>(rows) * row_w);
+  for (auto& x : qkv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  std::vector<float> cs(static_cast<std::size_t>(base + rows) * half), sn(cs.size());
+  for (auto& x : cs) x = static_cast<float>(rng.next_float_range(1.0));
+  for (auto& x : sn) x = static_cast<float>(rng.next_float_range(1.0));
+  std::uint16_t *dqkv, *dqr4, *dqr5;
+  float *dcos, *dsin, *dks4, *dvs4, *dks5, *dvs5;
+  std::uint8_t *dk4, *dv4, *dk5, *dv5;
+  const std::size_t k4b = static_cast<std::size_t>(Hk) * stride * (d / 2);
+  const std::size_t k5b = static_cast<std::size_t>(Hk) * stride * kK5RowBytes;
+  const std::size_t nsc = static_cast<std::size_t>(Hk) * stride;
+  if (cudaMalloc(&dqkv, qkv.size() * 2) || cudaMalloc(&dqr4, qn * 2) || cudaMalloc(&dqr5, qn * 2) ||
+      cudaMalloc(&dcos, cs.size() * 4) || cudaMalloc(&dsin, sn.size() * 4) || cudaMalloc(&dk4, k4b) ||
+      cudaMalloc(&dv4, k4b) || cudaMalloc(&dk5, k5b) || cudaMalloc(&dv5, k4b) ||
+      cudaMalloc(&dks4, nsc * 4) || cudaMalloc(&dvs4, nsc * 4) || cudaMalloc(&dks5, nsc * 4) ||
+      cudaMalloc(&dvs5, nsc * 4)) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemset(dk4, 0, k4b)); CUDA_CHECK(cudaMemset(dv4, 0, k4b));
+  CUDA_CHECK(cudaMemset(dk5, 0, k5b)); CUDA_CHECK(cudaMemset(dv5, 0, k4b));
+  CUDA_CHECK(cudaMemset(dks4, 0, nsc * 4)); CUDA_CHECK(cudaMemset(dvs4, 0, nsc * 4));
+  CUDA_CHECK(cudaMemset(dks5, 0, nsc * 4)); CUDA_CHECK(cudaMemset(dvs5, 0, nsc * 4));
+  up(dqkv, qkv.data(), qkv.size() * 2); up(dcos, cs.data(), cs.size() * 4); up(dsin, sn.data(), sn.size() * 4);
+  expect(granite4::prefill_rope_split_append_int4(dqkv, dcos, dsin, base, rows, Hq, Hk, d, stride, dqr4,
+                                                  dk4, dv4, dks4, dvs4) == 0, "prefill append int4: launch");
+  expect(granite4::prefill_rope_split_append_k5v4(dqkv, dcos, dsin, base, rows, Hq, Hk, d, stride, dqr5,
+                                                  dk5, dv5, dks5, dvs5) == 0, "prefill append k5v4: launch");
+  std::vector<std::uint16_t> qr4(qn), qr5(qn);
+  std::vector<std::uint8_t> hk4(k4b), hv4(k4b), hk5(k5b), hv5(k4b);
+  std::vector<float> hs4k(nsc), hs4v(nsc), hs5k(nsc), hs5v(nsc);
+  CUDA_CHECK(cudaMemcpy(qr4.data(), dqr4, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(qr5.data(), dqr5, qn * 2, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hk4.data(), dk4, k4b, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hv4.data(), dv4, k4b, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hk5.data(), dk5, k5b, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hv5.data(), dv5, k4b, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hs4k.data(), dks4, nsc * 4, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hs4v.data(), dvs4, nsc * 4, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hs5k.data(), dks5, nsc * 4, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(hs5v.data(), dvs5, nsc * 4, cudaMemcpyDeviceToHost));
+  expect(qr4 == qr5, "prefill append: q_rot identical to the int4 path");
+  int v_bad = 0, k_bad = 0;
+  for (int h = 0; h < Hk; ++h)
+    for (int r = 0; r < rows; ++r) {
+      const std::size_t row = static_cast<std::size_t>(h) * stride + base + r;
+      if (std::memcmp(&hs4v[row], &hs5v[row], 4) != 0) ++v_bad;
+      for (int w = 0; w < d / 2; ++w)
+        if (hv4[row * (d / 2) + w] != hv5[row * (d / 2) + w]) ++v_bad;
+      unsigned char codes[kK5RowDim];
+      k5_unpack_row_host(&hk5[row * kK5RowBytes], codes);
+      const float tol = 0.5f * hs5k[row] + 0.5f * hs4k[row] + 1e-6f;
+      for (int w = 0; w < d / 2; ++w) {
+        float a4, b4;
+        const unsigned char byte = hk4[row * (d / 2) + w];
+        a4 = hs4k[row] * static_cast<float>(static_cast<int>(byte & 0x0fu) - 8);
+        b4 = hs4k[row] * static_cast<float>(static_cast<int>((byte >> 4) & 0x0fu) - 8);
+        const float a5 = k5_dequant_host(codes[2 * w], hs5k[row]);
+        const float b5 = k5_dequant_host(codes[2 * w + 1], hs5k[row]);
+        if (std::fabs(a4 - a5) > tol || std::fabs(b4 - b5) > tol) ++k_bad;
+      }
+    }
+  std::printf("  k5v4 prefill append: V mismatches %d, K elements outside one quantization step %d\n", v_bad, k_bad);
+  expect(v_bad == 0, "prefill append: V bytes and scales identical to the int4 path");
+  expect(k_bad == 0, "prefill append: K5 dequant within one quantization step of the int4 dequant");
+  for (void* p : {static_cast<void*>(dqkv), static_cast<void*>(dqr4), static_cast<void*>(dqr5), static_cast<void*>(dcos), static_cast<void*>(dsin),
+                  static_cast<void*>(dk4), static_cast<void*>(dv4), static_cast<void*>(dk5), static_cast<void*>(dv5), static_cast<void*>(dks4),
+                  static_cast<void*>(dvs4), static_cast<void*>(dks5), static_cast<void*>(dvs5)})
+    cudaFree(p);
+}
 static void test_rmsnorm_device() {
   const int rows = 64, cols = 256;
   const float eps = 1e-5f;
@@ -3317,12 +3668,25 @@ int main() {
     std::printf("FAIL: no CUDA device\n");
     return 1;
   }
+  // G4_TEST_ONLY=k5v4 runs just the K5:V4 tests. They need a few MB, so they can run next to a
+  // live service without taking its GPU memory (the full suite allocates much more).
+  if (const char* only = std::getenv("G4_TEST_ONLY"); only != nullptr && std::strcmp(only, "k5v4") == 0) {
+    test_k5v4_append_device();
+    test_k5v4_attn_split_device();
+    test_k5v4_prefill_device();
+    cudaDeviceSynchronize();
+    if (g_failures == 0) std::printf("k5v4 device kernel tests passed\n");
+    return g_failures == 0 ? 0 : 1;
+  }
   test_arch_probe();
   test_fp8_decode_all();
   test_fp8_hw_decode();
   test_kv8_device();
   test_kv4_device();
   test_kv4_attn_split_device();
+  test_k5v4_append_device();
+  test_k5v4_attn_split_device();
+  test_k5v4_prefill_device();
   test_rmsnorm_device();
   test_rope_device();
   test_softmax_device();

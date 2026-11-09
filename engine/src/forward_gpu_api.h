@@ -242,6 +242,9 @@ bool gpu_ctx_is_kv8(const GpuCtx* ctx);
 // capability check, so a config that requested int4 KV but fell back to bf16
 // reports false.
 bool gpu_ctx_is_kv4(const GpuCtx* ctx);
+// True when the persistent cache is K5:V4 (docs/kv-k5v4.md): K 5-bit in 80-byte rows, V int4. Implies
+// gpu_ctx_is_kv4(); reports the resolved mode (G4_KV8=5 after the split-attention capability check).
+bool gpu_ctx_is_k5v4(const GpuCtx* ctx);
 
 // True when the split-KV attention (decode / verify / prefill) is the active
 // path. Implied by gpu_ctx_is_kv8() in the current implementation (KV8 can

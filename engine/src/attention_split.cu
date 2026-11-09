@@ -84,7 +84,7 @@ int tiles_per_split(int stride) {
 // Int8 (Q8_0) / Int4 (Q4_0): the tile fill dequantizes each row into the same
 // bf16 Ks/Vs tiles the bf16 path writes (16 / 32 codes per thread, vector
 // loads), so everything after the fill is byte-identical between formats.
-template <bool Int8, bool Int4, int RB>
+template <bool Int8, bool Int4, int RB, bool K5 = false>
 __global__ void __launch_bounds__(kThreads)
     attn_split_kernel(const std::uint16_t* __restrict__ q,
                       const std::uint16_t* __restrict__ k,
@@ -151,7 +151,8 @@ __global__ void __launch_bounds__(kThreads)
   const std::int8_t* const v8 =
       Int8 ? cache_v8 + static_cast<std::size_t>(hkv) * stride * kD : nullptr;
   const std::uint8_t* const k4 =
-      Int4 ? cache_k4 + static_cast<std::size_t>(hkv) * stride * (kD / 2) : nullptr;
+      Int4 ? cache_k4 + static_cast<std::size_t>(hkv) * stride * (K5 ? dev::kK5RowBytes : kD / 2)
+           : nullptr;
   const std::uint8_t* const v4 =
       Int4 ? cache_v4 + static_cast<std::size_t>(hkv) * stride * (kD / 2) : nullptr;
   const float* const ksc =
@@ -256,16 +257,27 @@ __global__ void __launch_bounds__(kThreads)
         const int r = rs + idx / (kD / 32), c = (idx % (kD / 32)) * 16;  // code-byte offset
         const int pos = phys(fr, t0 + r);
         const std::size_t cbase = static_cast<std::size_t>(pos) * (kD / 2) + c;
+        // K5: the K row is 80 bytes (64 nibble bytes + a 16-byte high-bit plane); this thread's
+        // 16 nibble bytes are dims [2c, 2c + 32), whose high bits are 4 plane bytes at 64 + c / 4.
+        const std::size_t kbase = K5 ? static_cast<std::size_t>(pos) * dev::kK5RowBytes + c : cbase;
         const float sk = ksc[pos], sv = vsc[pos];
-        const uint4 kraw = *reinterpret_cast<const uint4*>(k4 + cbase);
+        const uint4 kraw = *reinterpret_cast<const uint4*>(k4 + kbase);
         const uint4 vraw = *reinterpret_cast<const uint4*>(v4 + cbase);
         const unsigned char* const kc = reinterpret_cast<const unsigned char*>(&kraw);
         const unsigned char* const vc = reinterpret_cast<const unsigned char*>(&vraw);
+        std::uint32_t khi_bits = 0;
+        if (K5)
+          khi_bits = *reinterpret_cast<const std::uint32_t*>(
+              k4 + static_cast<std::size_t>(pos) * dev::kK5RowBytes + dev::kK5NibbleBytes + c / 4);
         std::uint16_t vout[32];
 #pragma unroll
         for (int e = 0; e < 16; ++e) {
           float klo, khi, vlo, vhi;
-          dev::q4_dequant_pair(kc[e], sk, klo, khi);
+          if (K5)
+            dev::k5_dequant_pair(kc[e], (khi_bits >> (2 * e)) & 1u, (khi_bits >> (2 * e + 1)) & 1u,
+                                 sk, klo, khi);
+          else
+            dev::q4_dequant_pair(kc[e], sk, klo, khi);
           dev::q4_dequant_pair(vc[e], sv, vlo, vhi);
           Ks[r][c + e] = static_cast<std::uint32_t>(f32_to_bf16(klo)) |
                          (static_cast<std::uint32_t>(f32_to_bf16(khi)) << 16);
@@ -398,7 +410,7 @@ constexpr std::size_t kRowsSmem =
 
 // Dequantize / copy logical rows [0, cnt) into (K, V) rows (K as bf16 pairs,
 // pitch kPitchWords; V pitch kD); phys(r) is row r's physical arena row.
-template <bool Int8, bool Int4, class Phys>
+template <bool Int8, bool Int4, bool K5, class Phys>
 __device__ __forceinline__ void fill_kv(std::uint32_t* K, std::uint16_t* V, int cnt, Phys phys,
                                         const std::uint16_t* kb, const std::uint16_t* vb,
                                         const std::int8_t* k8, const std::int8_t* v8,
@@ -421,16 +433,25 @@ __device__ __forceinline__ void fill_kv(std::uint32_t* K, std::uint16_t* V, int 
       const int r = idx / (kD / 32), c = (idx % (kD / 32)) * 16;
       const int pos = phys(r);
       const std::size_t cbase = static_cast<std::size_t>(pos) * (kD / 2) + c;
+      const std::size_t kbase = K5 ? static_cast<std::size_t>(pos) * dev::kK5RowBytes + c : cbase;
       const float sk = ksc[pos], sv = vsc[pos];
-      const uint4 kraw = *reinterpret_cast<const uint4*>(k4 + cbase);
+      const uint4 kraw = *reinterpret_cast<const uint4*>(k4 + kbase);
       const uint4 vraw = *reinterpret_cast<const uint4*>(v4 + cbase);
       const unsigned char* const kc = reinterpret_cast<const unsigned char*>(&kraw);
       const unsigned char* const vc = reinterpret_cast<const unsigned char*>(&vraw);
+      std::uint32_t khi_bits = 0;
+      if (K5)
+        khi_bits = *reinterpret_cast<const std::uint32_t*>(
+            k4 + static_cast<std::size_t>(pos) * dev::kK5RowBytes + dev::kK5NibbleBytes + c / 4);
       std::uint16_t vout[32];
 #pragma unroll
       for (int e = 0; e < 16; ++e) {
         float klo, khi, vlo, vhi;
-        dev::q4_dequant_pair(kc[e], sk, klo, khi);
+        if (K5)
+          dev::k5_dequant_pair(kc[e], (khi_bits >> (2 * e)) & 1u, (khi_bits >> (2 * e + 1)) & 1u,
+                               sk, klo, khi);
+        else
+          dev::q4_dequant_pair(kc[e], sk, klo, khi);
         dev::q4_dequant_pair(vc[e], sv, vlo, vhi);
         K[r * kPitchWords + c + e] = static_cast<std::uint32_t>(f32_to_bf16(klo)) |
                                      (static_cast<std::uint32_t>(f32_to_bf16(khi)) << 16);
@@ -468,7 +489,7 @@ __device__ __forceinline__ void fill_kv(std::uint32_t* K, std::uint16_t* V, int 
   }
 }
 
-template <bool Int8, bool Int4>
+template <bool Int8, bool Int4, bool K5 = false>
 __global__ void __launch_bounds__(kRowsWarps * 32)
     attn_rows_kernel(const std::uint16_t* __restrict__ q, const std::uint16_t* __restrict__ k,
                      const std::uint16_t* __restrict__ v, float scale, int Hq, int kv_base,
@@ -530,7 +551,8 @@ __global__ void __launch_bounds__(kRowsWarps * 32)
   const std::int8_t* const v8 =
       Int8 ? cache_v8 + static_cast<std::size_t>(hkv) * stride * kD : nullptr;
   const std::uint8_t* const k4 =
-      Int4 ? cache_k4 + static_cast<std::size_t>(hkv) * stride * (kD / 2) : nullptr;
+      Int4 ? cache_k4 + static_cast<std::size_t>(hkv) * stride * (K5 ? dev::kK5RowBytes : kD / 2)
+           : nullptr;
   const std::uint8_t* const v4 =
       Int4 ? cache_v4 + static_cast<std::size_t>(hkv) * stride * (kD / 2) : nullptr;
   const float* const ksc =
@@ -547,7 +569,7 @@ __global__ void __launch_bounds__(kRowsWarps * 32)
       const int cnt = min(kTailMax, row_len(t) - 1 - tb);
       if (cnt <= 0) continue;
       const int* const tl = row_tail + (r0 + t) * kAttnTailStride;
-      fill_kv<Int8, Int4>(TK + t * kTailMax * kPitchWords, TV + t * kTailMax * kD, cnt,
+      fill_kv<Int8, Int4, K5>(TK + t * kTailMax * kPitchWords, TV + t * kTailMax * kD, cnt,
                           [&](int j) { return to_phys(tl[j]); }, kb, vb, k8, v8, k4, v4, ksc,
                           vsc);
     }
@@ -563,7 +585,7 @@ __global__ void __launch_bounds__(kRowsWarps * 32)
     // tails start inside it).
     const int ns = tails ? max(0, min(n, tb + 1 - t0)) : n;
     __syncthreads();  // previous tile's readers (and the q / tail preloads) are done
-    fill_kv<Int8, Int4>(Ks, Vs, ns, [&](int r) { return to_phys(t0 + r); }, kb, vb, k8, v8, k4,
+    fill_kv<Int8, Int4, K5>(Ks, Vs, ns, [&](int r) { return to_phys(t0 + r); }, kb, vb, k8, v8, k4,
                         v4, ksc, vsc);
     __syncthreads();
     if (t0 >= t_end) continue;  // this warp's row is done (warp-uniform)
@@ -661,7 +683,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const float* cache_v_scale, bool int8, const std::uint8_t* cache_k4,
                const std::uint8_t* cache_v4, bool int4, const int* d_pt, int max_len,
                const int* row_pos, const int* const* row_pt, const int* row_grp,
-               int ngroups, const int* row_tbase, const int* row_tail, int kv_hint) {
+               int ngroups, const int* row_tbase, const int* row_tail, int kv_hint, bool k5) {
   // `stride` addresses the cache arena; the split layout follows the longest
   // logical sequence (== stride for a private, contiguous cache).
   const int ml = max_len > 0 ? max_len : stride;
@@ -674,6 +696,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
       ((row_tbase != nullptr) != (row_tail != nullptr)) ||
       (row_tbase != nullptr && row_pos == nullptr) ||
       (int8 && int4) ||
+      (k5 && !int4) ||
       (int8 && (cache_k8 == nullptr || cache_v8 == nullptr ||
                 cache_k_scale == nullptr || cache_v_scale == nullptr)) ||
       (int4 && (cache_k4 == nullptr || cache_v4 == nullptr ||
@@ -704,6 +727,11 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
           cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr, d_pt, row_pos, row_pt,
           grp, row_tbase, row_tail, pipe_on);
+    else if (int4 && k5)
+      attn_split_kernel<false, true, RB, true><<<grid, kThreads>>>(
+          q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
+          nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt, row_pos, row_pt,
+          grp, row_tbase, row_tail, pipe_on);
     else if (int4)
       attn_split_kernel<false, true, RB><<<grid, kThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
@@ -731,6 +759,9 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                                   static_cast<int>(kRowsSmem)) == cudaSuccess &&
              cudaFuncSetAttribute(attn_rows_kernel<false, true>,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  static_cast<int>(kRowsSmem)) == cudaSuccess &&
+             cudaFuncSetAttribute(attn_rows_kernel<false, true, true>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   static_cast<int>(kRowsSmem)) == cudaSuccess;
     }();
     if (!attr) return false;
@@ -739,6 +770,11 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
       attn_rows_kernel<true, false><<<grid, kRowsWarps * 32, kRowsSmem>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
           cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr, d_pt, row_pos,
+          row_pt, grp, row_tbase, row_tail);
+    else if (int4 && k5)
+      attn_rows_kernel<false, true, true><<<grid, kRowsWarps * 32, kRowsSmem>>>(
+          q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
+          nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt, row_pos,
           row_pt, grp, row_tbase, row_tail);
     else if (int4)
       attn_rows_kernel<false, true><<<grid, kRowsWarps * 32, kRowsSmem>>>(
