@@ -383,8 +383,11 @@
                 position page). null: sessions x maxContext, so every session
                 can fill its whole context at once. A smaller pool
                 oversubscribes it: when it runs short the least recently used
-                other session's cache is dropped and that conversation
-                re-prefills on its next request. Must be >= maxContext.
+                other *idle* session's cache is dropped (that conversation
+                re-prefills on its next request), and a request whose pages
+                are held by running requests waits in the queue until one
+                finishes. Must be >= maxContext. Measured balance on the
+                16 GiB card: docs/deployment.md, "Serve config balance".
               '';
               type = lib.types.nullOr lib.types.ints.positive;
               default = null;

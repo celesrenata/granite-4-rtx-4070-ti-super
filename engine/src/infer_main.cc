@@ -1837,18 +1837,32 @@ int gpu_serve_cmd(const Args& cli) {
   std::vector<std::vector<std::int32_t>> hist(n_sessions);
   std::vector<long> last_used(n_sessions, 0);
   std::vector<EaglePolicy> policy(n_sessions);  // per conversation
+  std::vector<bool> busy(n_sessions, false);    // a request is running on it
   long tick = 0;
+  auto round_page = [](long need) {
+    return ((static_cast<std::size_t>(need) + kPoolPage - 1) / kPoolPage) * kPoolPage;
+  };
+  // Whether session i can get `need` positions by dropping only IDLE sessions'
+  // caches. false while running sessions hold the pages it needs: the request
+  // then waits in the queue until one of them finishes (an oversubscribed pool,
+  // --kv-pool-tokens < sessions x max-context).
+  auto fits_now = [&](int i, long need) {
+    std::size_t avail = pool.free_pages();
+    for (int j = 0; j < n_sessions; ++j)
+      if (j != i && !busy[j]) avail += pool.slot_pages(slot[j]);
+    return pool.pages_missing(slot[i], round_page(need)) <= avail;
+  };
   // Give session i enough pool pages for `need` positions and publish its row
   // table. Its resident pages never move, so a resumed conversation's KV stays
-  // valid. If the pool is short, the least-recently-used OTHER session's
-  // resident KV is dropped (it just re-prefills next time) until it fits.
+  // valid. If the pool is short, the least-recently-used OTHER idle session's
+  // resident KV is dropped (it just re-prefills next time) until it fits. A
+  // running session is never a victim: its pages are being written.
   auto prepare = [&](int i, long need, std::string* e) -> bool {
-    const std::size_t want =
-        ((static_cast<std::size_t>(need) + kPoolPage - 1) / kPoolPage) * kPoolPage;
+    const std::size_t want = round_page(need);
     while (pool.pages_missing(slot[i], want) > pool.free_pages()) {
       int victim = -1;
       for (int j = 0; j < n_sessions; ++j)
-        if (j != i && pool.slot_pages(slot[j]) > 0 &&
+        if (j != i && !busy[j] && pool.slot_pages(slot[j]) > 0 &&
             (victim < 0 || last_used[j] < last_used[victim]))
           victim = j;
       if (victim < 0) {
@@ -1968,7 +1982,6 @@ int gpu_serve_cmd(const Args& cli) {
     std::string err;
   };
   std::list<std::unique_ptr<Job>> jobs;  // stable addresses (EagleRun keeps refs)
-  std::vector<bool> busy(n_sessions, false);
   const bool debug = std::getenv("G4_SERVE_DEBUG") != nullptr;
   int next = 0;
   auto send = [](const std::string& s) {
@@ -2094,6 +2107,21 @@ int gpu_serve_cmd(const Args& cli) {
     const ServeDecision dec = serve_decide(state, 0, a.tokens, kPoolPage);
     j->sess = order[static_cast<std::size_t>(dec.picked)];
     j->resume = std::getenv("G4_FORCE_REPREFILL") != nullptr ? 0 : dec.resume;
+    // Pool pages for everything this job can write (+ one decode chunk of
+    // overshoot past the stop).
+    const long need = std::min<long>(
+        static_cast<long>(a.tokens.size()) + a.max_tokens + a.draft_k +
+            (a.eagle_k > 0 ? std::max(a.eagle_k, eagle_tree_nodes()) + 1 : 0) + 8,
+        cli.max_context);
+    // Oversubscribed pool and the pages it needs are held by running
+    // requests: leave it queued (FIFO) until one finishes, never take a
+    // running session's pages.
+    if (active_count() > 0 && !fits_now(j->sess, need)) {
+      if (debug)
+        std::fprintf(stderr, "G4_SERVE defer: need=%ld free_pages=%zu active=%d\n", need,
+                     pool.free_pages(), active_count());
+      return false;
+    }
     next = (j->sess + 1) % n_sessions;
     GpuSession& s = sessions[j->sess];
     j->wm_before = s.written();
@@ -2105,11 +2133,7 @@ int gpu_serve_cmd(const Args& cli) {
       send_error(j->has_id, j->id, j->err);
       return true;  // session untouched
     }
-    // Pool pages for everything this job can write (+ one decode chunk of
-    // overshoot past the stop).
-    const long need = static_cast<long>(a.tokens.size()) + a.max_tokens + a.draft_k +
-                      (a.eagle_k > 0 ? std::max(a.eagle_k, eagle_tree_nodes()) + 1 : 0) + 8;
-    if (!prepare(j->sess, std::min<long>(need, cli.max_context), &j->err)) {
+    if (!prepare(j->sess, need, &j->err)) {
       send_error(j->has_id, j->id, j->err);
       return true;
     }

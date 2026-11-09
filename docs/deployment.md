@@ -120,9 +120,11 @@ granite4.nixosModules.granite4Rtx
     checkpoint = "/opt/granite4-rtx-4070-ti-super/ckpt";  # BF16 safetensors + tokenizer
     maxContext = 8192;            # positions per request (160 KiB VRAM each, bf16 KV)
     kv8 = true;                   # int8 KV cache (opt-in; ~52% less KV VRAM, gate stays bf16)
-    # 64K context x 2 sessions (131072-position pool) needs int4 KV and a
-    # quantized EAGLE draft KV instead (see the table below):
-    #   kv4 = true; maxContext = 65536; sessions = 2; eagle.draftKv = 8;
+    # 64K context per request needs int4 KV and a quantized EAGLE draft KV
+    # instead; the measured best balance on gremlin-1 is 3 x 64K slots on a
+    # 120K pool ("Serve config balance" below):
+    #   kv4 = true; maxContext = 65536; sessions = 3; kvPoolTokens = 122880;
+    #   eagle.draftKv = 4;
     listenAddress = "127.0.0.1";
     listenPort = 2701;
   };
@@ -213,6 +215,51 @@ one, yet the draft KV cache only ever holds the current request's
 the quantization error stays small and barely moves the accept rate.
 `G4_DRAFT_KV=8` is the lossless 131K default; `4` is the headroom
 option if you need the last ~128 MiB.
+
+### Serve config balance (gremlin-1, 2026-11-09)
+
+Speed vs concurrency vs KV pool size, one build (the oversubscription fix
+below), r12 head, eagle k 4, `G4_DRAFT_KV=4` unless noted, GPU free:
+`scripts/serve_balance_matrix.sh` (`serve_balance_bench.py` per config).
+Short = 12 chat prompts x max 256 (eos), aggregate tok/s incl. prefill;
+prefill = a fresh 30K / 60K-token prompt; decode = 256 tokens resumed on it
+(steady state); VRAM per `nvidia-smi` for the engine process.
+
+| Config (kv, slots x context, pool) | VRAM load / peak MiB | short x1 | short x all slots | prefill 30K / 60K | decode 60K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| KV8, 2 x 32K, 64K, bf16 draft (old deploy) | 15218 / 15706 | 138.5 | 245.4 (x2) | 14.6 s / — | — |
+| KV8, 2 x 64K, 64K | 15086 / 15846 | 141.5 | 241.3 (x2) | 14.7 s / 45.1 s | 38.0 |
+| KV8, 2 x 64K, 72K | 15758 / OOM | — | — | — | — |
+| KV4, 2 x 64K, 128K | 15314 / 16016 | 125.4 | 226.5 (x2) | 19.1 s / 62.8 s | 39.0 |
+| KV4, 3 x 64K, 96K | 14106 / 14884 | 124.8 | 308.6 (x3) | 19.2 s / 62.8 s | 40.2 |
+| **KV4, 3 x 64K, 120K** (deployed) | 15150 / 15954 | 126.0 | 311.6 (x3) | 19.1 s / 62.8 s | 40.3 |
+| KV4, 3 x 64K, 128K | 15498 / EAGLE OOM | — | — | — | — |
+
+Read:
+
+- KV8 is the faster format (prefill ~25-28% less time, short chats +9-13%)
+  but costs **82.5 KiB/pos** in the live arena (5.80 GiB for 73728
+  positions; the 78.2 KiB/pos above is the bf16-int8 *delta*), so its pool
+  tops out at 64K on this card: two 64K slots on it hold one long
+  conversation at a time, and two long agents evict each other every turn
+  (a 60K re-prefill is ~45 s).
+- KV4 decodes long contexts as fast as KV8 (decode 60K: 39-40 vs 38 tok/s)
+  and holds 2x the positions, so the pool can be *oversubscribed*: 3 x 64K
+  slots on 120K uses less VRAM than 2 x 64K on 128K, keeps two ~55K agents
+  resident at once (stress: two 55K conversations + a short chat in flight
+  together, 123 s, no error), and adds a third slot (+38% aggregate on short
+  chats). Each slot costs ~184 MiB plus its EAGLE buffers; the EAGLE prompt
+  feature buffer is `2 B x hidden x maxContext` (512 MiB at 64K).
+- Decode at 30K swings 34-50 tok/s between runs of the same config: EAGLE
+  acceptance is ~0.07-0.09 on long contexts and its plain/draft policy flips.
+- eagle k 4 vs 5 is identical (tree drafting uses its tuned trees).
+
+Oversubscription fix: before it, a request whose pages were short evicted
+the least recently used other session *even while it was generating*, so
+both requests ran on the same pages (`scripts/serve_oversub_check.py`: the
+old engine fails with `eagle: tree head failed`). Running sessions are now
+never evicted; the request waits in the queue until one finishes, and
+outputs equal the sequential run token for token (KV4, KV8, plain).
 
 Deploy a pushed commit:
 
