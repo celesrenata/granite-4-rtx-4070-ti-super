@@ -3044,9 +3044,9 @@ static void test_shared_arena_sessions_device() {
   const int ends[] = {20, 21, 22, 30, 31};
   constexpr int kSteps = 5;
   char err[256];
-  const char* const modes[] = {"0", "1", "4"};
-  const char* const mode_name[] = {"bf16", "KV8", "KV4"};
-  for (int m = 0; m < 3; ++m) {
+  const char* const modes[] = {"0", "1", "4", "5"};
+  const char* const mode_name[] = {"bf16", "KV8", "KV4", "K5V4"};
+  for (int m = 0; m < 4; ++m) {
     setenv("G4_KV8", modes[m], 1);
     std::string tag = std::string("shared arena [") + mode_name[m] + "]: ";
     // Reference: one private-cache context, run once per token sequence.
@@ -3205,6 +3205,9 @@ static void test_attn_split_rows_bit_identical_device() {
   std::vector<std::uint8_t> k4(rowsz * d / 2), v4(rowsz * d / 2);
   for (auto& x : k4) x = static_cast<std::uint8_t>(rng.next() & 0xffu);
   for (auto& x : v4) x = static_cast<std::uint8_t>(rng.next() & 0xffu);
+  // K5:V4: K rows are kK5RowBytes (any byte pattern is a valid K5 code); V is the int4 buffer above.
+  std::vector<std::uint8_t> k5(rowsz * kK5RowBytes);
+  for (auto& x : k5) x = static_cast<std::uint8_t>(rng.next() & 0xffu);
   std::vector<float> ks(rowsz), vs(rowsz);
   for (auto& x : ks) x = 0.002f + 0.02f * rng.next_float_range(1.0);
   for (auto& x : vs) x = 0.002f + 0.02f * rng.next_float_range(1.0);
@@ -3219,14 +3222,14 @@ static void test_attn_split_rows_bit_identical_device() {
   for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
   std::uint16_t *dk, *dv, *dq, *dmulti, *dsingle;
   std::int8_t *dk8, *dv8;
-  std::uint8_t *dk4, *dv4;
+  std::uint8_t *dk4, *dv4, *dk5;
   float *dks, *dvs;
   int* dpt;
   void* scratch;
   const std::size_t scr = granite4::attn_split_scratch_bytes(Hq, kMaxR, max_len);
   if (cudaMalloc(&dk, ck.size() * 2) || cudaMalloc(&dv, cv.size() * 2) ||
       cudaMalloc(&dk8, k8.size()) || cudaMalloc(&dv8, v8.size()) ||
-      cudaMalloc(&dk4, k4.size()) || cudaMalloc(&dv4, v4.size()) ||
+      cudaMalloc(&dk4, k4.size()) || cudaMalloc(&dv4, v4.size()) || cudaMalloc(&dk5, k5.size()) ||
       cudaMalloc(&dks, ks.size() * 4) || cudaMalloc(&dvs, vs.size() * 4) ||
       cudaMalloc(&dq, qn * 2) || cudaMalloc(&dmulti, qn * 2) || cudaMalloc(&dsingle, qn * 2) ||
       cudaMalloc(&dpt, pt.size() * 4) || cudaMalloc(&scratch, scr)) {
@@ -3239,13 +3242,14 @@ static void test_attn_split_rows_bit_identical_device() {
   CUDA_CHECK(cudaMemcpy(dv8, v8.data(), v8.size(), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(dk4, k4.data(), k4.size(), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(dv4, v4.data(), v4.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk5, k5.data(), k5.size(), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(dks, ks.data(), ks.size() * 4, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(dvs, vs.data(), vs.size() * 4, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(dpt, pt.data(), pt.size() * 4, cudaMemcpyHostToDevice));
   const float scale = 0.0078125f * 8.0f;
-  const char* const names[] = {"bf16", "KV8", "KV4"};
-  for (int fmt = 0; fmt < 3; ++fmt) {
+  const char* const names[] = {"bf16", "KV8", "KV4", "K5V4"};
+  for (int fmt = 0; fmt < 4; ++fmt) {
     for (const int base : {100, 1777}) {  // short (one row per block) and long contexts
     for (const int R : {2, 7, 13}) {
       for (const bool paged : {false, true}) {
@@ -3259,9 +3263,14 @@ static void test_attn_split_rows_bit_identical_device() {
             return granite4::attn_split(qp, nullptr, nullptr, scale, Hq, Hk, d, kvb, nullptr,
                                         rows, stride, scratch, out, dk8, dv8, dks, dvs, true,
                                         nullptr, nullptr, false, t, max_len);
+          if (fmt == 2)
+            return granite4::attn_split(qp, nullptr, nullptr, scale, Hq, Hk, d, kvb, nullptr, rows,
+                                        stride, scratch, out, nullptr, nullptr, dks, dvs, false,
+                                        dk4, dv4, true, t, max_len);
           return granite4::attn_split(qp, nullptr, nullptr, scale, Hq, Hk, d, kvb, nullptr, rows,
                                       stride, scratch, out, nullptr, nullptr, dks, dvs, false,
-                                      dk4, dv4, true, t, max_len);
+                                      dk5, dv4, true, t, max_len, nullptr, nullptr, nullptr, 0,
+                                      nullptr, nullptr, 0, true);
         };
         const std::string tag = std::string("attn_split rows [") + names[fmt] + " R=" +
                                 std::to_string(R) + " base=" + std::to_string(base) +
@@ -3282,7 +3291,7 @@ static void test_attn_split_rows_bit_identical_device() {
     }
     }
   }
-  std::printf("  attn_split rows: multi-row == single-row (bf16/KV8/KV4, R=2/7/13, paged)\n");
+  std::printf("  attn_split rows: multi-row == single-row (bf16/KV8/KV4/K5V4, R=2/7/13, paged)\n");
   // Multi-sequence rows grouped per sequence (row_grp) == one row per block:
   // sequence A rows at 1500..1503 (table pt), B at 1800..1804 (table ptB).
   {
@@ -3306,7 +3315,7 @@ static void test_attn_split_rows_bit_identical_device() {
     CUDA_CHECK(cudaMemcpy(drpos, rpos.data(), n * 4, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(drpt, rpt.data(), n * sizeof(int*), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dgrp, grp, sizeof grp, cudaMemcpyHostToDevice));
-    for (int fmt = 0; fmt < 3; ++fmt) {
+    for (int fmt = 0; fmt < 4; ++fmt) {
       auto call = [&](const int* g, int ng, std::uint16_t* out) {
         if (fmt == 0)
           return granite4::attn_split(dq, dk, dv, scale, Hq, Hk, d, 0, nullptr, n, stride,
@@ -3317,9 +3326,14 @@ static void test_attn_split_rows_bit_identical_device() {
           return granite4::attn_split(dq, nullptr, nullptr, scale, Hq, Hk, d, 0, nullptr, n,
                                       stride, scratch, out, dk8, dv8, dks, dvs, true, nullptr,
                                       nullptr, false, nullptr, max_len, drpos, drpt, g, ng);
+        if (fmt == 2)
+          return granite4::attn_split(dq, nullptr, nullptr, scale, Hq, Hk, d, 0, nullptr, n,
+                                      stride, scratch, out, nullptr, nullptr, dks, dvs, false, dk4,
+                                      dv4, true, nullptr, max_len, drpos, drpt, g, ng);
         return granite4::attn_split(dq, nullptr, nullptr, scale, Hq, Hk, d, 0, nullptr, n,
-                                    stride, scratch, out, nullptr, nullptr, dks, dvs, false, dk4,
-                                    dv4, true, nullptr, max_len, drpos, drpt, g, ng);
+                                    stride, scratch, out, nullptr, nullptr, dks, dvs, false, dk5,
+                                    dv4, true, nullptr, max_len, drpos, drpt, g, ng, nullptr,
+                                    nullptr, 0, true);
       };
       const std::string tag = std::string("attn_split groups [") + names[fmt] + "]: ";
       expect(call(nullptr, 0, dsingle) == 0, (tag + "per-row launch").c_str());
@@ -3331,9 +3345,9 @@ static void test_attn_split_rows_bit_identical_device() {
              (tag + "grouped multi-sequence rows bit-identical to one row per block").c_str());
     }
     cudaFree(dptB); cudaFree(drpos); cudaFree(dgrp); cudaFree(drpt);
-    std::printf("  attn_split groups: 2 sequences x 4/5 rows grouped == per-row (bf16/KV8/KV4)\n");
+    std::printf("  attn_split groups: 2 sequences x 4/5 rows grouped == per-row (bf16/KV8/KV4/K5V4)\n");
   }
-  cudaFree(dk); cudaFree(dv); cudaFree(dk8); cudaFree(dv8); cudaFree(dk4); cudaFree(dv4);
+  cudaFree(dk); cudaFree(dv); cudaFree(dk8); cudaFree(dv8); cudaFree(dk4); cudaFree(dv4); cudaFree(dk5);
   cudaFree(dks); cudaFree(dvs); cudaFree(dq); cudaFree(dmulti); cudaFree(dsingle);
   cudaFree(dpt); cudaFree(scratch);
 }
@@ -3387,9 +3401,9 @@ static void test_decode_multi_device() {
   for (auto& s : scales) s = 0.1f + 0.9f * rng.next_float_range(1.0);
   const int plen[2] = {13, 21};  // different positions per session
   char err[256];
-  const char* const modes[] = {"0", "1", "4"};
-  const char* const names[] = {"bf16", "KV8", "KV4"};
-  for (int m = 0; m < 3; ++m) {
+  const char* const modes[] = {"0", "1", "4", "5"};
+  const char* const names[] = {"bf16", "KV8", "KV4", "K5V4"};
+  for (int m = 0; m < 4; ++m) {
     setenv("G4_KV8", modes[m], 1);
     const std::string tag = std::string("decode multi [") + names[m] + "]: ";
     std::int32_t* tok[2][2];  // [run][session]
@@ -3544,9 +3558,9 @@ static void test_tree_verify_device() {
   std::vector<std::int32_t> prompt(z(P));
   for (int i = 0; i < P; ++i) prompt[z(i)] = (i * 53 + 11) % V;
   char err[256];
-  const char* const modes[] = {"0", "1", "4"};
-  const char* const names[] = {"bf16", "KV8", "KV4"};
-  for (int m = 0; m < 3; ++m) {
+  const char* const modes[] = {"0", "1", "4", "5"};
+  const char* const names[] = {"bf16", "KV8", "KV4", "K5V4"};
+  for (int m = 0; m < 4; ++m) {
     setenv("G4_KV8", modes[m], 1);
     const std::string tag = std::string("tree verify [") + names[m] + " P=" +
                             std::to_string(P) + "]: ";
