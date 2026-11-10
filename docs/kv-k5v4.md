@@ -103,3 +103,19 @@ only ~1% when moved from int8 to K5 features (2.206 at the end of its own traini
 head has little left to win offline. The live serving-style gap is therefore probably not mainly a head-mismatch effect.
 r12 stays deployed; r13k5 is kept at `heads/r13k5.safetensors` (gremlin) and `runs/r13k5/` (5090) but not used.
 The K5 feature dumps are kept in `ds/k5/` on both hosts for future runs.
+
+## Serving-style decode gap: policy and sample investigation (2026-11-09)
+
+Two repeats per format, serving-style held-out prompts, EAGLE r12 k=4, fresh requests, `G4_SERVE_DEBUG=1`:
+
+| Run | int4 | K5:V4 |
+| --- | ---: | ---: |
+| a | 153.6 tok/s, accept 0.145 | 140.0 tok/s, accept 0.125 |
+| b | 153.5 tok/s, accept 0.145 | 140.0 tok/s, accept 0.125 |
+
+- The result is exactly reproducible (deterministic greedy), so the -9% is not run-to-run noise.
+- The adaptive draft policy is not involved: both formats kept drafting on for every request (0 switches to plain).
+- The 24-prompt set holds only **9 distinct prompts** (repeated 4, 4, 3, 3, 2, 2, 2, 2, 2 times). Per distinct prompt, K5 is slower on 3 (-20%, -12%, -14%), equal on 3, and faster on 3 (up to +10%). The weighted -9% is dominated by the single largest 4x-repeated prompt (176 vs 140 tok/s).
+- None of the 24 outputs are identical between formats: each format follows its own greedy continuation, and the draft head finds some continuations easier to predict than others.
+
+Conclusion: the serving-style gap is per-content variance between two different greedy continuations measured on a small, duplicated set, not a systematic K5 cost. With the other families (chat -1.6% over 30 prompts, novel +0.7%, long +3.4%) and r12 losing only ~1% offline when moved to K5 features, speculative decode speed under K5:V4 is effectively equal to int4. No remaining K5-specific lever was found; a faster decode would need general head or engine improvements.
