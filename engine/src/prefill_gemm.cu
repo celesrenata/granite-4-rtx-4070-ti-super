@@ -289,6 +289,16 @@ __global__ void embed_rows_kernel(const std::int32_t* tokens, int start,
       f32_to_bf16(mult * bf16_to_f32(emb[static_cast<std::size_t>(tok) * H + j]));
 }
 
+__global__ void embed_rows_v8_kernel(const std::int32_t* tokens, int start,
+                                     const std::uint16_t* emb, float mult,
+                                     std::uint16_t* out, int H) {
+  const int r = blockIdx.y;
+  const int j = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (j >= H) return;
+  const std::int32_t tok = tokens[start + r];
+  *reinterpret_cast<uint4*>(out + static_cast<std::size_t>(r) * H + j) = dev::scale_bf16x8(
+      *reinterpret_cast<const uint4*>(emb + static_cast<std::size_t>(tok) * H + j), mult);
+}
 // qkv is token-major [rows][Hq*d | Hk*d | Hk*d]. Row r sits at position
 // base_pos + r: q is rotated into q_rot [rows][Hq*d]; k is rotated and v
 // copied straight into the persistent [Hk][stride][d] caches. RoPE is the
@@ -1278,7 +1288,10 @@ int prefill_gemm(GemmOut out, const std::uint16_t* A, int lda, const std::uint8_
 int prefill_embed_rows(const std::int32_t* d_tokens, int start, int rows,
                        const std::uint16_t* emb, float mult, std::uint16_t* out, int H) {
   if (rows <= 0 || rows > 65535 || H <= 0) return -1;
-  embed_rows_kernel<<<dim3((H + 255) / 256, rows), 256>>>(d_tokens, start, emb, mult, out, H);
+  if (H % 8 == 0)
+    embed_rows_v8_kernel<<<dim3((H / 8 + 255) / 256, rows), 256>>>(d_tokens, start, emb, mult, out, H);
+  else
+    embed_rows_kernel<<<dim3((H + 255) / 256, rows), 256>>>(d_tokens, start, emb, mult, out, H);
   G4_PF_CHECK();
   return 0;
 }

@@ -47,7 +47,10 @@ void gpu_weights_free_obj(GpuWeights* w);
 int gpu_weights_load(GpuWeights* w, const std::uint8_t* h_weights,
                      std::size_t bytes, const float* h_scales,
                      std::size_t n_scales, char* error,
-                     std::size_t error_size);
+                     std::size_t error_size, std::size_t host_prefix_bytes = 0);
+// host_prefix_bytes > 0: the blob's first host_prefix_bytes (the bf16 embedding table, which a
+// token reads one row of) stay in mapped pinned HOST memory, read by the kernels over PCIe;
+// only the rest is device memory. Same bytes, so every output is unchanged.
 
 // Attach a weight object to a context without taking ownership (the
 // caller keeps the object alive for the lifetime of every context that
@@ -94,6 +97,11 @@ int gpu_ctx_set_kv_rows_n(GpuCtx* ctx, const int* h_rows, int n);
 int gpu_ctx_mapped_rows(const GpuCtx* ctx);
 // Rows per (layer, head) of the context's KV cache (the arena's pool size).
 int gpu_ctx_kv_stride(const GpuCtx* ctx);
+// Split-KV attention scratch: bytes this context needs, and replacing its own buffer with a
+// shared one (bytes >= the need; the caller owns it and keeps it alive). Contexts whose work is
+// serialized on one stream (the serve loop) can all share one buffer. 0, or -1 on bad args.
+std::size_t gpu_ctx_attn_scratch_bytes(const GpuCtx* ctx);
+int gpu_ctx_share_attn_scratch(GpuCtx* ctx, void* shared, std::size_t bytes);
 // The context's device position -> row table (stable address for its life),
 // for kernels outside the forward pass (the EAGLE draft head) that must
 // address the same rows.
@@ -102,6 +110,12 @@ const int* gpu_ctx_kv_rows_device(const GpuCtx* ctx);
 // only for contexts that never prefill concurrently (the serve loop runs one
 // request at a time). Call before the context's first prefill.
 int gpu_ctx_share_prefill_scratch(GpuCtx* ctx, GpuCtx* owner);
+// RoPE cos/sin tables ([max_pos][d/2] f32 each, ~48 MiB at 98K positions): read-only, so contexts
+// of the same shape can use one copy. share: ctx frees its own and uses owner's (owner must
+// outlive ctx). get: the tables and the shape they were built for. 0, or -1 on a mismatch.
+int gpu_ctx_share_rope_tables(GpuCtx* ctx, const GpuCtx* owner);
+int gpu_ctx_rope_tables(const GpuCtx* ctx, const float** cos_tbl, const float** sin_tbl,
+                        int* max_pos, int* d, double* theta);
 // The context's tensor-core prefill scratch (allocated on first use), for
 // kernels outside the forward pass that run a prefill-shaped batch between
 // two forwards - the EAGLE head's prompt catch-up. Valid until the next

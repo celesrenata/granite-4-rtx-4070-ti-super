@@ -95,6 +95,26 @@ __global__ void concat_kernel(const std::int32_t* tokens, int tok0, const std::u
   }
 }
 
+// concat_kernel with 8 bf16 (16 bytes) per thread; H % 8 == 0. The embedding table may be in
+// mapped host memory (G4_EMBED_HOST), where wide reads keep PCIe efficient.
+__global__ void concat_v8_kernel(const std::int32_t* tokens, int tok0, const std::uint16_t* emb,
+                                 const std::uint16_t* feat, int H, std::uint16_t* x) {
+  const int r = blockIdx.y;
+  const int j = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (j >= 2 * H) return;
+  const std::uint16_t* const src =
+      j < H ? emb + static_cast<std::size_t>(tokens[tok0 + r]) * H + j
+            : feat + static_cast<std::size_t>(r) * H + (j - H);
+  *reinterpret_cast<uint4*>(x + static_cast<std::size_t>(r) * 2 * H + j) =
+      *reinterpret_cast<const uint4*>(src);
+}
+void launch_concat(const std::int32_t* tokens, int tok0, const std::uint16_t* emb,
+                   const std::uint16_t* feat, int H, int R, std::uint16_t* x) {
+  if (H % 8 == 0)
+    concat_v8_kernel<<<dim3((2 * H / 8 + 255) / 256, R), 256>>>(tokens, tok0, emb, feat, H, x);
+  else
+    concat_kernel<<<dim3((2 * H + 255) / 256, R), 256>>>(tokens, tok0, emb, feat, H, x);
+}
 // In place on the [rows][2H] concat buffer: half 0 (embedding) by ln_e,
 // half 1 (feature) by ln_h. One block per (half, row).
 constexpr int kNormThreads = 1024;
@@ -448,7 +468,17 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
   if (ok) ok = h->alloc(&h->scratch, row_elems(*h) * kMaxVerifyRows * 2, err);
   if (ok) ok = h->alloc(&h->logits, static_cast<std::size_t>(h->Vd) * 2, err);
   if (!ok) return nullptr;
-  if (granite4_rope_tables_build(spec.rope_theta, h->d, max_pos, &h->cos_tbl, &h->sin_tbl) != 0) {
+  // The target context's RoPE tables when they match (same d, length, theta; read-only): one
+  // copy instead of two (~48 MiB at 98K positions).
+  const float *tc = nullptr, *ts = nullptr;
+  int tmax = 0, td = 0;
+  double ttheta = 0.0;
+  if (target != nullptr && gpu_ctx_rope_tables(target, &tc, &ts, &tmax, &td, &ttheta) == 0 &&
+      td == h->d && tmax == max_pos && ttheta == static_cast<double>(spec.rope_theta)) {
+    h->cos_tbl = const_cast<float*>(tc);
+    h->sin_tbl = const_cast<float*>(ts);
+    h->owns_tables = false;
+  } else if (granite4_rope_tables_build(spec.rope_theta, h->d, max_pos, &h->cos_tbl, &h->sin_tbl) != 0) {
     *err = "eagle head: rope tables";
     return nullptr;
   }
@@ -457,6 +487,23 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
 }
 
 void eagle_free(EagleHead* h) { delete h; }
+
+std::size_t eagle_attn_scratch_bytes(const EagleHead* h) {
+  return h != nullptr ? attn_split_scratch_bytes(h->Hq, kMaxVerifyRows, h->max_pos) : 0;
+}
+int eagle_share_attn_scratch(EagleHead* h, void* shared, std::size_t bytes) {
+  if (h == nullptr || shared == nullptr || bytes < eagle_attn_scratch_bytes(h)) return -1;
+  // The own buffer came from h->alloc: free it now and drop it from the free list.
+  for (auto it = h->allocs.begin(); it != h->allocs.end(); ++it)
+    if (*it == h->attn_scratch) {
+      cudaFree(*it);
+      h->allocs.erase(it);
+      break;
+    }
+  h->attn_scratch = shared;
+  return 0;
+}
+
 
 EagleHead* eagle_fork(const EagleHead* base, GpuCtx* target, std::string* err) {
   if (base == nullptr || target == nullptr || !base->paged) {
@@ -521,7 +568,7 @@ int eagle_rows_prefill(EagleHead* h, const std::int32_t* d_tokens, int p, int R,
   std::uint16_t* const xin = reinterpret_cast<std::uint16_t*>(s.gu);
   std::uint16_t* const x = s.hidden;
   std::uint16_t* const xn = s.normed;
-  concat_kernel<<<dim3((2 * H + 255) / 256, R), 256>>>(d_tokens, p + 1, h->embed, d_feat, H, xin);
+  launch_concat(d_tokens, p + 1, h->embed, d_feat, H, R, xin);
   if (h->ln_e != nullptr)
     input_norm_kernel<<<dim3(2, R), kNormThreads>>>(xin, h->ln_e, h->ln_h, H, h->eps);
   GemmEpilogue ep;
@@ -645,8 +692,7 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
                   *v = take(nk), *qr = take(nq), *kr = take(nk), *att = take(nq), *hh = take(H),
                   *hn = take(H), *act = take(I);
     std::uint16_t* f = d_feat_out + static_cast<std::size_t>(c0) * H;
-    concat_kernel<<<dim3((2 * H + 255) / 256, R), 256>>>(
-        d_tokens, p + 1, h->embed, d_feat + static_cast<std::size_t>(c0) * H, H, xin);
+    launch_concat(d_tokens, p + 1, h->embed, d_feat + static_cast<std::size_t>(c0) * H, H, R, xin);
     if (h->ln_e != nullptr)
       input_norm_kernel<<<dim3(2, R), kNormThreads>>>(xin, h->ln_e, h->ln_h, H, h->eps);
     if (granite4_verify_gemv(xin, h->fc, h->sc[0], R, H, 2 * H, x) != 0) return -1;
@@ -728,6 +774,19 @@ __global__ void concat_multi_kernel(const GpuMultiRows* __restrict__ mr, const s
   }
 }
 
+__global__ void concat_multi_v8_kernel(const GpuMultiRows* __restrict__ mr, const std::uint16_t* emb,
+                                       const std::uint16_t* feat, int H, std::uint16_t* x) {
+  const int r = blockIdx.y;
+  const int j = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (j >= 2 * H) return;
+  const int slot = mr->tree ? mr->slot[r] : mr->pos[r];
+  const std::uint16_t* const src =
+      j < H ? emb + static_cast<std::size_t>(mr->tok[r][slot + 1]) * H + j
+            : feat + static_cast<std::size_t>(r) * H + (j - H);
+  *reinterpret_cast<uint4*>(x + static_cast<std::size_t>(r) * 2 * H + j) =
+      *reinterpret_cast<const uint4*>(src);
+}
+
 // Per row: the k best draft-vocab entries (descending, first index on ties),
 // mapped to target ids and written to tokens[slot[i]].
 struct TopkReq {
@@ -788,7 +847,10 @@ int head_rows(EagleHead* h, GpuMultiRows* md, int R, bool tree, int kv_hint) {
                 *v = take(nk), *qr = take(nq), *kr = take(nk), *att = take(nq), *hh = take(H),
                 *hn = take(H), *act = take(I);
   std::uint16_t* const f = h->multi_out;
-  concat_multi_kernel<<<dim3((2 * H + 255) / 256, R), 256>>>(md, h->embed, h->multi_feat, H, xin);
+  if (H % 8 == 0)
+    concat_multi_v8_kernel<<<dim3((2 * H / 8 + 255) / 256, R), 256>>>(md, h->embed, h->multi_feat, H, xin);
+  else
+    concat_multi_kernel<<<dim3((2 * H + 255) / 256, R), 256>>>(md, h->embed, h->multi_feat, H, xin);
   if (h->ln_e != nullptr)
     input_norm_kernel<<<dim3(2, R), kNormThreads>>>(xin, h->ln_e, h->ln_h, H, h->eps);
   if (granite4_verify_gemv(xin, h->fc, h->sc[0], R, H, 2 * H, x) != 0) return -1;

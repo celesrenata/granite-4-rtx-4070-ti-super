@@ -91,6 +91,14 @@ __global__ void embed_kernel(const std::int32_t* tokens, const int* d_pos,
       f32_to_bf16(mult * bf16_to_f32(emb[static_cast<std::size_t>(tok) * H + j]));
 }
 
+__global__ void embed_v8_kernel(const std::int32_t* tokens, const int* d_pos,
+                                const std::uint16_t* emb, float mult, std::uint16_t* out, int H) {
+  const int j = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (j >= H) return;
+  const std::int32_t tok = tokens[*d_pos];
+  *reinterpret_cast<uint4*>(out + j) =
+      dev::scale_bf16x8(*reinterpret_cast<const uint4*>(emb + static_cast<std::size_t>(tok) * H + j), mult);
+}
 // Store position *d_pos's RoPE'd K and raw V in the persistent
 // [Hk][stride][d] cache; direct-cache GQA reads the rows in place.
 __global__ void kv_append_kernel(const std::uint16_t* src_k, const std::uint16_t* src_v,
@@ -359,6 +367,15 @@ __global__ void embed_multi_kernel(const MultiRows* __restrict__ mr,
       f32_to_bf16(mult * bf16_to_f32(emb[static_cast<std::size_t>(tok) * H + j]));
 }
 
+__global__ void embed_multi_v8_kernel(const MultiRows* __restrict__ mr, const std::uint16_t* emb,
+                                      float mult, std::uint16_t* out, int H) {
+  const int r = blockIdx.y;
+  const int j = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (j >= H) return;
+  const std::int32_t tok = mr->tok[r][multi_slot(mr, r)];
+  *reinterpret_cast<uint4*>(out + static_cast<std::size_t>(r) * H + j) =
+      dev::scale_bf16x8(*reinterpret_cast<const uint4*>(emb + static_cast<std::size_t>(tok) * H + j), mult);
+}
 // rope_at_pos_batched_kernel with row r at its own position.
 __global__ void rope_multi_kernel(const std::uint16_t* x, const float* cos_tbl,
                                   const float* sin_tbl, const MultiRows* __restrict__ mr,
@@ -1183,7 +1200,13 @@ int granite4_kernel_rmsnorm_batched(const std::uint16_t* d_x,
 // per sequence.
 // ---------------------------------------------------------------------------
 struct GpuWeights {
-  std::uint8_t* weights = nullptr;  // [weights_bytes] packed GpuWeightsLayout (device)
+  // Base of the packed GpuWeightsLayout. With a host prefix it is dev_alloc - prefix_bytes: offsets
+  // below prefix_bytes are never dereferenced through it (they live at prefix_dev).
+  std::uint8_t* weights = nullptr;
+  std::uint8_t* dev_alloc = nullptr;    // the device allocation (== weights without a prefix)
+  std::uint8_t* host_prefix = nullptr;  // pinned host copy of bytes [0, prefix_bytes), or null
+  const std::uint8_t* prefix_dev = nullptr;  // its device-mapped address
+  std::size_t prefix_bytes = 0;
   float* scales = nullptr;          // [scales_count] dequant scales (HOST, pinned, host-read)
   std::size_t weights_bytes = 0;
   std::size_t scales_count = 0;
@@ -1199,7 +1222,8 @@ GpuWeights* gpu_weights_create() {
 
 void gpu_weights_free_obj(GpuWeights* w) {
   if (w == nullptr) return;
-  if (w->weights != nullptr) cudaFree(w->weights);
+  if (w->dev_alloc != nullptr) cudaFree(w->dev_alloc);
+  if (w->host_prefix != nullptr) cudaFreeHost(w->host_prefix);
   if (w->scales != nullptr) cudaFreeHost(w->scales);
   delete w;
 }
@@ -1209,12 +1233,14 @@ void gpu_weights_free_obj(GpuWeights* w) {
 int gpu_weights_load(GpuWeights* w, const std::uint8_t* h_weights,
                      std::size_t bytes, const float* h_scales,
                      std::size_t n_scales, char* error,
-                     std::size_t error_size) {
+                     std::size_t error_size, std::size_t host_prefix_bytes) {
   auto seterr = [&](const char* what) {
     if (error != nullptr && error_size > 0)
       std::snprintf(error, error_size, "%s", what);
     return -1;
   };
+  if (host_prefix_bytes >= bytes || (host_prefix_bytes & 255u) != 0)
+    return seterr("invalid host prefix");
   if (w == nullptr || h_weights == nullptr || bytes == 0 ||
       h_scales == nullptr || n_scales == 0 ||
       n_scales > SIZE_MAX / sizeof(float))
@@ -1223,19 +1249,36 @@ int gpu_weights_load(GpuWeights* w, const std::uint8_t* h_weights,
     if (!std::isfinite(h_scales[i])) return seterr("non-finite scale");
   }
   // Replacing existing weights: free first (idempotent semantics).
-  if (w->weights != nullptr) cudaFree(w->weights);
+  if (w->dev_alloc != nullptr) cudaFree(w->dev_alloc);
+  if (w->host_prefix != nullptr) cudaFreeHost(w->host_prefix);
   if (w->scales != nullptr) cudaFreeHost(w->scales);
   w->weights = nullptr;
+  w->dev_alloc = nullptr;
+  w->host_prefix = nullptr;
+  w->prefix_dev = nullptr;
+  w->prefix_bytes = 0;
   w->scales = nullptr;
   w->weights_bytes = 0;
   w->scales_count = 0;
+  const std::size_t P = host_prefix_bytes;
   std::uint8_t* d_weights = nullptr;
-  if (cudaMalloc(&d_weights, bytes) != cudaSuccess)
+  if (cudaMalloc(&d_weights, bytes - P) != cudaSuccess)
     return seterr("cudaMalloc weights failed");
-  if (cudaMemcpy(d_weights, h_weights, bytes, cudaMemcpyHostToDevice) !=
+  if (cudaMemcpy(d_weights, h_weights + P, bytes - P, cudaMemcpyHostToDevice) !=
       cudaSuccess) {
     cudaFree(d_weights);
     return seterr("cudaMemcpy weights failed");
+  }
+  std::uint8_t* h_prefix = nullptr;
+  void* d_prefix = nullptr;
+  if (P > 0) {
+    if (cudaHostAlloc(&h_prefix, P, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostGetDevicePointer(&d_prefix, h_prefix, 0) != cudaSuccess) {
+      if (h_prefix != nullptr) cudaFreeHost(h_prefix);
+      cudaFree(d_weights);
+      return seterr("cudaHostAlloc weight prefix failed");
+    }
+    std::memcpy(h_prefix, h_weights, P);
   }
   // The dequant scales are read on the host (every kernel launcher takes
   // them by value), so they must stay in HOST memory - pinned for the
@@ -1247,7 +1290,11 @@ int gpu_weights_load(GpuWeights* w, const std::uint8_t* h_weights,
     return seterr("cudaHostAlloc scales failed");
   }
   std::memcpy(h_scales_pin, h_scales, n_scales * sizeof(float));
-  w->weights = d_weights;
+  w->dev_alloc = d_weights;
+  w->weights = d_weights - P;
+  w->host_prefix = h_prefix;
+  w->prefix_dev = static_cast<const std::uint8_t*>(d_prefix);
+  w->prefix_bytes = P;
   w->weights_bytes = bytes;
   w->scales = h_scales_pin;
   w->scales_count = n_scales;
@@ -1375,6 +1422,7 @@ struct GpuCtx {
   // G4_SPLIT_ATTN=0 selects the fused one-block-per-head GQA instead.
   bool split_attn = false;
   void* attn_scratch = nullptr;
+  bool owns_attn_scratch = true;  // false: a shared buffer (gpu_ctx_share_attn_scratch)
 
   // Tensor-core prefill scratch (allocated on first use, prefill_rows rows).
   std::uint8_t* prefill = nullptr;
@@ -1385,6 +1433,7 @@ struct GpuCtx {
   const std::int32_t* graph_tokens = nullptr;  // pointers the graph was
   const std::uint16_t* graph_logits = nullptr;  // captured with
 
+  bool owns_tables = true;   // false: cos/sin borrowed (gpu_ctx_share_rope_tables)
   float* cos_tbl = nullptr;  // [max_pos][d/2]
   float* sin_tbl = nullptr;
   int written = 0;  // KV positions written so far
@@ -1707,7 +1756,7 @@ void gpu_ctx_free(GpuCtx* ctx) {
   cudaFree(ctx->scratch_batched);
   cudaFree(ctx->d_pos);
   cudaFree(ctx->d_pt);
-  cudaFree(ctx->attn_scratch);
+  if (ctx->owns_attn_scratch) cudaFree(ctx->attn_scratch);
   if (ctx->prefill_owner == nullptr) cudaFree(ctx->prefill);
   cudaFree(ctx->d_multi);
   cudaFree(ctx->d_multi_ids);
@@ -1715,8 +1764,10 @@ void gpu_ctx_free(GpuCtx* ctx) {
   for (auto& vg : ctx->verify_graphs)
     if (vg.exec != nullptr) cudaGraphExecDestroy(vg.exec);
   if (ctx->decode_graph != nullptr) cudaGraphExecDestroy(ctx->decode_graph);
-  cudaFree(ctx->cos_tbl);
-  cudaFree(ctx->sin_tbl);
+  if (ctx->owns_tables) {
+    cudaFree(ctx->cos_tbl);
+    cudaFree(ctx->sin_tbl);
+  }
   if (ctx->owns_weights && ctx->weights_obj != nullptr)
     gpu_weights_free_obj(ctx->weights_obj);
   ctx->weights_obj = nullptr;
@@ -1842,7 +1893,11 @@ HeadView head_view(const GpuCtx* g) {
                              static_cast<std::size_t>(g->Hq), static_cast<std::size_t>(g->Hk),
                              static_cast<std::size_t>(g->d)};
   HeadView h;
-  h.embed = reinterpret_cast<const std::uint16_t*>(g->weights);
+  // The embedding is the blob's first bytes; with a host prefix it lives in mapped host memory.
+  h.embed = reinterpret_cast<const std::uint16_t*>(
+      g->weights_obj != nullptr && g->weights_obj->prefix_bytes >= lay.embed_bytes()
+          ? g->weights_obj->prefix_dev
+          : g->weights);
   h.final_norm = reinterpret_cast<const std::uint16_t*>(g->weights + lay.final_norm_off());
   h.lm_head = g->weights + lay.lm_head_off();
   h.lm_scale = g->scales[static_cast<std::size_t>(g->L) * kGpuScalesPerLayer] *
@@ -2042,6 +2097,10 @@ int forward_position(GpuCtx* g, const std::int32_t* d_tokens, int t_host,
   std::uint16_t* const d_k_new_rot = d_qf_rot + Hq * d;
 
   bucket(StepProbe::kEmbed, 0, 0);
+  if (H % 8 == 0)
+    embed_v8_kernel<<<(H / 8 + 255) / 256, 256>>>(d_tokens, g->d_pos, hv.embed,
+                                                  g->spec.embedding_multiplier, d_hidden, H);
+  else
   embed_kernel<<<(H + 255) / 256, 256>>>(d_tokens, g->d_pos, hv.embed,
                                          g->spec.embedding_multiplier, d_hidden, H);
   G4_CUDA_CHECK(cudaGetLastError());
@@ -2455,6 +2514,10 @@ int forward_multi_step(GpuCtx* g, MultiRows* d_mr, int n, std::uint16_t* d_logit
   // replays bypassed), per-call averages printed every 64 calls.
   MultiProfile prof;
   prof.mark(-1);
+  if (H % 8 == 0)
+    embed_multi_v8_kernel<<<dim3((H / 8 + 255) / 256, rows), 256>>>(
+        d_mr, hv.embed, g->spec.embedding_multiplier, d_hidden, H);
+  else
   embed_multi_kernel<<<dim3((H + 255) / 256, rows), 256>>>(d_mr, hv.embed,
                                                            g->spec.embedding_multiplier,
                                                            d_hidden, H);
@@ -2665,6 +2728,20 @@ bool ensure_prefill_scratch(GpuCtx* g) {
       cudaSuccess) {
     cudaGetLastError();  // clear the sticky-free allocation error
     g->prefill = nullptr;
+    // Without it every long prompt runs one position at a time (minutes for 32K tokens): say so
+    // once, since the cause is a pool / context too large for the card, not a slow kernel.
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      std::size_t free_b = 0, total_b = 0;
+      cudaMemGetInfo(&free_b, &total_b);
+      std::fprintf(stderr,
+                   "granite4: WARNING: prefill scratch (%.0f MiB) does not fit (%.0f MiB free); "
+                   "long prompts fall back to the per-position forward and will be very slow. "
+                   "Lower --kv-pool-tokens or --max-context.\n",
+                   static_cast<double>(prefill_row_bytes(g) * rows + 256 + prefill_ws_bytes(g)) / 1048576.0,
+                   static_cast<double>(free_b) / 1048576.0);
+    }
     return false;
   }
   g->prefill_rows = rows;
@@ -3519,6 +3596,19 @@ int gpu_ctx_set_kv_rows(GpuCtx* ctx, const int* h_rows) {
 }
 int gpu_ctx_mapped_rows(const GpuCtx* ctx) { return ctx != nullptr ? ctx->mapped : 0; }
 int gpu_ctx_kv_stride(const GpuCtx* ctx) { return ctx != nullptr ? ctx->kv_stride : 0; }
+std::size_t gpu_ctx_attn_scratch_bytes(const GpuCtx* ctx) {
+  return ctx != nullptr && ctx->split_attn ? attn_split_scratch_bytes(ctx->Hq, kMaxVerifyRows, ctx->max_pos)
+                                           : 0;
+}
+int gpu_ctx_share_attn_scratch(GpuCtx* ctx, void* shared, std::size_t bytes) {
+  if (ctx == nullptr || shared == nullptr || !ctx->split_attn ||
+      bytes < gpu_ctx_attn_scratch_bytes(ctx))
+    return -1;
+  if (ctx->owns_attn_scratch) cudaFree(ctx->attn_scratch);
+  ctx->attn_scratch = shared;
+  ctx->owns_attn_scratch = false;
+  return 0;
+}
 const int* gpu_ctx_kv_rows_device(const GpuCtx* ctx) {
   return ctx != nullptr ? ctx->d_pt : nullptr;
 }
@@ -3538,6 +3628,28 @@ int gpu_ctx_prefill_scratch(GpuCtx* ctx, GpuPrefillScratch* out) {
   out->ws = p.ws;
   out->ws_bytes = p.ws_bytes;
   out->rows = ctx->prefill_rows;
+  return 0;
+}
+int gpu_ctx_share_rope_tables(GpuCtx* ctx, const GpuCtx* owner) {
+  if (ctx == nullptr || owner == nullptr || ctx == owner || !ctx->owns_tables ||
+      owner->cos_tbl == nullptr || ctx->d != owner->d || ctx->max_pos != owner->max_pos ||
+      ctx->spec.rope_theta != owner->spec.rope_theta)
+    return -1;
+  cudaFree(ctx->cos_tbl);
+  cudaFree(ctx->sin_tbl);
+  ctx->cos_tbl = owner->cos_tbl;
+  ctx->sin_tbl = owner->sin_tbl;
+  ctx->owns_tables = false;
+  return 0;
+}
+int gpu_ctx_rope_tables(const GpuCtx* ctx, const float** cos_tbl, const float** sin_tbl,
+                        int* max_pos, int* d, double* theta) {
+  if (ctx == nullptr || ctx->cos_tbl == nullptr) return -1;
+  *cos_tbl = ctx->cos_tbl;
+  *sin_tbl = ctx->sin_tbl;
+  *max_pos = ctx->max_pos;
+  *d = ctx->d;
+  *theta = ctx->spec.rope_theta;
   return 0;
 }
 int gpu_ctx_share_prefill_scratch(GpuCtx* ctx, GpuCtx* owner) {

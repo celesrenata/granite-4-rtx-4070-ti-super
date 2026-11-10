@@ -337,6 +337,12 @@ class GpuSession {
       *error = "gpu_ctx_share_prefill_scratch failed";
       return false;
     }
+    // Same shape: one copy of the read-only RoPE tables (G4_SHARE_ROPE=0 keeps one each).
+    const char* sr = std::getenv("G4_SHARE_ROPE");
+    if ((sr == nullptr || sr[0] != '0') && gpu_ctx_share_rope_tables(ctx_, owner->ctx_) != 0) {
+      *error = "gpu_ctx_share_rope_tables failed";
+      return false;
+    }
     feat_owner_ = owner;
     return true;
   }
@@ -460,7 +466,15 @@ class GpuSession {
   std::int32_t* argmax_buffer() { return d_argmax_; }
   std::int32_t* d_tokens() { return d_tokens_; }
   const std::string& dir() const { return dir_; }
-  // Device scratch for draft-head features: [max_pos][hidden] (prompt) and
+  // Prompt catch-up piece (rows): EagleRun::start() forwards the target and runs the head over a
+  // long prompt in pieces of this many rows (the last piece holds up to twice as many), so the
+  // prompt-feature buffer needs kPromptFeatRows rows instead of max_pos (512 MiB at 64K).
+  // A multiple of the 512-row prefill chunk: every piece starts on a chunk boundary of the
+  // unsplit call, so the target and head chunking - and every output - are unchanged.
+  static constexpr int kCatchupPiece = 2048;
+  static constexpr int kPromptFeatRows = 2 * kCatchupPiece;
+  int prompt_feat_rows() const { return std::min(max_pos_, kPromptFeatRows); }
+  // Device scratch for draft-head features: [prompt_feat_rows][hidden] (prompt) and
   // [kMaxVerifyRows][hidden] (verify rows, chain); allocated on first use.
   bool feature_buffers(std::uint16_t** prompt, std::uint16_t** verify, std::uint16_t** chain,
                        std::string* error) {
@@ -481,10 +495,10 @@ class GpuSession {
     }
     if (d_feat_ == nullptr) {
       const std::size_t H = static_cast<std::size_t>(hidden_);
-      G4_HOST_CUDA_CHECK(cudaMalloc(&d_feat_, 2 * H * (max_pos_ + 2 * kMaxVerifyRows)));
+      G4_HOST_CUDA_CHECK(cudaMalloc(&d_feat_, 2 * H * (prompt_feat_rows() + 2 * kMaxVerifyRows)));
     }
     *prompt = d_feat_;
-    *verify = d_feat_ + static_cast<std::size_t>(max_pos_) * hidden_;
+    *verify = d_feat_ + static_cast<std::size_t>(prompt_feat_rows()) * hidden_;
     *chain = *verify + static_cast<std::size_t>(kMaxVerifyRows) * hidden_;
     return true;
   }
@@ -995,14 +1009,28 @@ class EagleRun {
     int hq0 = 0;
     if (prefix > 0) hq0 = std::max(0, std::min({prefix, eagle_written(head_), plen - 1}));
     std::vector<std::int32_t> ids;
-    if (!s_.truncate(hq0) || !s_.upload(seq_, 0, plen, error) ||
-        !s_.forward(plen, plen - 1, error, f_prompt, hq0) || !s_.argmax(1, &ids, error))
-      return false;
+    if (!s_.truncate(hq0) || !s_.upload(seq_, 0, plen, error)) return false;
     eagle_truncate(head_, hq0);
     started_ = true;
     head_valid_ = hq0;
+    // Long prompts: target + head catch-up piece by piece (see kCatchupPiece), so the feature
+    // buffer only ever holds one piece. The last piece (C..2C rows) yields the first token.
+    constexpr int C = GpuSession::kCatchupPiece;
+    int s0 = hq0;
+    std::int32_t* const d_tok0 = s_.d_tokens();
+    while (plen - s0 > 2 * C) {
+      if (!s_.forward(s0 + C, s0 + C, error, f_prompt, s0)) return false;
+      if (eagle_forward(head_, d_tok0, s0, C, f_prompt, f_prompt, nullptr) != 0) {
+        *error = "eagle: head forward failed";
+        return false;
+      }
+      s0 += C;
+      head_valid_ = s0;
+    }
+    if (!s_.forward(plen, plen - 1, error, f_prompt, s0) || !s_.argmax(1, &ids, error))
+      return false;
     L_ = plen;
-    hq_ = hq0;
+    hq_ = s0;
     if (emit(ids[0])) {
       *done = true;
       return true;
@@ -1735,6 +1763,21 @@ int gpu_dump_hidden_cmd(const Args& a) {
 // `serve`: load once, then answer one JSON request per stdin line with one
 // JSON line on stdout (see the file header). Errors are reported per request
 // ({"error": "..."}) and do not end the loop; EOF on stdin does.
+// G4_MEM_LOG=1: device memory in use (cudaMemGetInfo) at each serve stage and after each
+// request, with the delta since the previous mark - the audit for where VRAM goes.
+void mem_mark(const char* stage) {
+  static const bool on = [] {
+    const char* e = std::getenv("G4_MEM_LOG");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (!on) return;
+  static double prev = 0.0;
+  std::size_t free_b = 0, total_b = 0;
+  if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+  const double used = static_cast<double>(total_b - free_b) / (1024.0 * 1024.0);
+  std::fprintf(stderr, "granite4: mem %-28s used %8.1f MiB  delta %+8.1f MiB\n", stage, used, used - prev);
+  prev = used;
+}
 int gpu_serve_cmd(const Args& cli) {
   constexpr int kServeLogitRows = 16;  // draft_lookup <= 15
   constexpr int kPoolPage = 64;        // rows per KV page (the attention tile)
@@ -1746,6 +1789,8 @@ int gpu_serve_cmd(const Args& cli) {
   ModelConfig cfg;
   if (!load_model_config(cli.dir, &cfg, &err, /*enforce_spec=*/true))
     return fail(err);
+  cudaFree(nullptr);  // create the CUDA context first so its cost is its own mark
+  mem_mark("cuda context");
   GpuModel gm;
   if (!pack_gpu_model_from_checkpoint(cli.dir, cfg, &gm, &err))
     return fail(err);
@@ -1753,15 +1798,22 @@ int gpu_serve_cmd(const Args& cli) {
   if (weights == nullptr) return fail("gpu_weights_create failed");
   {
     char werr[256] = "";
+    // The bf16 embedding table (the blob's first vocab x hidden x 2 bytes, ~784 MiB) stays in
+    // mapped host memory: a token reads one 8 KB row of it, and the space goes to the KV pool.
+    // G4_EMBED_HOST=0 keeps it on the device.
+    const char* eh = std::getenv("G4_EMBED_HOST");
+    const std::size_t embed_bytes =
+        (eh != nullptr && eh[0] == '0') ? 0 : cfg.vocab_size * cfg.hidden_size * 2;
     if (gpu_weights_load(weights, gm.weights.get(), gm.bytes,
                          gm.scales.data(), gm.scales.size(), werr,
-                         sizeof werr) != 0)
+                         sizeof werr, embed_bytes) != 0)
       return fail(std::string("gpu_weights_load: ") + werr);
   }
   struct WtGuard {
     GpuWeights* w;
     ~WtGuard() { gpu_weights_free_obj(w); }
   } wt_guard{weights};
+  mem_mark("weights");
   constexpr int kMaxSessions = 16;
   if (n_sessions > kMaxSessions)
     return fail("--sessions exceeds " + std::to_string(kMaxSessions));
@@ -1787,6 +1839,7 @@ int gpu_serve_cmd(const Args& cli) {
     GpuKvArena* a;
     ~ArenaGuard() { gpu_kv_arena_free(a); }
   } arena_guard{arena};
+  mem_mark("kv arena");
   KvPoolConfig pool_cfg;
   pool_cfg.layout = KvLayout::from_config(cfg);
   pool_cfg.tokens_per_page = kPoolPage;
@@ -1800,14 +1853,44 @@ int gpu_serve_cmd(const Args& cli) {
   //    scratch and feature buffers instead of each holding ~1 GiB of its own.
   GpuSession sessions[kMaxSessions];
   int slot[kMaxSessions];
+  // One split-KV attention scratch for every session and head (~65 MiB each at 256 splits x 16
+  // rows): the serve loop issues all GPU work from this thread in stream order, so no two
+  // attention calls are in flight at once. Each context / head swaps to it right after it is
+  // created, so the private buffers never coexist (they would set the startup peak).
+  // G4_SHARE_ATTN_SCRATCH=0 keeps one per context.
+  void* shared_attn = nullptr;
+  std::size_t shared_attn_bytes = 0;
+  struct SharedAttnGuard {
+    void** p;
+    ~SharedAttnGuard() { cudaFree(*p); }
+  } shared_attn_guard{&shared_attn};
+  const bool share_attn = [] {
+    const char* e = std::getenv("G4_SHARE_ATTN_SCRATCH");
+    return e == nullptr || e[0] != '0';
+  }();
   for (int i = 0; i < n_sessions; ++i) {
     if (!sessions[i].open_shared(cli.dir, cli.max_context, kServeLogitRows,
                                  weights, &err, arena))
       return fail("open_shared[" + std::to_string(i) + "]: " + err);
+    if (share_attn) {
+      GpuCtx* const c = sessions[i].ctx();
+      if (shared_attn == nullptr) {
+        // Session 0's own buffer becomes the shared one: allocate the shared buffer, then free
+        // session 0's when it swaps (net zero beyond one buffer).
+        shared_attn_bytes = gpu_ctx_attn_scratch_bytes(c);
+        if (shared_attn_bytes > 0 && cudaMalloc(&shared_attn, shared_attn_bytes) != cudaSuccess) {
+          cudaGetLastError();
+          shared_attn = nullptr;
+        }
+      }
+      if (shared_attn != nullptr && gpu_ctx_share_attn_scratch(c, shared_attn, shared_attn_bytes) != 0)
+        return fail("share attention scratch failed (session " + std::to_string(i) + ")");
+    }
     if (i > 0 && !sessions[i].share_scratch_from(&sessions[0], &err))
       return fail("share_scratch[" + std::to_string(i) + "]: " + err);
     slot[i] = pool.open_slot();
     if (slot[i] < 0) return fail("kv pool: no slot for session " + std::to_string(i));
+    mem_mark(("session " + std::to_string(i)).c_str());
   }
   // 4. EAGLE: ONE draft-KV pool in the same row space as the main pool (the
   //    head's draft KV for a position sits at the same arena row as the main
@@ -1826,10 +1909,20 @@ int gpu_serve_cmd(const Args& cli) {
     heads[0] = eagle_load(cli.eagle, sessions[0].ctx(), cfg, kForwardSpec, cli.max_context,
                           &err, pool_rows);
     if (heads[0] == nullptr) return fail(err);
+    // A head whose need exceeds the shared buffer keeps its own (never expected: both cap at the
+    // same split count).
+    auto share_head = [&](EagleHead* h) {
+      if (shared_attn != nullptr && eagle_attn_scratch_bytes(h) <= shared_attn_bytes)
+        eagle_share_attn_scratch(h, shared_attn, shared_attn_bytes);
+    };
+    share_head(heads[0]);
+    mem_mark("eagle head + draft kv");
     for (int i = 1; i < n_sessions; ++i) {
       heads[i] = eagle_fork(heads[0], sessions[i].ctx(), &err);
       if (heads[i] == nullptr) return fail("eagle_fork[" + std::to_string(i) + "]: " + err);
+      share_head(heads[i]);
     }
+    mem_mark("eagle forks");
   }
   const bool have_eagle = heads[0] != nullptr;
   // Per-session conversation state: the tokens whose KV the session holds,
@@ -1900,6 +1993,7 @@ int gpu_serve_cmd(const Args& cli) {
     if (cli.max_context >= 16 &&
         (!prepare(i, 64, &err) || !gpu_generate(sessions[i], w, &g, &err, heads[i])))
       return fail("warm-up[" + std::to_string(i) + "]: " + err);
+    mem_mark(("warm-up " + std::to_string(i)).c_str());
   }
   std::fprintf(stderr,
                "granite4: serve ready: %d session(s) x %d positions, KV pool %d positions "
@@ -1987,6 +2081,7 @@ int gpu_serve_cmd(const Args& cli) {
   auto send = [](const std::string& s) {
     std::fwrite(s.data(), 1, s.size(), stdout);
     std::fflush(stdout);
+    mem_mark("after a request");
   };
   auto id_prefix = [](bool has, long long id) {
     return has ? "{\"id\":" + std::to_string(id) + "," : std::string("{");

@@ -32,6 +32,10 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
 // same arena as base's target). `base` must stay alive and must have been
 // loaded with kv_rows > 0. Free forks before the base.
 EagleHead* eagle_fork(const EagleHead* base, GpuCtx* target, std::string* err);
+// Split-KV attention scratch of a head: bytes it needs, and replacing its own buffer with a
+// shared one (see gpu_ctx_share_attn_scratch). 0, or -1 on bad args.
+std::size_t eagle_attn_scratch_bytes(const EagleHead* h);
+int eagle_share_attn_scratch(EagleHead* h, void* shared, std::size_t bytes);
 // Bytes of the draft-KV pool (shared by the base and all forks).
 std::size_t eagle_kv_bytes(const EagleHead* h);
 void eagle_free(EagleHead* h);

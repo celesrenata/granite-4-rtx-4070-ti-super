@@ -252,6 +252,17 @@ __device__ __forceinline__ void codes8_to_bf16(std::uint32_t w, unsigned hib8, s
     out[e] = bf16x2_add(x, off_bits);
   }
 }
+// Embedding gathers read 8 bf16 per thread (one 16-byte load): the table may live in mapped host
+// memory (G4_EMBED_HOST), where wide reads are what keeps PCIe efficient. scale_bf16x8 applies
+// the per-element f32_to_bf16(mult * x) of the scalar kernels.
+__device__ __forceinline__ uint4 scale_bf16x8(uint4 v, float mult) {
+  std::uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+  for (int e = 0; e < 4; ++e)
+    w[e] = static_cast<std::uint32_t>(f32_to_bf16(mult * bf16_to_f32(static_cast<std::uint16_t>(w[e] & 0xffffu)))) |
+           (static_cast<std::uint32_t>(f32_to_bf16(mult * bf16_to_f32(static_cast<std::uint16_t>(w[e] >> 16)))) << 16);
+  return make_uint4(w[0], w[1], w[2], w[3]);
+}
 constexpr std::uint32_t kQ4CodeOff = 0xc308c308u;  // -(128 + 8): int4 code - 8
 constexpr std::uint32_t kK5CodeOff = 0xc310c310u;  // -(128 + 16): K5 code - 16
 // Sixteen int8 codes -> eight bf16 pairs (exact).
