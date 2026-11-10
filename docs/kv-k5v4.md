@@ -257,3 +257,15 @@ Ceiling found on the way: at pool 150,528 the first request's prefill scratch no
 **Engine option `G4_EAGLE_WINDOW`** (default off): the head attends to (p − W, p] only. It is supported by the split-KV tensor-core kernel and both prefill attention kernels, and covered by device test `test_attn_window_device` (`G4_TEST_ONLY=window`). It helps short-trained heads at long context but not r15long, so it stays off.
 
 Deployed 2026-11-10 05:41 as generation 800 (engine 96d3459, `eagle.head = heads/r15long.safetensors`). Parity gate pass; a 32K-token prompt + 128 tokens served in 16.9 s through the API; 15,883 MiB in use. Rollback: `eagle.head` back to `r12.safetensors`, or generation 799.
+
+## Full checkpoint window: maxContext 131072 (generation 801, 2026-11-10)
+
+`maxContext = 131072` (the checkpoint's window), 3 sessions, `kvPoolTokens = 147456` unchanged. The freed VRAM is already in the pool: 147,456 is the largest pool that leaves room for the first request's prefill scratch, and 150,528 falls back to the slow path. One session can now hold a 128K conversation, with the other two using the remaining 16K positions or waiting for pages (the pool is oversubscribed on purpose; running sessions are never evicted).
+
+Live through the API after the switch:
+- Parity gate pass.
+- A 124,059-token prompt with a needle at 50% depth answered correctly in 139.8 s, including prefill.
+- GPU peak 15,913 of 16,376 MiB; no fallback warning, no OOM.
+- A 32K prompt plus 128 tokens takes 16.9 s, unchanged.
+
+Not run: the full 64K / 100K / 128K × 5 / 50 / 95% needle matrix, which the user chose to skip.

@@ -177,10 +177,10 @@ Remaining levers, roughly in order:
 4. **Weights.** They are at ~95% of roofline. The only remaining lever is fewer bytes per token, and INT4 weights
    were rejected on quality.
 
-## Production today (gremlin-1, generation 800)
+## Production today (gremlin-1, generation 801)
 
 - Engine 96d3459, flake input on `main`.
-- K5:V4 KV (`kv5`), pool 147,456 positions, 3 sessions x 98K.
+- K5:V4 KV (`kv5`), pool 147,456 positions, 3 sessions x 128K (the full checkpoint window; pool oversubscribed).
 - EAGLE r15long (r12 + long-context records), k=4, tree drafting, draft KV int4.
 - Tensor-core attention on (`G4_ATTN_MMA`), plus code-tile prefill attention (`G4_PREFILL_ATTN_CODES`). The parity gate runs at every start.
 - Rollback: the previous generation, or set either env flag to `0`.
