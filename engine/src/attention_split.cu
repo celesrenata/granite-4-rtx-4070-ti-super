@@ -643,6 +643,443 @@ __global__ void __launch_bounds__(kRowsWarps * 32)
   *reinterpret_cast<float4*>(part_o + slot * kD + 4 * lane) = make_float4(o[0], o[1], o[2], o[3]);
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-core split-KV attention (G4_ATTN_MMA, default on): ONE kernel for decode (1 row),
+// consecutive-row verify, multi-session rows and draft-tree rows.
+//
+// Why: the scalar kernels above compute each (row, head) dot product on the CUDA cores out of
+// shared memory. A 14-row verify at 16K positions measured ~11% of the K5:V4 bytes-read floor
+// and the same time in every KV format, i.e. compute bound (granite4-attn-bench).
+//
+// Layout (prefill_attention_kernel's flash-attention fragments): a block owns one KV head, one
+// split, and a group of up to kMmaRows rows of ONE sequence; its query rows are (row, query head)
+// pairs, 4 per row, so up to 32 query rows = two m16 MMA tiles, one per compute warp. Per 64-key
+// tile: S = Q K^T (mma.m16n8k16, f32 accumulate), logits rounded to bf16 (the reference rounding),
+// causal mask per row, online softmax in f32, O += P V with P as bf16. The tiles, split layout and
+// (m, l, o) partials are those of the scalar kernels, so attn_combine_kernel is unchanged.
+//
+// Exactness: an MMA output row depends only on its own A row and the B tile, and every reduction
+// below (row max, row sum) has a fixed per-row shape, so a row's result does not depend on which
+// other rows share the block. Decode and grouped verify therefore stay bit-identical to each other
+// (the verify == decode contract the speculative paths rely on), checked by the rows / tree tests.
+// Tree rows: a tile reaching past a group's shared prefix (tbase) is processed once per row, with
+// that row's own keys in the tail positions, and only that row is updated (the others' logits
+// are masked, which carries their state exactly), so the per-row tile sequence equals a decode
+// of that path. V fragments come from a row-major tile via ldmatrix.trans, and the shared tiles
+// are software-pipelined (the next tile's cache loads are in flight during the current tile).
+constexpr int kMmaRows = 8;               // rows per block (32 query rows)
+constexpr int kMmaThreads = 128;          // 4 warps: 2 compute (one m16 tile each), all 4 fill
+constexpr int kMmaP = kD + 8;             // K / V tile pitch (bf16): conflict-free fragment loads
+constexpr int kMmaItems = kTile * (kD / 16) / kMmaThreads;  // fill items (position, 16 dims)
+constexpr int kMmaPtMax = 512;  // split positions whose page-table entries are staged in smem
+
+__device__ __forceinline__ void mma_16816(float (&c)[4], const std::uint32_t (&a)[4],
+                                          std::uint32_t b0, std::uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// Four transposed 8x8 bf16 matrices: the m16n8k16 B fragments of two n8 blocks read from a
+// row-major [key][dim] tile.
+__device__ __forceinline__ void ldsm_x4_trans(std::uint32_t& r0, std::uint32_t& r1,
+                                              std::uint32_t& r2, std::uint32_t& r3,
+                                              const void* p) {
+  const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(a));
+}
+__device__ __forceinline__ float mma_bf16_round(float x) {
+  return __uint_as_float(static_cast<std::uint32_t>(f32_to_bf16(x)) << 16);
+}
+__device__ __forceinline__ std::uint32_t mma_pack(float lo, float hi) {
+  return static_cast<std::uint32_t>(f32_to_bf16(lo)) |
+         (static_cast<std::uint32_t>(f32_to_bf16(hi)) << 16);
+}
+
+// One fill item: 16 dims [16 * part, 16 * part + 16) of one key position, as loaded from the
+// cache (bf16: k0 k1 v0 v1; KV8: k0 v0 + scales; KV4 / K5: k0.xy v0.xy + scales (+ K5 high bits)).
+// Loading and storing are separate so a tile's loads can be in flight during the previous
+// tile's compute.
+struct MmaRaw {
+  uint4 k0, k1, v0, v1;
+  float sk, sv;
+  unsigned hib;
+};
+
+template <bool Int8, bool Int4, bool K5>
+__device__ __forceinline__ void mma_load_pos(MmaRaw& r, int row, bool valid, int part,
+                                             const std::uint16_t* kb, const std::uint16_t* vb,
+                                             const std::int8_t* k8, const std::int8_t* v8,
+                                             const std::uint8_t* k4, const std::uint8_t* v4,
+                                             const float* ksc, const float* vsc) {
+  if (!valid) return;
+  const int c0 = 16 * part;
+  if (!Int8 && !Int4) {
+    const uint4* const ks = reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(row) * kD + c0);
+    const uint4* const vs = reinterpret_cast<const uint4*>(vb + static_cast<std::size_t>(row) * kD + c0);
+    r.k0 = ks[0];
+    r.k1 = ks[1];
+    r.v0 = vs[0];
+    r.v1 = vs[1];
+  } else if (Int8) {
+    r.sk = ksc[row];
+    r.sv = vsc[row];
+    r.k0 = *reinterpret_cast<const uint4*>(k8 + static_cast<std::size_t>(row) * kD + c0);
+    r.v0 = *reinterpret_cast<const uint4*>(v8 + static_cast<std::size_t>(row) * kD + c0);
+  } else {
+    r.sk = ksc[row];
+    r.sv = vsc[row];
+    // 16 dims = 8 nibble bytes (int4 layout) for both K and V.
+    const std::size_t kbase = K5 ? static_cast<std::size_t>(row) * dev::kK5RowBytes + c0 / 2
+                                 : static_cast<std::size_t>(row) * (kD / 2) + c0 / 2;
+    const uint2 kraw = *reinterpret_cast<const uint2*>(k4 + kbase);
+    const uint2 vraw = *reinterpret_cast<const uint2*>(v4 + static_cast<std::size_t>(row) * (kD / 2) + c0 / 2);
+    r.k0.x = kraw.x;
+    r.k0.y = kraw.y;
+    r.v0.x = vraw.x;
+    r.v0.y = vraw.y;
+    // K5: the 16 high bits of dims [c0, c0 + 16) = plane bytes c0 / 8, c0 / 8 + 1.
+    if (K5)
+      r.hib = *reinterpret_cast<const std::uint16_t*>(
+          k4 + static_cast<std::size_t>(row) * dev::kK5RowBytes + dev::kK5NibbleBytes + c0 / 8);
+  }
+}
+
+// bf16x2 a * 1 + c (exact here: the results are small integers).
+__device__ __forceinline__ std::uint32_t mma_bf16x2_sub(std::uint32_t a, std::uint32_t c) {
+  std::uint32_t r;
+  asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(a), "r"(0x3f803f80u), "r"(c));
+  return r;
+}
+// Eight 4-bit codes (one word, dim 2e in byte e's low nibble, 2e + 1 in its high nibble) plus
+// K5 high bits (bit 2e / 2e + 1 of hib8) -> four bf16 pairs of (code - off), exactly: 0x4300 | n
+// is the bf16 128 + n for n < 128, and off_bits holds -(128 + off) in both halves.
+template <bool K5>
+__device__ __forceinline__ void mma_codes8(std::uint32_t w, unsigned hib8, std::uint32_t off_bits,
+                                           std::uint32_t* out) {
+  const std::uint32_t lo = w & 0x0f0f0f0fu, hi = (w >> 4) & 0x0f0f0f0fu;
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    // Result byte 0 = lo.byte e, byte 2 = hi.byte e (bytes 1 and 3 are masked off).
+    const unsigned sel = static_cast<unsigned>(e) | static_cast<unsigned>(4 + e) << 8;
+    std::uint32_t x = (__byte_perm(lo, hi, sel) & 0x00ff00ffu) | 0x43004300u;
+    if (K5) {
+      const unsigned b = hib8 >> (2 * e);
+      x |= ((b & 1u) << 4) | ((b & 2u) << 19);
+    }
+    out[e] = mma_bf16x2_sub(x, off_bits);
+  }
+}
+
+// Store a loaded item into Ks[kr] / Vs[kr] (row-major). bf16: the cache values. Quantized: the
+// integer codes (exact in bf16; KV4 code - 8, K5 code - 16, KV8 the int8), with the position's
+// scales in ksc_s / vsc_s - attend applies them to the logits (K) and the probabilities (V), so
+// no per-element multiply or rounding here. !valid: zeros (masked logits stay finite and add 0).
+template <bool Int8, bool Int4, bool K5>
+__device__ __forceinline__ void mma_store_pos(std::uint16_t (*Ks)[kMmaP], std::uint16_t (*Vs)[kMmaP],
+                                              float* ksc_s, float* vsc_s, int kr, int part,
+                                              const MmaRaw& r, bool valid) {
+  const int c0 = 16 * part;
+  uint4 ko0, ko1, vo0, vo1;
+  if (!valid) {
+    ko0 = ko1 = vo0 = vo1 = make_uint4(0u, 0u, 0u, 0u);
+  } else if (!Int8 && !Int4) {
+    ko0 = r.k0;
+    ko1 = r.k1;
+    vo0 = r.v0;
+    vo1 = r.v1;
+  } else if (Int8) {
+    std::uint32_t kw[8], vw[8];
+    const std::int8_t* const kc = reinterpret_cast<const std::int8_t*>(&r.k0);
+    const std::int8_t* const vc = reinterpret_cast<const std::int8_t*>(&r.v0);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      kw[e] = mma_pack(static_cast<float>(kc[2 * e]), static_cast<float>(kc[2 * e + 1]));
+      vw[e] = mma_pack(static_cast<float>(vc[2 * e]), static_cast<float>(vc[2 * e + 1]));
+    }
+    ko0 = make_uint4(kw[0], kw[1], kw[2], kw[3]);
+    ko1 = make_uint4(kw[4], kw[5], kw[6], kw[7]);
+    vo0 = make_uint4(vw[0], vw[1], vw[2], vw[3]);
+    vo1 = make_uint4(vw[4], vw[5], vw[6], vw[7]);
+  } else {
+    std::uint32_t kw[8], vw[8];
+    constexpr std::uint32_t kOff = K5 ? 0xc310c310u : 0xc308c308u;  // -(128 + 16) / -(128 + 8)
+    mma_codes8<K5>(r.k0.x, r.hib, kOff, &kw[0]);
+    mma_codes8<K5>(r.k0.y, r.hib >> 8, kOff, &kw[4]);
+    mma_codes8<false>(r.v0.x, 0u, 0xc308c308u, &vw[0]);
+    mma_codes8<false>(r.v0.y, 0u, 0xc308c308u, &vw[4]);
+    ko0 = make_uint4(kw[0], kw[1], kw[2], kw[3]);
+    ko1 = make_uint4(kw[4], kw[5], kw[6], kw[7]);
+    vo0 = make_uint4(vw[0], vw[1], vw[2], vw[3]);
+    vo1 = make_uint4(vw[4], vw[5], vw[6], vw[7]);
+  }
+  *reinterpret_cast<uint4*>(&Ks[kr][c0]) = ko0;
+  *reinterpret_cast<uint4*>(&Ks[kr][c0 + 8]) = ko1;
+  *reinterpret_cast<uint4*>(&Vs[kr][c0]) = vo0;
+  *reinterpret_cast<uint4*>(&Vs[kr][c0 + 8]) = vo1;
+  if ((Int8 || Int4) && part == 0) {
+    ksc_s[kr] = valid ? r.sk : 0.0f;
+    vsc_s[kr] = valid ? r.sv : 0.0f;
+  }
+}
+
+// Tree = row_tail present (draft-tree rows): a separate instance, so the common paths do not
+// carry the per-row save / keep state.
+template <bool Int8, bool Int4, bool K5, bool Tree>
+__global__ void __launch_bounds__(kMmaThreads, 2)
+    attn_mma_kernel(const std::uint16_t* __restrict__ q, const std::uint16_t* __restrict__ k,
+                    const std::uint16_t* __restrict__ v, float scale, int Hq, int kv_base,
+                    const int* __restrict__ d_pos, int stride, int tps, int splits, int rows,
+                    float2* __restrict__ part_ml, float* __restrict__ part_o,
+                    const std::int8_t* __restrict__ cache_k8, const std::int8_t* __restrict__ cache_v8,
+                    const float* __restrict__ k_scale, const float* __restrict__ v_scale,
+                    const std::uint8_t* __restrict__ cache_k4, const std::uint8_t* __restrict__ cache_v4,
+                    const int* __restrict__ d_pt, const int* __restrict__ row_pos,
+                    const int* const* __restrict__ row_pt, const int* __restrict__ row_grp,
+                    const int* __restrict__ row_tbase, const int* __restrict__ row_tail,
+                    int group_rows) {
+  const int hkv = blockIdx.x;
+  const int split = blockIdx.y;
+  // Row group: row_grp entry (r0 | nr << 8), else blocks of `group_rows` consecutive rows.
+  const int gd = row_grp != nullptr ? row_grp[blockIdx.z] : 0;
+  const int r0 = row_grp != nullptr ? (gd & 0xff) : blockIdx.z * group_rows;
+  const int nr = row_grp != nullptr ? (gd >> 8) : min(group_rows, rows - r0);
+  const int base = row_pos != nullptr ? row_pos[r0] - r0 : (d_pos != nullptr ? *d_pos : kv_base);
+  auto row_len = [&](int rr) { return row_pos != nullptr ? row_pos[r0 + rr] + 1 : base + r0 + rr + 1; };
+  int kv_max = 0;
+  for (int rr = 0; rr < nr; ++rr) kv_max = max(kv_max, row_len(rr));
+  const int t_begin = split * tps * kTile;
+  if (t_begin >= kv_max) return;
+  const int t_end_max = min(kv_max, t_begin + tps * kTile);
+
+  __shared__ __align__(16) std::uint16_t Ks[kTile][kMmaP];
+  __shared__ __align__(16) std::uint16_t Vs[kTile][kMmaP];
+  __shared__ __align__(8) float ksc_s[kTile], vsc_s[kTile];  // quantized: per-position scales
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int g = lane >> 2, t4 = lane & 3;
+  // This compute warp's m16 tile = query rows 16 * warp .. 16 * warp + 15 = rows 4 * warp ..
+  // 4 * warp + 3 of the group, 4 query heads each. Fragment rows g and g + 8.
+  const bool compute = warp < 2 && 4 * warp < nr;
+  int rrow[2], head[2], rlen[2];
+  bool ok[2];
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const int qr = 16 * warp + g + 8 * h;  // 0..31
+    rrow[h] = qr / kG;
+    head[h] = hkv * kG + qr % kG;
+    ok[h] = compute && rrow[h] < nr;
+    rlen[h] = ok[h] ? row_len(rrow[h]) : 0;
+  }
+  std::uint32_t qf[kD / 16][4];
+#pragma unroll
+  for (int ks = 0; ks < kD / 16; ++ks) {
+    const int kk = ks * 16 + 2 * t4;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const std::uint16_t* const qp = q + (static_cast<std::size_t>(r0 + rrow[h]) * Hq + head[h]) * kD;
+      qf[ks][h] = ok[h] ? *reinterpret_cast<const std::uint32_t*>(qp + kk) : 0u;
+      qf[ks][2 + h] = ok[h] ? *reinterpret_cast<const std::uint32_t*>(qp + kk + 8) : 0u;
+    }
+  }
+  float o[kD / 8][4];
+#pragma unroll
+  for (int i = 0; i < kD / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+  float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+
+  const bool quantized = Int8 || Int4;
+  const std::uint16_t* const kb = quantized ? nullptr : k + static_cast<std::size_t>(hkv) * stride * kD;
+  const std::uint16_t* const vb = quantized ? nullptr : v + static_cast<std::size_t>(hkv) * stride * kD;
+  const std::int8_t* const k8 = Int8 ? cache_k8 + static_cast<std::size_t>(hkv) * stride * kD : nullptr;
+  const std::int8_t* const v8 = Int8 ? cache_v8 + static_cast<std::size_t>(hkv) * stride * kD : nullptr;
+  const std::uint8_t* const k4 =
+      Int4 ? cache_k4 + static_cast<std::size_t>(hkv) * stride * (K5 ? dev::kK5RowBytes : kD / 2) : nullptr;
+  const std::uint8_t* const v4 = Int4 ? cache_v4 + static_cast<std::size_t>(hkv) * stride * (kD / 2) : nullptr;
+  const float* const ksc = quantized ? k_scale + static_cast<std::size_t>(hkv) * stride : nullptr;
+  const float* const vsc = quantized ? v_scale + static_cast<std::size_t>(hkv) * stride : nullptr;
+  const int* const pt = row_pt != nullptr ? row_pt[r0] : d_pt;
+
+  // Attend the tile in Ks / Vs (positions t0 ..): S = Q K^T, mask, online softmax, O += P V.
+  // keep >= 0: only group row `keep` is updated; every other row's logits are masked, so its
+  // state is carried exactly (alpha = 1, p = 0: o * 1 + 0, l * 1 + 0), as for a row that has
+  // no valid key in a tile.
+  auto attend = [&](int t0, int keep) {
+    int lim[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) lim[h] = keep < 0 || rrow[h] == keep ? rlen[h] : 0;
+    float s[kTile / 8][4];
+#pragma unroll
+    for (int ni = 0; ni < kTile / 8; ++ni) s[ni][0] = s[ni][1] = s[ni][2] = s[ni][3] = 0.0f;
+#pragma unroll
+    for (int ks = 0; ks < kD / 16; ++ks)
+#pragma unroll
+      for (int ni = 0; ni < kTile / 8; ++ni) {
+        const std::uint16_t* const kr = &Ks[ni * 8 + g][ks * 16 + 2 * t4];
+        mma_16816(s[ni], qf[ks], *reinterpret_cast<const std::uint32_t*>(kr),
+                  *reinterpret_cast<const std::uint32_t*>(kr + 8));
+      }
+    float mx[2] = {m[0], m[1]};
+#pragma unroll
+    for (int ni = 0; ni < kTile / 8; ++ni)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int h = e >> 1;
+        const int j = t0 + ni * 8 + 2 * t4 + (e & 1);
+        // Quantized: S holds q . codes; the K scale makes it q . k (one f32 multiply).
+        const float dot = Int8 || Int4 ? s[ni][e] * ksc_s[j - t0] : s[ni][e];
+        const float val = j < lim[h] ? mma_bf16_round(scale * dot) : -INFINITY;
+        s[ni][e] = val;
+        mx[h] = fmaxf(mx[h], val);
+      }
+    float alpha[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffffu, mx[h], 1));
+      mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffffu, mx[h], 2));
+      // A row with no valid key yet keeps m = -inf: alpha = 1 and p = 0 (no NaN).
+      alpha[h] = mx[h] == -INFINITY ? 1.0f : expf(m[h] - mx[h]);
+      l[h] *= alpha[h];
+      m[h] = mx[h];
+    }
+#pragma unroll
+    for (int i = 0; i < kD / 8; ++i) {
+      o[i][0] *= alpha[0];
+      o[i][1] *= alpha[0];
+      o[i][2] *= alpha[1];
+      o[i][3] *= alpha[1];
+    }
+    std::uint32_t pf[kTile / 16][4];
+#pragma unroll
+    for (int ni = 0; ni < kTile / 8; ++ni) {
+      const float e0 = m[0] == -INFINITY ? 0.0f : expf(s[ni][0] - m[0]);
+      const float e1 = m[0] == -INFINITY ? 0.0f : expf(s[ni][1] - m[0]);
+      const float e2 = m[1] == -INFINITY ? 0.0f : expf(s[ni][2] - m[1]);
+      const float e3 = m[1] == -INFINITY ? 0.0f : expf(s[ni][3] - m[1]);
+      l[0] += e0 + e1;
+      l[1] += e2 + e3;
+      // Quantized: V holds codes, so P carries the V scale (l keeps the unscaled sum).
+      float sv0 = 1.0f, sv1 = 1.0f;
+      if (Int8 || Int4) {
+        const float2 sv = *reinterpret_cast<const float2*>(&vsc_s[ni * 8 + 2 * t4]);
+        sv0 = sv.x;
+        sv1 = sv.y;
+      }
+      pf[ni / 2][(ni & 1) * 2] = mma_pack(e0 * sv0, e1 * sv1);
+      pf[ni / 2][(ni & 1) * 2 + 1] = mma_pack(e2 * sv0, e3 * sv1);
+    }
+    // B fragments of V via ldmatrix.trans: lanes 8j .. 8j + 7 address matrix j's rows
+    // (keys kk * 16 + 8 * (j & 1) + r, dims 8 * (nd + (j >> 1))).
+    const int mj = lane >> 3, mr = lane & 7;
+#pragma unroll
+    for (int kk = 0; kk < kTile / 16; ++kk)
+#pragma unroll
+      for (int nd = 0; nd < kD / 8; nd += 2) {
+        std::uint32_t b0, b1, b2, b3;
+        ldsm_x4_trans(b0, b1, b2, b3, &Vs[kk * 16 + 8 * (mj & 1) + mr][8 * (nd + (mj >> 1))]);
+        mma_16816(o[nd], pf[kk], b0, b1);
+        mma_16816(o[nd + 1], pf[kk], b2, b3);
+      }
+  };
+
+  // Tree rows: a group shares tbase; a tile whose last position is past it holds row-specific
+  // keys. Those are the split's last tiles, so tiles [t_begin, t_sh) are shared by every row.
+  const int tb = Tree ? row_tbase[r0] : INT_MAX;
+  int t_sh = t_end_max;
+  if (Tree) {
+    t_sh = t_begin;
+    while (t_sh < t_end_max && min(t_sh + kTile, t_end_max) - 1 <= tb) t_sh += kTile;
+  }
+  if (t_sh > t_begin) {
+    // The shared tiles' physical rows, staged once (one global round trip for the whole split
+    // instead of a page-table load ahead of every tile's cache loads).
+    __shared__ int Ps[kMmaPtMax];
+    const bool staged = t_sh - t_begin <= kMmaPtMax;
+    if (staged) {
+      for (int i = threadIdx.x; i < t_sh - t_begin; i += kMmaThreads)
+        Ps[i] = pt != nullptr ? pt[t_begin + i] : t_begin + i;
+      __syncthreads();
+    }
+    // Software pipeline: tile t + 1's cache loads are issued before tile t is attended.
+    MmaRaw raw[kMmaItems];
+    bool rv[kMmaItems];
+    auto load_tile = [&](int t0) {
+#pragma unroll
+      for (int i = 0; i < kMmaItems; ++i) {
+        const int it = threadIdx.x + i * kMmaThreads;
+        const int lp = t0 + (it >> 3);
+        rv[i] = lp < t_sh;
+        const int prow = !rv[i] ? 0 : staged ? Ps[lp - t_begin] : (pt != nullptr ? pt[lp] : lp);
+        mma_load_pos<Int8, Int4, K5>(raw[i], prow, rv[i], it & 7, kb, vb, k8, v8, k4, v4, ksc, vsc);
+      }
+    };
+    load_tile(t_begin);
+    for (int t0 = t_begin; t0 < t_sh; t0 += kTile) {
+      __syncthreads();  // the previous tile's readers of Ks / Vs are done
+#pragma unroll
+      for (int i = 0; i < kMmaItems; ++i) {
+        const int it = threadIdx.x + i * kMmaThreads;
+        mma_store_pos<Int8, Int4, K5>(Ks, Vs, ksc_s, vsc_s, it >> 3, it & 7, raw[i], rv[i]);
+      }
+      __syncthreads();
+      if (t0 + kTile < t_sh) load_tile(t0 + kTile);
+      if (compute) attend(t0, -1);
+    }
+  }
+  if constexpr (Tree) {
+    // Row-specific tiles: one pass per row with that row's own keys past tbase; the pass
+    // updates only that row (attend's keep), so every row sees exactly its own sequential
+    // tiles. Only the warp holding the row attends.
+    for (int t0 = t_sh; t0 < t_end_max; t0 += kTile)
+      for (int fr = 0; fr < nr; ++fr) {
+        __syncthreads();  // the previous pass's readers of Ks / Vs are done
+        for (int it = threadIdx.x; it < kTile * (kD / 16); it += kMmaThreads) {
+          const int kr = it >> 3, part = it & 7;
+          const int lp = t0 + kr;
+          const bool tail = lp > tb;
+          if (fr > 0 && !tail) continue;  // later passes rewrite only the tail positions
+          int prow = 0;
+          bool valid = lp < t_end_max;
+          if (tail) {
+            const int j = lp - tb - 1;
+            valid = valid && j < kAttnTailStride && lp < row_len(fr);
+            if (valid) {
+              const int lt = row_tail[(r0 + fr) * kAttnTailStride + j];
+              prow = pt != nullptr ? pt[lt] : lt;
+            }
+          } else if (valid) {
+            prow = pt != nullptr ? pt[lp] : lp;
+          }
+          MmaRaw r;
+          mma_load_pos<Int8, Int4, K5>(r, prow, valid, part, kb, vb, k8, v8, k4, v4, ksc, vsc);
+          mma_store_pos<Int8, Int4, K5>(Ks, Vs, ksc_s, vsc_s, kr, part, r, valid);
+        }
+        __syncthreads();
+        if (compute && (fr >> 2) == warp) attend(t0, fr);
+      }
+  }
+  if (!compute) return;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    l[h] += __shfl_xor_sync(0xffffffffu, l[h], 1);
+    l[h] += __shfl_xor_sync(0xffffffffu, l[h], 2);
+  }
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    if (!ok[h] || t_begin >= rlen[h]) continue;
+    const std::size_t slot = (static_cast<std::size_t>(r0 + rrow[h]) * Hq + head[h]) * splits + split;
+    if (t4 == 0) part_ml[slot] = make_float2(m[h], l[h]);
+#pragma unroll
+    for (int nd = 0; nd < kD / 8; ++nd) {
+      const int col = nd * 8 + 2 * t4;
+      *reinterpret_cast<float2*>(part_o + slot * kD + col) = make_float2(o[nd][2 * h], o[nd][2 * h + 1]);
+    }
+  }
+}
+
 __global__ void __launch_bounds__(kD)
     attn_combine_kernel(const float2* __restrict__ part_ml, const float* __restrict__ part_o,
                         int Hq, int kv_base, const int* __restrict__ d_pos, int tps,
@@ -795,7 +1232,46 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
   // Rows of different sequences never share a tile: one row per block, or
   // one same-sequence row group per block when the caller passes groups.
   // G4_ATTN_ROWS=0: the row-serial RB=8 blocks instead of rows-parallel ones.
-  if (row_grp != nullptr) {
+  // G4_ATTN_MMA=0: the scalar kernels below instead of the tensor-core kernel. One kernel
+  // serves every case, so decode and verify stay bit-identical under either setting.
+  static const bool mma_on = [] {
+    const char* e = std::getenv("G4_ATTN_MMA");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (mma_on) {
+    // Per-row positions without groups, or a short context (too few blocks to fill the card
+    // otherwise): one row per block; else up to kMmaRows rows share the tiles.
+    const int group_rows = row_pos != nullptr || short_ctx ? 1 : kMmaRows;
+    const int nz = row_grp != nullptr ? ngroups : (rows + group_rows - 1) / group_rows;
+    const dim3 grid(Hk, lsplits, nz);
+    auto launch_mma = [&](auto tree_tag) {
+    constexpr bool Tree = decltype(tree_tag)::value;
+    if (int8)
+      attn_mma_kernel<true, false, false, Tree><<<grid, kMmaThreads>>>(
+          q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
+          cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr, d_pt, row_pos,
+          row_pt, row_grp, row_tbase, row_tail, group_rows);
+    else if (int4 && k5)
+      attn_mma_kernel<false, true, true, Tree><<<grid, kMmaThreads>>>(
+          q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
+          nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt, row_pos,
+          row_pt, row_grp, row_tbase, row_tail, group_rows);
+    else if (int4)
+      attn_mma_kernel<false, true, false, Tree><<<grid, kMmaThreads>>>(
+          q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
+          nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt, row_pos,
+          row_pt, row_grp, row_tbase, row_tail, group_rows);
+    else
+      attn_mma_kernel<false, false, false, Tree><<<grid, kMmaThreads>>>(
+          q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, d_pt, row_pos, row_pt, row_grp,
+          row_tbase, row_tail, group_rows);
+    };
+    if (row_tail != nullptr)
+      launch_mma(std::true_type{});
+    else
+      launch_mma(std::false_type{});
+  } else if (row_grp != nullptr) {
     if (!(rows_par && launch_rows(row_grp, ngroups))) launch(Many{}, row_grp, ngroups);
   } else if (rows == 1 || short_ctx || row_pos != nullptr) {
     launch(One{}, nullptr, rows);

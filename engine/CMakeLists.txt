@@ -159,6 +159,11 @@ if(GRANITE_ENABLE_CUDA)
   # real model shapes, isolates the per-token weight-streaming cost.
   add_executable(granite4-gemv-bench src/gemv_bench.cu)
   target_link_libraries(granite4-gemv-bench PRIVATE granite4_static CUDA::cudart)
+  # Split-KV attention micro-benchmark at the serve shapes (decode, chain / tree verify, every KV
+  # format), reported against the bytes-read-once floor.
+  add_executable(granite4-attn-bench src/attn_bench.cu)
+  target_include_directories(granite4-attn-bench PRIVATE src)
+  target_link_libraries(granite4-attn-bench PRIVATE granite4_static CUDA::cudart)
 
   # Standalone build of the fused-k verify GEMV (also linked into granite4,
   # where the batched verify forward uses it for the lm_head).

@@ -119,3 +119,48 @@ Two repeats per format, serving-style held-out prompts, EAGLE r12 k=4, fresh req
 - None of the 24 outputs are identical between formats: each format follows its own greedy continuation, and the draft head finds some continuations easier to predict than others.
 
 Conclusion: the serving-style gap is per-content variance between two different greedy continuations measured on a small, duplicated set, not a systematic K5 cost. With the other families (chat -1.6% over 30 prompts, novel +0.7%, long +3.4%) and r12 losing only ~1% offline when moved to K5 features, speculative decode speed under K5:V4 is effectively equal to int4. No remaining K5-specific lever was found; a faster decode would need general head or engine improvements.
+
+## EAGLE head retrain, full mix (r14k5, 2026-11-09): not adopted
+
+r14k5 retrains r12's full five-set mix (chat_r9/r11/r12_train, serve_train3, train2000) on K5:V4 features dumped on gremlin-1 by the production engine. It is fine-tuned from r12 with r12's exact recipe (`scripts/eagle/train_remote_r14k5.sh`, 5589 steps, about 57 min on the 5090).
+
+| Head | chat_r12_eval (K5) | serve_eval (K5) |
+| --- | ---: | ---: |
+| r12 | **2.186** | **2.455** |
+| r13k5 (3 of the 5 sets) | 2.154 | 2.389 |
+| r14k5 (full mix) | 2.182 | 2.431 |
+
+With the full mix, the loss r13k5 showed is gone, but r14k5 still does not beat r12. Matching the head to K5 features has nothing left to win, so r12 stays deployed. Further head gains would have to come from elsewhere: more data, a deeper head, or a different tree.
+
+## Tensor-core split-KV attention (`G4_ATTN_MMA`, default on, 2026-11-09)
+
+`granite4-attn-bench` (new; serve shapes, pool 114688, maxlen 65536, 14 rows, ms per 40 layers) showed why verify attention was slow. On the scalar kernels a 14-row verify took the same time in every KV format, about 11% of the K5:V4 bytes-read floor, so it was compute bound. K5 decode at 16K reached only 33% even though its 20 MB working set fits in the 48 MB L2, so it was bound by the per-element dequantize work.
+
+`attn_mma_kernel` (in `attention_split.cu`) replaces the scalar kernels for every attention call: decode, chain verify, multi-session rows and draft-tree rows.
+- Layout: one block per (KV head, split, group of up to 8 rows). The query rows are (row, query head) pairs, giving two m16 tiles. Each 64-key tile computes S = QKᵀ and O += PV with `mma.m16n8k16` bf16 at f32 accumulate. The online softmax is in f32 and the logits are rounded to bf16 as before.
+- V fragments: `ldmatrix.trans` from a row-major tile.
+- Pipelining: the next tile's cache loads are issued before the current tile is attended. The split's page-table rows are staged in shared memory once per block.
+- Quantized formats: the tiles hold the integer codes, which are exact in bf16. The K scale multiplies the logit column and the V scale folds into P, so a code is converted with one `0x4300|n` OR and one `fma.bf16x2` per pair, and no per-element multiply or bf16 rounding remains. K is therefore used exactly instead of being rounded to bf16 after scaling. Mean |err| vs the original values is 0.01152 (was 0.01155). The max |delta| vs the old dequantized-bf16 reference grew to 0.0117, and that reference no longer matches the arithmetic.
+- Exactness: an MMA output row depends only on its own query row, and masked keys contribute exactly 0. A row's result therefore does not depend on which rows share its block. Decode, grouped verify and tree verify stay bit-identical (`attn_split rows/groups`, `decode multi`, `tree verify` and `shared arena` device tests, all four formats). Tree tiles past the shared prefix run once per row with that row's own keys, and only that row is updated.
+- Fallback: `G4_ATTN_MMA=0` restores the scalar kernels. The setting is per process, so decode and verify always share one kernel.
+
+K5:V4 results (scalar → MMA):
+
+| Case | 4K | 16K | 32K | 55K |
+| --- | ---: | ---: | ---: | ---: |
+| tree verify (14 rows, production) | 5.56 → 2.36 | 22.96 → 8.54 | 46.12 → 17.63 | 77.67 → 30.15 |
+| decode | 0.87 → 0.80 | 3.35 → 3.21 | 7.33 → 7.11 | 11.96 → 11.50 |
+| one row per block (14 rows) | 9.40 → 8.23 | 41.56 → 38.20 | 93.43 → 87.55 | 156.70 → 146.58 |
+
+KV4 and KV8 gain about the same. bf16 grouped verify is 1.9–2.9× faster, while bf16 decode is 3–9% slower at ≤4K (about 0.07 ms per token; bf16 KV is not the serving format).
+
+Live results on gremlin-1 (`G4_MULTI_PROFILE`, r12 k=4 tree verify, 14 rows, ms per verify step):
+
+| ctx | attn before | attn after | step before → after |
+| ---: | ---: | ---: | ---: |
+| 541 | 1.50 | 1.66 | 17.0 → 17.2 |
+| 4K | 6.38 | 2.63 | 22.2 → 18.5 |
+| 16K | 22.21 | 7.31 | 38.8 → 23.9 |
+| 32K | – | 14.77 | – → 31.1 |
+
+On the held-out families (`kv_accept_ab.py`, K5, r12 k=4), speculative output equals plain greedy for every request, and parity passes (teacher-forced, K5 and bf16, MMA on and off). Plain decode is unchanged at short context (68 tok/s, weight-bound). The greedy text differs from the scalar build because the attention arithmetic changed: 4 of 61 plain outputs are identical. Tok/s on chat/novel/serving is within the per-content variance described above (137.2 / 136.4 / 135.6 vs 134.7 / 138.0 / 140.3). The long family (10–13K-token prompts) goes from 30.8 to 34.2 tok/s including prefill.

@@ -174,6 +174,7 @@
             # inference CLI whose --gpu 1 path runs the sm_89 forward pass.
             install -m 0755 build/engine/granite4-kernel-test $out/bin/
             install -m 0755 build/engine/granite4-kernel-bench $out/bin/
+            install -m 0755 build/engine/granite4-attn-bench $out/bin/
             install -m 0755 build/engine/granite4-gemv-bench $out/bin/
             install -m 0755 build/engine/granite4-verify-gemv-test $out/bin/
             install -m 0755 build/engine/granite4-verify-gemv-bench $out/bin/
