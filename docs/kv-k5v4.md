@@ -225,3 +225,35 @@ The space went to the pool and to a longer context: `maxContext = 98304`, `kvPoo
 - A 90,028-token prompt served in 63 s.
 
 Ceiling found on the way: at pool 150,528 the first request's prefill scratch no longer fits. The engine then silently fell back to the per-position forward, so a 32K prompt took minutes at 100% GPU. That fallback now prints a warning with the free memory. Keep ~450 MiB free.
+
+## Long-context EAGLE head r15long (96d3459, 2026-11-10)
+
+**Cause.** Every deployed head had been trained on records of ≤ 4096 tokens: `dump-hidden --max-context 4096`, and RoPE tables of 8192 positions in `train_eagle.py`. The service drafts at up to 98K positions, and acceptance fell from ~0.13 (short chat) to 0.05–0.09 at 17–32K. Two checks pointed at the training data:
+- Draft-KV width at long context made no difference (bf16/int8/int4 within 0.005).
+- A diagnostic that windows the head's attention to its last 1024 entries improved r12 on held-out long records from 1.792 to 2.034 tokens/round (depth 6). In other words, the head did better seeing less of a context it had never trained on.
+
+**Data** (`gen_long_prompts.py`, `stage_r15_long.sh`):
+- 520 prompts of 3K–48K tokens (480 train, 40 held out by directory). Each prompt is several related files from one directory subtree, under `// File:` headers like agent tool reads, plus an agent-style task (explain / review / tests / refactor / trace / JSON summary).
+- Sources: Menagerie TS/MD 45%, Python packages 20%, nixpkgs 15%, this repo 20%.
+- Replies are the live target's own greedy output, generated through the API with no downtime: 254K reply tokens.
+- K5:V4 features were dumped by the production engine at `--max-context 65536`, in 7 idle-gated windows of ~5–9 min each: 8.3M tokens, 66 GB.
+
+**Training** (`train_remote_r15long.sh`, RTX 5090, 35 min):
+- Fine-tuned from r12 on r12's full K5 mix plus the long shards ×4, 1 epoch, at r12's learning rate.
+- Long records run `unroll()` from the reply region only (`q0`). Step 1 still builds keys and values for the whole context, but queries, the layer tail and steps ≥ 2 run only where the loss reads. This is exact (`test_unroll_q0.py`: ≤ 3e-6 vs the full unroll) and is what makes 48K-token records trainable.
+- `--rope-len 65536`.
+
+**Offline**, depth-6 tokens/round on held-out sets:
+
+| Head | chat_r12_eval | serve_eval | long_r15_eval | long, 40K+ |
+| --- | ---: | ---: | ---: | ---: |
+| r12 | 2.186 | 2.455 | 1.792 | 1.598 |
+| r12, window 1024 | – | – | 2.034 | – |
+| **r15long** | **2.202** | 2.436 | **2.273** | **2.291** |
+| r15long, window 1024 / 4096 / 8192 | – | – | 2.243 / 2.261 / 2.269 | – |
+
+**Live** (production shape, new engine), decode tok/s on real long documents: 5.6K 113.1 → 118.2, 5.9K 113.8 → 122.8, 17K 76.1 → 85.2, 19K 78.6 → 89.7, 32K 49.7 → 67.5 (+36%; r12's adaptive policy had turned drafting off there). On the held-out families: chat 133.2 → 134.5, novel equal, serving 133.6 → 139.3, long 38.8 → 41.3. Output equals plain greedy everywhere, and the parity gate and kernel tests pass.
+
+**Engine option `G4_EAGLE_WINDOW`** (default off): the head attends to (p − W, p] only. It is supported by the split-KV tensor-core kernel and both prefill attention kernels, and covered by device test `test_attn_window_device` (`G4_TEST_ONLY=window`). It helps short-trained heads at long context but not r15long, so it stays off.
+
+Deployed 2026-11-10 05:41 as generation 800 (engine 96d3459, `eagle.head = heads/r15long.safetensors`). Parity gate pass; a 32K-token prompt + 128 tokens served in 16.9 s through the API; 15,883 MiB in use. Rollback: `eagle.head` back to `r12.safetensors`, or generation 799.

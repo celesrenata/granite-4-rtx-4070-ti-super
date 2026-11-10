@@ -1,7 +1,7 @@
 # Granite 4.2 8B on one RTX 4070 Ti SUPER: from bf16 to K5:V4 and tensor-core attention
 
 A recap of the serving engine's path from the first scaffold (2026-10-22) to the current production build
-(2026-11-09, NixOS generation 798 on gremlin-1). Every number here was measured on gremlin-1 (RTX 4070 Ti SUPER,
+(2026-11-10, NixOS generation 800 on gremlin-1). Every number here was measured on gremlin-1 (RTX 4070 Ti SUPER,
 16 GB, sm_89, 632 GB/s measured read bandwidth) unless marked otherwise. Detailed tables and reproduction commands
 live in `phases.md`, `memory.md`, `deployment.md` and `kv-k5v4.md`; Menagerie-side quality runs live in Menagerie
 `docs/performance/`.
@@ -24,6 +24,7 @@ load). The engine never used fp16 storage.
 | **Tensor-core attention** | unchanged at short ctx | - | 114,688 | 16K verify step 38.8 → 23.9 ms |
 | **Code-tile prefill attention** | unchanged | - | 114,688 | 32K prefill 22.1 → 13.4 s |
 | **VRAM diet** (embedding to host, shared scratch/RoPE, pieced catch-up) | unchanged | - | **147,456 at 98K ctx** | −1.7 GiB outside the pool |
+| **r15long head** (long-context training data) | 32K decode 49.7 → 67.5 tok/s | serving 139 tok/s | 147,456 | long-record acceptance +27% offline |
 
 Two rules held the whole way: speculative output must equal plain greedy token for token, and every speed claim
 must come from a same-harness A/B.
@@ -168,7 +169,7 @@ Also checked: draft-KV width (int4 / int8 / bf16) at long context changes accept
 GEMMs 15.2 ms (the weight pass, ~590 GB/s), attention 7.3 ms, lm_head 0.7 ms, norms 0.5 ms, RoPE 0.2 ms.
 
 Remaining levers, roughly in order:
-1. **EAGLE acceptance at long context.** It drops to 0.06-0.09 past 16K, and that now costs more than attention does.
+1. **EAGLE acceptance at long context.** Done for now: r15long (trained on 3K–48K records) lifts long-record acceptance 27% offline and 32K decode 36% live. More long data, and longer records (64K+), are the next steps.
 2. **Decode / verify attention at very long context.** It is ~25-30% of the bytes floor with MMA. Running more query rows per block,
    or reading K5 codes directly, could help.
 3. **Heads.** Options are more self-distilled data (especially long-context and agent traffic), deeper heads, or
@@ -176,11 +177,11 @@ Remaining levers, roughly in order:
 4. **Weights.** They are at ~95% of roofline. The only remaining lever is fewer bytes per token, and INT4 weights
    were rejected on quality.
 
-## Production today (gremlin-1, generation 799)
+## Production today (gremlin-1, generation 800)
 
-- Engine e41b834, flake input on `main`.
+- Engine 96d3459, flake input on `main`.
 - K5:V4 KV (`kv5`), pool 147,456 positions, 3 sessions x 98K.
-- EAGLE r12, k=4, tree drafting, draft KV int4.
+- EAGLE r15long (r12 + long-context records), k=4, tree drafting, draft KV int4.
 - Tensor-core attention on (`G4_ATTN_MMA`), plus code-tile prefill attention (`G4_PREFILL_ATTN_CODES`). The parity gate runs at every start.
 - Rollback: the previous generation, or set either env flag to `0`.
 - Live, K5:V4 before the MMA change:
