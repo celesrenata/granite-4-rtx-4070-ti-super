@@ -198,3 +198,30 @@ Also measured: draft-KV width at long context makes little difference. Acceptanc
 Deployed on gremlin-1 2026-11-09 22:42 (generation 797, engine e41b834). After the switch, the first request failed with `cuda: out of memory at 484` (infer_main.cc). The cause was not the engine change. The host config had been changed to `maxContext = 98304` at 21:27 (generation 796). The EAGLE prompt-feature buffer is 2 B × hidden × maxContext, which is 768 MiB at 98304, and it is allocated lazily on the first EAGLE request. That does not fit in the ~0.9 GiB the card has left at pool 114688. maxContext was set back to 65536 (generation 798; the edited file is kept as `granite4-rtx.nix.bak-ctx98304-*`).
 
 Live after the fix: parity gate pass. A 32,151-token prompt plus 128 generated tokens takes 15.7 s end to end through the API, and GPU memory peaks at 16,021 MiB. A 98K context would need a smaller pool or a smaller feature buffer (for example, prompt features only for the rows the head catch-up needs), and has not been tested.
+
+## VRAM outside the KV pool: −1.7 GiB (e1dc0fe, generation 799, 2026-11-10)
+
+`G4_MEM_LOG=1` prints device memory at each serve stage and after each request. Production shape (3 × 64K, pool 114,688, r12, K5:V4), before → after:
+
+| Stage | Before (MiB) | After (MiB) | Change |
+| --- | ---: | ---: | --- |
+| CUDA context | 219 | 219 | |
+| Weights | 8,778 | 7,994 | bf16 embedding table (784 MiB) moved to mapped pinned host memory (`G4_EMBED_HOST`) |
+| KV arena | 5,320 | 5,320 | |
+| 3 sessions | 336 | 164 | one split-KV attention scratch shared by all sessions and heads (`G4_SHARE_ATTN_SCRATCH`); one RoPE table copy (`G4_SHARE_ROPE`) |
+| EAGLE head + forks | 706 | 508 | same sharing |
+| First request | +618 | +138 | prompt catch-up in 2048-row pieces: the prompt-feature buffer is 4096 rows (32 MiB) instead of `maxContext` rows (512 MiB) |
+| **Peak** | **16,003** | **14,413** | **−1,590 MiB** |
+
+Why each change is exact:
+- **Embedding:** same bytes, and a token reads one 8 KB row. The gathers now read 16 bytes per thread, which keeps PCIe efficient.
+- **Shared buffers:** the serve loop issues all GPU work from one thread in stream order, and the RoPE tables are read-only.
+- **Catch-up pieces:** they start on the unsplit call's 512-row chunk boundaries, and the last piece holds 2048–4096 rows, so the target and head take the same paths.
+
+At the old shape, all five long-document outputs, acceptance and proposal counts are byte-identical to the previous build. Speculative output equals plain greedy, and the parity gate passes.
+
+The space went to the pool and to a longer context: `maxContext = 98304`, `kvPoolTokens = 147456` (+28.6%). Before this change, 98304 OOMed because the feature buffer scaled with `maxContext`.
+- Peak memory: 15,901 MiB, with 475 MiB headroom; the old layout ran with 351 MiB.
+- A 90,028-token prompt served in 63 s.
+
+Ceiling found on the way: at pool 150,528 the first request's prefill scratch no longer fits. The engine then silently fell back to the per-position forward, so a 32K prompt took minutes at 100% GPU. That fallback now prints a warning with the free memory. Keep ~450 MiB free.

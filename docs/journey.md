@@ -23,6 +23,7 @@ load). The engine never used fp16 storage.
 | **K5:V4** | ~120 tok/s live | 211 tok/s (3 clients, live) | 114,688 | int8-level accuracy |
 | **Tensor-core attention** | unchanged at short ctx | - | 114,688 | 16K verify step 38.8 → 23.9 ms |
 | **Code-tile prefill attention** | unchanged | - | 114,688 | 32K prefill 22.1 → 13.4 s |
+| **VRAM diet** (embedding to host, shared scratch/RoPE, pieced catch-up) | unchanged | - | **147,456 at 98K ctx** | −1.7 GiB outside the pool |
 
 Two rules held the whole way: speculative output must equal plain greedy token for token, and every speed claim
 must come from a same-harness A/B.
@@ -175,10 +176,10 @@ Remaining levers, roughly in order:
 4. **Weights.** They are at ~95% of roofline. The only remaining lever is fewer bytes per token, and INT4 weights
    were rejected on quality.
 
-## Production today (gremlin-1, generation 798)
+## Production today (gremlin-1, generation 799)
 
 - Engine e41b834, flake input on `main`.
-- K5:V4 KV (`kv5`), pool 114,688 positions, 3 sessions x 64K.
+- K5:V4 KV (`kv5`), pool 147,456 positions, 3 sessions x 98K.
 - EAGLE r12, k=4, tree drafting, draft KV int4.
 - Tensor-core attention on (`G4_ATTN_MMA`), plus code-tile prefill attention (`G4_PREFILL_ATTN_CODES`). The parity gate runs at every start.
 - Rollback: the previous generation, or set either env flag to `0`.
