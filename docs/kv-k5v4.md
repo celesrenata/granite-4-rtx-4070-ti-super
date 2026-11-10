@@ -78,3 +78,28 @@ instantiations are unchanged. The draft head keeps its own int4 KV and is untouc
 - **Quality is a proxy.** The simulation is teacher-forced KL/argmax on short prompts. The decision to proceed
   rests on it; confirm with the Menagerie golden set (phase 6) before deploying.
 - Prefix/session resume (`serve_resume`) and the parity gate assume specific KV semantics; both need re-checking.
+
+## EAGLE head retrain on K5:V4 features (r13k5, 2026-11-09): not adopted
+
+Goal: recover the serving-style decode gap (EAGLE acceptance 0.145 with int4 vs 0.125 with K5:V4, r12 head).
+
+- Features were re-dumped on the production RTX 4070 with the deployed engine (`G4_KV8=5`,
+  `scripts/eagle/stage_r13k5_dump.sh`): serve_eval, serve_train3, chat_r12_eval, train2000, chat_r12_train,
+  9.4M tokens in 43 min (production down for that window). The RTX 5090 was not used for dumping: on identical input
+  the same binary's K5 features differ between the two cards (cosine 0.984 vs 0.9994 for int8).
+- r13k5 was fine-tuned from r12 on the RTX 5090 (`scripts/eagle/train_remote_r13k5.sh`; same hyperparameters as r12,
+  but only the three K5-dumped training sets).
+
+Offline eval on K5 features (tokens per round at depth 6, higher is better):
+
+| Head | chat_r12_eval (K5) | serve_eval (K5) |
+| --- | ---: | ---: |
+| r12 (trained on int8 features) | **2.186** | **2.455** |
+| r13k5 | 2.154 | 2.389 |
+
+r13k5 is worse on both. During training it dropped to 2.111 by step 500 and recovered only to 2.154, so the fine-tune
+lost more (the r9/r11 chat sets and part of the base data were left out) than it gained from matching K5. r12 itself loses
+only ~1% when moved from int8 to K5 features (2.206 at the end of its own training vs 2.186 here), so a perfectly matched
+head has little left to win offline. The live serving-style gap is therefore probably not mainly a head-mismatch effect.
+r12 stays deployed; r13k5 is kept at `heads/r13k5.safetensors` (gremlin) and `runs/r13k5/` (5090) but not used.
+The K5 feature dumps are kept in `ds/k5/` on both hosts for future runs.
