@@ -164,3 +164,5 @@ Live results on gremlin-1 (`G4_MULTI_PROFILE`, r12 k=4 tree verify, 14 rows, ms 
 | 32K | – | 14.77 | – → 31.1 |
 
 On the held-out families (`kv_accept_ab.py`, K5, r12 k=4), speculative output equals plain greedy for every request, and parity passes (teacher-forced, K5 and bf16, MMA on and off). Plain decode is unchanged at short context (68 tok/s, weight-bound). The greedy text differs from the scalar build because the attention arithmetic changed: 4 of 61 plain outputs are identical. Tok/s on chat/novel/serving is within the per-content variance described above (137.2 / 136.4 / 135.6 vs 134.7 / 138.0 / 140.3). The long family (10–13K-token prompts) goes from 30.8 to 34.2 tok/s including prefill.
+
+Deployed on gremlin-1 2026-11-09 21:06 (generation 795, engine `gw4acyp9…-granite4-engine-cuda`, flake input back on `main` at 6ea7c3a). Parity gate passed at start (24/24). Rollback: `nixos-rebuild switch --rollback` (generation 794), or `G4_ATTN_MMA=0` in the service environment.
