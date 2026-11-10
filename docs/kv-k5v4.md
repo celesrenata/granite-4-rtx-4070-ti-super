@@ -166,3 +166,35 @@ Live results on gremlin-1 (`G4_MULTI_PROFILE`, r12 k=4 tree verify, 14 rows, ms 
 On the held-out families (`kv_accept_ab.py`, K5, r12 k=4), speculative output equals plain greedy for every request, and parity passes (teacher-forced, K5 and bf16, MMA on and off). Plain decode is unchanged at short context (68 tok/s, weight-bound). The greedy text differs from the scalar build because the attention arithmetic changed: 4 of 61 plain outputs are identical. Tok/s on chat/novel/serving is within the per-content variance described above (137.2 / 136.4 / 135.6 vs 134.7 / 138.0 / 140.3). The long family (10–13K-token prompts) goes from 30.8 to 34.2 tok/s including prefill.
 
 Deployed on gremlin-1 2026-11-09 21:06 (generation 795, engine `gw4acyp9…-granite4-engine-cuda`, flake input back on `main` at 6ea7c3a). Parity gate passed at start (24/24). Rollback: `nixos-rebuild switch --rollback` (generation 794), or `G4_ATTN_MMA=0` in the service environment.
+
+## Quantized prefill attention on integer-code tiles (`G4_PREFILL_ATTN_CODES`, default on, 2026-11-09)
+
+Before this change, a 32K-token prompt prefilled in 22.1 s, and attention took most of that time (the GEMMs account for about 8 s). The quantized prefill kernel dequantized K and V one scalar element at a time, with a multiply and a bf16 rounding per element. It did this for every 32-query block of every 512-row chunk, so each cache tile was re-dequantized many times.
+
+`prefill_attention_q_kernel` (KV8 / KV4 / K5:V4) applies the same idea as the split-KV kernel:
+- The tiles hold the integer codes, which are exact in bf16. The per-position K scale multiplies the logit column, and the V scale is folded into P.
+- Fills are vector loads plus bit operations. V is stored row-major and read with `ldmatrix.trans`.
+- The next tile's loads are prefetched while the current tile is attended.
+- The code-tile helpers now live in `device_math.cuh` and are shared with `attn_mma_kernel`.
+- The bf16 path is unchanged. `G4_PREFILL_ATTN_CODES=0` restores the old fill; it reproduces the old timings exactly.
+
+`kv-bench`, K5:V4 (production binary vs new):
+
+| ctx | prefill before | prefill after |
+| ---: | ---: | ---: |
+| 8K | 2.78 s | 2.26 s (−19%) |
+| 16K | 7.39 s | 5.24 s (−29%) |
+| 32K | 22.14 s | 13.39 s (−40%) |
+
+End-to-end on real long documents (r12 k=4, fresh requests, 256 tokens, total request time): 17K-token prompt 11.73 → 9.16 s, 19K 13.32 → 10.15 s, 32K 27.06 → 18.09 s. On the held-out families, long goes 34.2 → 40.9 tok/s including prefill, and chat/novel/serving are unchanged.
+
+Checks:
+- The full GPU suite passes. K5:V4 prefill attention is now 0.00195 from the dequantized-bf16 reference (bound 0.02).
+- Speculative output equals plain on every held-out request.
+- The parity gate passes for K5 and bf16.
+
+Also measured: draft-KV width at long context makes little difference. Acceptance with bf16 / int8 draft KV is within +0.001–0.005 of int4, so `G4_DRAFT_KV=4` stays. Long-context acceptance (0.065–0.08 at 17–32K) is a head and data problem, not draft-KV noise.
+
+Deployed on gremlin-1 2026-11-09 22:42 (generation 797, engine e41b834). After the switch, the first request failed with `cuda: out of memory at 484` (infer_main.cc). The cause was not the engine change. The host config had been changed to `maxContext = 98304` at 21:27 (generation 796). The EAGLE prompt-feature buffer is 2 B × hidden × maxContext, which is 768 MiB at 98304, and it is allocated lazily on the first EAGLE request. That does not fit in the ~0.9 GiB the card has left at pool 114688. maxContext was set back to 65536 (generation 798; the edited file is kept as `granite4-rtx.nix.bak-ctx98304-*`).
+
+Live after the fix: parity gate pass. A 32,151-token prompt plus 128 generated tokens takes 15.7 s end to end through the API, and GPU memory peaks at 16,021 MiB. A 98K context would need a smaller pool or a smaller feature buffer (for example, prompt features only for the rows the head catch-up needs), and has not been tested.

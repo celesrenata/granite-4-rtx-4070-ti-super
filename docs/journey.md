@@ -1,7 +1,7 @@
 # Granite 4.2 8B on one RTX 4070 Ti SUPER: from bf16 to K5:V4 and tensor-core attention
 
 A recap of the serving engine's path from the first scaffold (2026-10-22) to the current production build
-(2026-11-09, NixOS generation 795 on gremlin-1). Every number here was measured on gremlin-1 (RTX 4070 Ti SUPER,
+(2026-11-09, NixOS generation 798 on gremlin-1). Every number here was measured on gremlin-1 (RTX 4070 Ti SUPER,
 16 GB, sm_89, 632 GB/s measured read bandwidth) unless marked otherwise. Detailed tables and reproduction commands
 live in `phases.md`, `memory.md`, `deployment.md` and `kv-k5v4.md`; Menagerie-side quality runs live in Menagerie
 `docs/performance/`.
@@ -22,6 +22,7 @@ load). The engine never used fp16 storage.
 | KV4 3 x 64K oversubscribed | 126 tok/s | 311.6 tok/s (3 slots) | int4 120K | capacity, but lossy |
 | **K5:V4** | ~120 tok/s live | 211 tok/s (3 clients, live) | 114,688 | int8-level accuracy |
 | **Tensor-core attention** | unchanged at short ctx | - | 114,688 | 16K verify step 38.8 → 23.9 ms |
+| **Code-tile prefill attention** | unchanged | - | 114,688 | 32K prefill 22.1 → 13.4 s |
 
 Two rules held the whole way: speculative output must equal plain greedy token for token, and every speed claim
 must come from a same-harness A/B.
@@ -148,26 +149,39 @@ works:
   - Unrolled combine: no gain; reverted.
   - Masking instead of save/restore for tree rows: kept, since it removed register spills.
 
+## 6. Prefill attention on code tiles (11-09)
+
+The same trick applied to prefill. The quantized prefill kernel used to dequantize every K/V element with a scalar load, a multiply and a bf16 round, for every 32-query block of every 512-row chunk. It now stores raw codes and applies the scales to S and P, with vector loads, `ldmatrix.trans` for V and prefetch.
+
+| K5:V4 prefill (`kv-bench`) | 8K | 16K | 32K |
+| --- | ---: | ---: | ---: |
+| Before | 2.78 s | 7.39 s | 22.14 s |
+| After | 2.26 s | 5.24 s | **13.39 s** |
+
+A real 32K-token request (prefill plus 256 tokens) went from 27.1 to 18.1 s. The long held-out family went from 34.2 to 40.9 tok/s.
+
+Also checked: draft-KV width (int4 / int8 / bf16) at long context changes acceptance by under 0.005. Long-context acceptance is a head and data problem.
+
 ## Where the time goes now (16K context, one verify step)
 
 GEMMs 15.2 ms (the weight pass, ~590 GB/s), attention 7.3 ms, lm_head 0.7 ms, norms 0.5 ms, RoPE 0.2 ms.
 
 Remaining levers, roughly in order:
 1. **EAGLE acceptance at long context.** It drops to 0.06-0.09 past 16K, and that now costs more than attention does.
-2. **Attention at very long context.** It is ~25-30% of the bytes floor with MMA. Running more query rows per block,
+2. **Decode / verify attention at very long context.** It is ~25-30% of the bytes floor with MMA. Running more query rows per block,
    or reading K5 codes directly, could help.
 3. **Heads.** Options are more self-distilled data (especially long-context and agent traffic), deeper heads, or
    retuned trees.
 4. **Weights.** They are at ~95% of roofline. The only remaining lever is fewer bytes per token, and INT4 weights
    were rejected on quality.
 
-## Production today (gremlin-1, generation 795)
+## Production today (gremlin-1, generation 798)
 
-- Engine 6ea7c3a, flake input on `main`.
+- Engine e41b834, flake input on `main`.
 - K5:V4 KV (`kv5`), pool 114,688 positions, 3 sessions x 64K.
 - EAGLE r12, k=4, tree drafting, draft KV int4.
-- Tensor-core attention on (`G4_ATTN_MMA`). The parity gate runs at every start.
-- Rollback: generation 794, or set `G4_ATTN_MMA=0`.
+- Tensor-core attention on (`G4_ATTN_MMA`), plus code-tile prefill attention (`G4_PREFILL_ATTN_CODES`). The parity gate runs at every start.
+- Rollback: the previous generation, or set either env flag to `0`.
 - Live, K5:V4 before the MMA change:
 
   | Measure | Result |
