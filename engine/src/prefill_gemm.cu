@@ -927,6 +927,245 @@ __global__ void __launch_bounds__(W * 32)
   }
 }
 
+// Quantized-cache prefill attention (KV8 / KV4 / K5:V4; G4_PREFILL_ATTN_CODES=0 restores the
+// dequantizing fill above). Same block layout and online softmax as prefill_attention_kernel, but
+// the K / V tiles hold the integer codes (exact in bf16) and the per-position scales go to the
+// logits (K) and probabilities (V), so a tile fill is vector loads plus bit operations instead of
+// a scalar load, multiply and bf16 rounding per element. V is stored row-major and read with
+// ldmatrix.trans; the next tile's cache loads are issued before the current tile is attended.
+// Numerics: K enters exactly (not rounded to bf16 after scaling); P carries the V scale in bf16.
+constexpr int kPqP = 128 + 8;  // K / V tile pitch (bf16): conflict-free fragment loads
+
+struct PqRaw {
+  uint4 k, v;     // KV8: 16 codes each; KV4 / K5: .x / .y = 8 nibble bytes (16 dims)
+  unsigned hib;   // K5: the 16 high bits of the item's dims
+  float sk, sv;
+};
+
+template <bool Int8, bool K5>
+__device__ __forceinline__ void pq_load(PqRaw& r, int row, bool valid, int part,
+                                        const std::int8_t* k8, const std::int8_t* v8,
+                                        const std::uint8_t* k4, const std::uint8_t* v4,
+                                        const float* ksc, const float* vsc) {
+  if (!valid) return;
+  const int c0 = 16 * part;
+  r.sk = ksc[row];
+  r.sv = vsc[row];
+  if (Int8) {
+    r.k = *reinterpret_cast<const uint4*>(k8 + static_cast<std::size_t>(row) * 128 + c0);
+    r.v = *reinterpret_cast<const uint4*>(v8 + static_cast<std::size_t>(row) * 128 + c0);
+  } else {
+    const std::size_t kb = K5 ? static_cast<std::size_t>(row) * dev::kK5RowBytes + c0 / 2
+                              : static_cast<std::size_t>(row) * 64 + c0 / 2;
+    const uint2 kr = *reinterpret_cast<const uint2*>(k4 + kb);
+    const uint2 vr = *reinterpret_cast<const uint2*>(v4 + static_cast<std::size_t>(row) * 64 + c0 / 2);
+    r.k.x = kr.x;
+    r.k.y = kr.y;
+    r.v.x = vr.x;
+    r.v.y = vr.y;
+    if (K5)
+      r.hib = *reinterpret_cast<const std::uint16_t*>(
+          k4 + static_cast<std::size_t>(row) * dev::kK5RowBytes + dev::kK5NibbleBytes + c0 / 8);
+  }
+}
+
+template <bool Int8, bool K5>
+__device__ __forceinline__ void pq_store(std::uint16_t (*Ks)[kPqP], std::uint16_t (*Vs)[kPqP],
+                                         float* ksc_s, float* vsc_s, int kr, int part,
+                                         const PqRaw& r, bool valid) {
+  const int c0 = 16 * part;
+  std::uint32_t kw[8], vw[8];
+  if (!valid) {
+#pragma unroll
+    for (int e = 0; e < 8; ++e) kw[e] = vw[e] = 0u;
+  } else if (Int8) {
+    dev::int8x16_to_bf16(r.k, kw);
+    dev::int8x16_to_bf16(r.v, vw);
+  } else {
+    constexpr std::uint32_t kOff = K5 ? dev::kK5CodeOff : dev::kQ4CodeOff;
+    dev::codes8_to_bf16<K5>(r.k.x, r.hib, kOff, &kw[0]);
+    dev::codes8_to_bf16<K5>(r.k.y, r.hib >> 8, kOff, &kw[4]);
+    dev::codes8_to_bf16<false>(r.v.x, 0u, dev::kQ4CodeOff, &vw[0]);
+    dev::codes8_to_bf16<false>(r.v.y, 0u, dev::kQ4CodeOff, &vw[4]);
+  }
+  *reinterpret_cast<uint4*>(&Ks[kr][c0]) = make_uint4(kw[0], kw[1], kw[2], kw[3]);
+  *reinterpret_cast<uint4*>(&Ks[kr][c0 + 8]) = make_uint4(kw[4], kw[5], kw[6], kw[7]);
+  *reinterpret_cast<uint4*>(&Vs[kr][c0]) = make_uint4(vw[0], vw[1], vw[2], vw[3]);
+  *reinterpret_cast<uint4*>(&Vs[kr][c0 + 8]) = make_uint4(vw[4], vw[5], vw[6], vw[7]);
+  if (part == 0) {
+    ksc_s[kr] = valid ? r.sk : 0.0f;
+    vsc_s[kr] = valid ? r.sv : 0.0f;
+  }
+}
+
+template <bool Int8, bool K5, int W>
+__global__ void __launch_bounds__(W * 32)
+    prefill_attention_q_kernel(const std::uint16_t* __restrict__ q_rot, float scale, int Hq,
+                               int base_pos, int rows, int stride, std::uint16_t* __restrict__ out,
+                               const std::int8_t* __restrict__ cache_k8,
+                               const std::int8_t* __restrict__ cache_v8,
+                               const float* __restrict__ k_scale, const float* __restrict__ v_scale,
+                               const std::uint8_t* __restrict__ cache_k4,
+                               const std::uint8_t* __restrict__ cache_v4,
+                               const int* __restrict__ d_pt) {
+  constexpr int D = 128, G = 4;
+  constexpr int kPosPerWarp = 16 / G;
+  constexpr int kPosPerBlock = W * kPosPerWarp;
+  constexpr int KT = kAttnKvTile;
+  constexpr int kItems = KT * (D / 16) / (W * 32);  // fill items (position, 16 dims) per thread
+  static_assert(kItems * W * 32 == KT * (D / 16), "fill items");
+  __shared__ __align__(16) std::uint16_t Ks[KT][kPqP];
+  __shared__ __align__(16) std::uint16_t Vs[KT][kPqP];
+  __shared__ __align__(8) float ksc_s[KT], vsc_s[KT];
+
+  const int hkv = blockIdx.y;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int g = lane >> 2, t4 = lane & 3;
+  const int p0 = blockIdx.x * kPosPerBlock;
+  const int wp0 = p0 + warp * kPosPerWarp;
+
+  int rl[2], head[2], pabs[2];
+  bool ok[2];
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const int r = g + 8 * h;
+    rl[h] = wp0 + r / G;
+    head[h] = hkv * G + r % G;
+    ok[h] = rl[h] < rows;
+    pabs[h] = base_pos + rl[h];
+  }
+  const std::size_t qpitch = static_cast<std::size_t>(Hq) * D;
+  std::uint32_t qf[D / 16][4];
+#pragma unroll
+  for (int ks = 0; ks < D / 16; ++ks) {
+    const int k = ks * 16 + 2 * t4;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const std::uint16_t* const q = q_rot + rl[h] * qpitch + head[h] * D;
+      qf[ks][h] = ok[h] ? *reinterpret_cast<const std::uint32_t*>(q + k) : 0u;
+      qf[ks][2 + h] = ok[h] ? *reinterpret_cast<const std::uint32_t*>(q + k + 8) : 0u;
+    }
+  }
+  float o[D / 8][4];
+#pragma unroll
+  for (int i = 0; i < D / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+  float m[2] = {-INFINITY, -INFINITY};
+  float l[2] = {0.0f, 0.0f};
+
+  const int last = min(p0 + kPosPerBlock, rows) - 1;
+  const int kv_end = base_pos + last + 1;
+  const std::int8_t* const k8 = Int8 ? cache_k8 + static_cast<std::size_t>(hkv) * stride * D : nullptr;
+  const std::int8_t* const v8 = Int8 ? cache_v8 + static_cast<std::size_t>(hkv) * stride * D : nullptr;
+  const std::uint8_t* const k4 =
+      Int8 ? nullptr : cache_k4 + static_cast<std::size_t>(hkv) * stride * (K5 ? dev::kK5RowBytes : D / 2);
+  const std::uint8_t* const v4 = Int8 ? nullptr : cache_v4 + static_cast<std::size_t>(hkv) * stride * (D / 2);
+  const float* const ksc = k_scale + static_cast<std::size_t>(hkv) * stride;
+  const float* const vsc = v_scale + static_cast<std::size_t>(hkv) * stride;
+
+  PqRaw raw[kItems];
+  bool rv[kItems];
+  auto load_tile = [&](int j0) {
+#pragma unroll
+    for (int i = 0; i < kItems; ++i) {
+      const int it = threadIdx.x + i * W * 32;
+      const int j = j0 + (it >> 3);
+      rv[i] = j < kv_end;
+      const int row = rv[i] ? (d_pt != nullptr ? d_pt[j] : j) : 0;
+      pq_load<Int8, K5>(raw[i], row, rv[i], it & 7, k8, v8, k4, v4, ksc, vsc);
+    }
+  };
+  load_tile(0);
+  const int mj = lane >> 3, mr = lane & 7;
+  for (int j0 = 0; j0 < kv_end; j0 += KT) {
+    __syncthreads();  // the previous tile's readers are done
+#pragma unroll
+    for (int i = 0; i < kItems; ++i) {
+      const int it = threadIdx.x + i * W * 32;
+      pq_store<Int8, K5>(Ks, Vs, ksc_s, vsc_s, it >> 3, it & 7, raw[i], rv[i]);
+    }
+    __syncthreads();
+    if (j0 + KT < kv_end) load_tile(j0 + KT);
+
+    float s[KT / 8][4];
+#pragma unroll
+    for (int ni = 0; ni < KT / 8; ++ni) s[ni][0] = s[ni][1] = s[ni][2] = s[ni][3] = 0.0f;
+#pragma unroll
+    for (int ks = 0; ks < D / 16; ++ks)
+#pragma unroll
+      for (int ni = 0; ni < KT / 8; ++ni) {
+        const std::uint16_t* const kr = &Ks[ni * 8 + g][ks * 16 + 2 * t4];
+        mma_bf16_16816(s[ni], qf[ks], *reinterpret_cast<const std::uint32_t*>(kr),
+                       *reinterpret_cast<const std::uint32_t*>(kr + 8));
+      }
+    float mx[2] = {m[0], m[1]};
+#pragma unroll
+    for (int ni = 0; ni < KT / 8; ++ni) {
+      const float2 skp = *reinterpret_cast<const float2*>(&ksc_s[ni * 8 + 2 * t4]);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int h = e >> 1;
+        const int j = j0 + ni * 8 + 2 * t4 + (e & 1);
+        const float dot = s[ni][e] * ((e & 1) ? skp.y : skp.x);
+        const float v = j <= pabs[h] ? bf16_round(scale * dot) : -INFINITY;
+        s[ni][e] = v;
+        mx[h] = fmaxf(mx[h], v);
+      }
+    }
+    float alpha[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffffu, mx[h], 1));
+      mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffffu, mx[h], 2));
+      alpha[h] = expf(m[h] - mx[h]);  // 0 on the first tile (m = -inf)
+      l[h] *= alpha[h];
+      m[h] = mx[h];
+    }
+#pragma unroll
+    for (int i = 0; i < D / 8; ++i) {
+      o[i][0] *= alpha[0];
+      o[i][1] *= alpha[0];
+      o[i][2] *= alpha[1];
+      o[i][3] *= alpha[1];
+    }
+    std::uint32_t pf[KT / 16][4];
+#pragma unroll
+    for (int ni = 0; ni < KT / 8; ++ni) {
+      const float e0 = expf(s[ni][0] - m[0]), e1 = expf(s[ni][1] - m[0]);
+      const float e2 = expf(s[ni][2] - m[1]), e3 = expf(s[ni][3] - m[1]);
+      l[0] += e0 + e1;
+      l[1] += e2 + e3;
+      const float2 svp = *reinterpret_cast<const float2*>(&vsc_s[ni * 8 + 2 * t4]);
+      pf[ni / 2][(ni & 1) * 2] = pack_bf16x2(e0 * svp.x, e1 * svp.y);
+      pf[ni / 2][(ni & 1) * 2 + 1] = pack_bf16x2(e2 * svp.x, e3 * svp.y);
+    }
+#pragma unroll
+    for (int kk = 0; kk < KT / 16; ++kk)
+#pragma unroll
+      for (int nd = 0; nd < D / 8; nd += 2) {
+        std::uint32_t b0, b1, b2, b3;
+        dev::ldsm_x4_trans(b0, b1, b2, b3, &Vs[kk * 16 + 8 * (mj & 1) + mr][8 * (nd + (mj >> 1))]);
+        mma_bf16_16816(o[nd], pf[kk], b0, b1);
+        mma_bf16_16816(o[nd + 1], pf[kk], b2, b3);
+      }
+  }
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    l[h] += __shfl_xor_sync(0xffffffffu, l[h], 1);
+    l[h] += __shfl_xor_sync(0xffffffffu, l[h], 2);
+  }
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    if (!ok[h]) continue;
+    const float inv = 1.0f / l[h];
+    std::uint16_t* const dst = out + rl[h] * qpitch + head[h] * D + 2 * t4;
+#pragma unroll
+    for (int nd = 0; nd < D / 8; ++nd)
+      *reinterpret_cast<std::uint32_t*>(dst + nd * 8) =
+          pack_bf16x2(o[nd][2 * h] * inv, o[nd][2 * h + 1] * inv);
+  }
+}
+
 // act[r][i] = bf16(g * sigmoid(g) * u), g = gu[r][i], u = gu[r][I + i]
 // (both already dequant-scaled by the GEMM epilogue) - the decode
 // silu_gate_up epilogue arithmetic.
@@ -1155,12 +1394,28 @@ int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
     return e == nullptr ? 0 : (e[0] == '4' ? 4 : (e[0] == '8' ? 8 : 0));
   }();
   const int warps = forced != 0 ? forced : ((int8 || int4) ? 8 : 4);
+  static const bool codes = [] {
+    const char* e = std::getenv("G4_PREFILL_ATTN_CODES");
+    return e == nullptr || e[0] != '0';
+  }();
   auto launch = [&](auto wtag) {
     constexpr int Wn = decltype(wtag)::value;
     constexpr int kPosPerBlock = Wn * (16 / 4);
     const dim3 grid(static_cast<unsigned>((rows + kPosPerBlock - 1) / kPosPerBlock),
                     static_cast<unsigned>(Hk));
-    if (int8)
+    if (codes && int8)
+      prefill_attention_q_kernel<true, false, Wn><<<grid, Wn * 32>>>(
+          q_rot, scale, Hq, base_pos, rows, stride, out, cache_k8, cache_v8, k_scale, v_scale,
+          nullptr, nullptr, d_pt);
+    else if (codes && int4 && k5)
+      prefill_attention_q_kernel<false, true, Wn><<<grid, Wn * 32>>>(
+          q_rot, scale, Hq, base_pos, rows, stride, out, nullptr, nullptr, k_scale, v_scale,
+          cache_k4, cache_v4, d_pt);
+    else if (codes && int4)
+      prefill_attention_q_kernel<false, false, Wn><<<grid, Wn * 32>>>(
+          q_rot, scale, Hq, base_pos, rows, stride, out, nullptr, nullptr, k_scale, v_scale,
+          cache_k4, cache_v4, d_pt);
+    else if (int8)
       prefill_attention_kernel<128, 4, true, false, Wn><<<grid, Wn * 32>>>(
           q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, cache_k8,
           cache_v8, k_scale, v_scale, nullptr, nullptr, d_pt);

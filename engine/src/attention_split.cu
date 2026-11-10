@@ -681,16 +681,6 @@ __device__ __forceinline__ void mma_16816(float (&c)[4], const std::uint32_t (&a
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
-// Four transposed 8x8 bf16 matrices: the m16n8k16 B fragments of two n8 blocks read from a
-// row-major [key][dim] tile.
-__device__ __forceinline__ void ldsm_x4_trans(std::uint32_t& r0, std::uint32_t& r1,
-                                              std::uint32_t& r2, std::uint32_t& r3,
-                                              const void* p) {
-  const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-               : "r"(a));
-}
 __device__ __forceinline__ float mma_bf16_round(float x) {
   return __uint_as_float(static_cast<std::uint32_t>(f32_to_bf16(x)) << 16);
 }
@@ -748,32 +738,6 @@ __device__ __forceinline__ void mma_load_pos(MmaRaw& r, int row, bool valid, int
   }
 }
 
-// bf16x2 a * 1 + c (exact here: the results are small integers).
-__device__ __forceinline__ std::uint32_t mma_bf16x2_sub(std::uint32_t a, std::uint32_t c) {
-  std::uint32_t r;
-  asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(a), "r"(0x3f803f80u), "r"(c));
-  return r;
-}
-// Eight 4-bit codes (one word, dim 2e in byte e's low nibble, 2e + 1 in its high nibble) plus
-// K5 high bits (bit 2e / 2e + 1 of hib8) -> four bf16 pairs of (code - off), exactly: 0x4300 | n
-// is the bf16 128 + n for n < 128, and off_bits holds -(128 + off) in both halves.
-template <bool K5>
-__device__ __forceinline__ void mma_codes8(std::uint32_t w, unsigned hib8, std::uint32_t off_bits,
-                                           std::uint32_t* out) {
-  const std::uint32_t lo = w & 0x0f0f0f0fu, hi = (w >> 4) & 0x0f0f0f0fu;
-#pragma unroll
-  for (int e = 0; e < 4; ++e) {
-    // Result byte 0 = lo.byte e, byte 2 = hi.byte e (bytes 1 and 3 are masked off).
-    const unsigned sel = static_cast<unsigned>(e) | static_cast<unsigned>(4 + e) << 8;
-    std::uint32_t x = (__byte_perm(lo, hi, sel) & 0x00ff00ffu) | 0x43004300u;
-    if (K5) {
-      const unsigned b = hib8 >> (2 * e);
-      x |= ((b & 1u) << 4) | ((b & 2u) << 19);
-    }
-    out[e] = mma_bf16x2_sub(x, off_bits);
-  }
-}
-
 // Store a loaded item into Ks[kr] / Vs[kr] (row-major). bf16: the cache values. Quantized: the
 // integer codes (exact in bf16; KV4 code - 8, K5 code - 16, KV8 the int8), with the position's
 // scales in ksc_s / vsc_s - attend applies them to the logits (K) and the probabilities (V), so
@@ -793,24 +757,19 @@ __device__ __forceinline__ void mma_store_pos(std::uint16_t (*Ks)[kMmaP], std::u
     vo1 = r.v1;
   } else if (Int8) {
     std::uint32_t kw[8], vw[8];
-    const std::int8_t* const kc = reinterpret_cast<const std::int8_t*>(&r.k0);
-    const std::int8_t* const vc = reinterpret_cast<const std::int8_t*>(&r.v0);
-#pragma unroll
-    for (int e = 0; e < 8; ++e) {
-      kw[e] = mma_pack(static_cast<float>(kc[2 * e]), static_cast<float>(kc[2 * e + 1]));
-      vw[e] = mma_pack(static_cast<float>(vc[2 * e]), static_cast<float>(vc[2 * e + 1]));
-    }
+    dev::int8x16_to_bf16(r.k0, kw);
+    dev::int8x16_to_bf16(r.v0, vw);
     ko0 = make_uint4(kw[0], kw[1], kw[2], kw[3]);
     ko1 = make_uint4(kw[4], kw[5], kw[6], kw[7]);
     vo0 = make_uint4(vw[0], vw[1], vw[2], vw[3]);
     vo1 = make_uint4(vw[4], vw[5], vw[6], vw[7]);
   } else {
     std::uint32_t kw[8], vw[8];
-    constexpr std::uint32_t kOff = K5 ? 0xc310c310u : 0xc308c308u;  // -(128 + 16) / -(128 + 8)
-    mma_codes8<K5>(r.k0.x, r.hib, kOff, &kw[0]);
-    mma_codes8<K5>(r.k0.y, r.hib >> 8, kOff, &kw[4]);
-    mma_codes8<false>(r.v0.x, 0u, 0xc308c308u, &vw[0]);
-    mma_codes8<false>(r.v0.y, 0u, 0xc308c308u, &vw[4]);
+    constexpr std::uint32_t kOff = K5 ? dev::kK5CodeOff : dev::kQ4CodeOff;
+    dev::codes8_to_bf16<K5>(r.k0.x, r.hib, kOff, &kw[0]);
+    dev::codes8_to_bf16<K5>(r.k0.y, r.hib >> 8, kOff, &kw[4]);
+    dev::codes8_to_bf16<false>(r.v0.x, 0u, dev::kQ4CodeOff, &vw[0]);
+    dev::codes8_to_bf16<false>(r.v0.y, 0u, dev::kQ4CodeOff, &vw[4]);
     ko0 = make_uint4(kw[0], kw[1], kw[2], kw[3]);
     ko1 = make_uint4(kw[4], kw[5], kw[6], kw[7]);
     vo0 = make_uint4(vw[0], vw[1], vw[2], vw[3]);
@@ -979,7 +938,7 @@ __global__ void __launch_bounds__(kMmaThreads, 2)
 #pragma unroll
       for (int nd = 0; nd < kD / 8; nd += 2) {
         std::uint32_t b0, b1, b2, b3;
-        ldsm_x4_trans(b0, b1, b2, b3, &Vs[kk * 16 + 8 * (mj & 1) + mr][8 * (nd + (mj >> 1))]);
+        dev::ldsm_x4_trans(b0, b1, b2, b3, &Vs[kk * 16 + 8 * (mj & 1) + mr][8 * (nd + (mj >> 1))]);
         mma_16816(o[nd], pf[kk], b0, b1);
         mma_16816(o[nd + 1], pf[kk], b2, b3);
       }

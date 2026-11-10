@@ -209,6 +209,60 @@ __device__ __forceinline__ void k5_write_plane(const unsigned char* hi, unsigned
   row[kK5NibbleBytes + w] = static_cast<unsigned char>(plane);
 }
 
+
+// ---------------------------------------------------------------------------
+// Tensor-core attention helpers shared by the split-KV (decode / verify) and prefill kernels.
+//
+// Quantized K/V tiles hold the integer codes as bf16 (exact: |code| <= 127), and the per-row
+// scales are applied to the logits (K) and probabilities (V), so a tile fill converts codes with
+// bit operations only.
+// ---------------------------------------------------------------------------
+// Four transposed 8x8 bf16 matrices from shared memory (m16n8k16 B fragments of two n8 blocks
+// read from a row-major [key][dim] tile).
+__device__ __forceinline__ void ldsm_x4_trans(std::uint32_t& r0, std::uint32_t& r1,
+                                              std::uint32_t& r2, std::uint32_t& r3,
+                                              const void* p) {
+  const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(p));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(a));
+}
+// bf16x2 a * 1 + c (exact for the small integers used here).
+__device__ __forceinline__ std::uint32_t bf16x2_add(std::uint32_t a, std::uint32_t c) {
+  std::uint32_t r;
+  asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(a), "r"(0x3f803f80u), "r"(c));
+  return r;
+}
+// Eight 4-bit codes (one word, dim 2e in byte e's low nibble, 2e + 1 in its high nibble) plus
+// K5 high bits (bit 2e / 2e + 1 of hib8) -> four bf16 pairs of (code - off), exactly: 0x4300 | n
+// is the bf16 128 + n for n < 128, and off_bits holds -(128 + off) in both halves.
+template <bool K5>
+__device__ __forceinline__ void codes8_to_bf16(std::uint32_t w, unsigned hib8, std::uint32_t off_bits,
+                                               std::uint32_t* out) {
+  const std::uint32_t lo = w & 0x0f0f0f0fu, hi = (w >> 4) & 0x0f0f0f0fu;
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    // Result byte 0 = lo.byte e, byte 2 = hi.byte e (bytes 1 and 3 are masked off).
+    const unsigned sel = static_cast<unsigned>(e) | static_cast<unsigned>(4 + e) << 8;
+    std::uint32_t x = (__byte_perm(lo, hi, sel) & 0x00ff00ffu) | 0x43004300u;
+    if (K5) {
+      const unsigned b = hib8 >> (2 * e);
+      x |= ((b & 1u) << 4) | ((b & 2u) << 19);
+    }
+    out[e] = bf16x2_add(x, off_bits);
+  }
+}
+constexpr std::uint32_t kQ4CodeOff = 0xc308c308u;  // -(128 + 8): int4 code - 8
+constexpr std::uint32_t kK5CodeOff = 0xc310c310u;  // -(128 + 16): K5 code - 16
+// Sixteen int8 codes -> eight bf16 pairs (exact).
+__device__ __forceinline__ void int8x16_to_bf16(const uint4& raw, std::uint32_t* out) {
+  const std::int8_t* const c = reinterpret_cast<const std::int8_t*>(&raw);
+#pragma unroll
+  for (int e = 0; e < 8; ++e)
+    out[e] = static_cast<std::uint32_t>(f32_to_bf16(static_cast<float>(c[2 * e]))) |
+             (static_cast<std::uint32_t>(f32_to_bf16(static_cast<float>(c[2 * e + 1]))) << 16);
+}
+
 }  // namespace dev
 }  // namespace granite4
 
