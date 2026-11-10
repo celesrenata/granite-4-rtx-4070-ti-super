@@ -1,7 +1,7 @@
-# Granite 4.2 8B on one RTX 4070 Ti SUPER: from bf16 to K5:V4 and tensor-core attention
+# Granite 4.2 8B on one RTX 4070 Ti SUPER: from bf16 to K5:V4, tensor-core attention and a 128K window
 
 A recap of the serving engine's path from the first scaffold (2026-10-22) to the current production build
-(2026-11-10, NixOS generation 800 on gremlin-1). Every number here was measured on gremlin-1 (RTX 4070 Ti SUPER,
+(2026-11-10, NixOS generation 801 on gremlin-1). Every number here was measured on gremlin-1 (RTX 4070 Ti SUPER,
 16 GB, sm_89, 632 GB/s measured read bandwidth) unless marked otherwise. Detailed tables and reproduction commands
 live in `phases.md`, `memory.md`, `deployment.md` and `kv-k5v4.md`; Menagerie-side quality runs live in Menagerie
 `docs/performance/`.
@@ -25,6 +25,20 @@ load). The engine never used fp16 storage.
 | **Code-tile prefill attention** | unchanged | - | 114,688 | 32K prefill 22.1 → 13.4 s |
 | **VRAM diet** (embedding to host, shared scratch/RoPE, pieced catch-up) | unchanged | - | **147,456 at 98K ctx** | −1.7 GiB outside the pool |
 | **r15long head** (long-context training data) | 32K decode 49.7 → 67.5 tok/s | serving 139 tok/s | 147,456 | long-record acceptance +27% offline |
+| **Full checkpoint window** | unchanged | - | 147,456, **128K per request** | 124K-token needle correct, 15.9 GiB peak |
+
+Start to finish, on the same card:
+
+| Measure | First GPU build | Today |
+| --- | ---: | ---: |
+| Decode step, short context | 55.7 ms (18 tok/s) | 13.95 ms plain (72 tok/s); ~120-135 tok/s with EAGLE |
+| Prefill, 2K tokens | 78 s | 0.5 s |
+| Prefill, 32K tokens | - | 13.4 s (22.1 s on the first K5:V4 build) |
+| Longest request | ~32K (bf16 KV, 1 session) | 128K (one session, pool shared by 3) |
+| KV positions on the card | ~32K | 147,456 |
+| Aggregate, 3 concurrent chats | - | 211 tok/s live |
+| Decode at 32K context | 39 tok/s (KV8, round 4) | 67.5 tok/s |
+| Long repeated prefix (56K) | full re-prefill, 58 s | 0.6 s (prompt cache) |
 
 Two rules held the whole way: speculative output must equal plain greedy token for token, and every speed claim
 must come from a same-harness A/B.
@@ -164,12 +178,79 @@ A real 32K-token request (prefill plus 256 tokens) went from 27.1 to 18.1 s. The
 
 Also checked: draft-KV width (int4 / int8 / bf16) at long context changes acceptance by under 0.005. Long-context acceptance is a head and data problem.
 
+## 7. VRAM outside the KV pool: −1.7 GiB (11-10, generation 799)
+
+`G4_MEM_LOG=1` (new) prints device memory at each serve stage. Production shape before → after:
+
+| Item | Before | After | How |
+| --- | ---: | ---: | --- |
+| Weights | 8,778 MiB | 7,994 MiB | bf16 embedding table (784 MiB) moved to mapped pinned host memory; a token reads one 8 KB row; gathers read 16 B per thread |
+| 3 sessions | 336 MiB | 164 MiB | one split-KV attention scratch for every session and head instead of six; one RoPE table copy |
+| EAGLE head + forks | 706 MiB | 508 MiB | same sharing |
+| First request | +618 MiB | +138 MiB | prompt catch-up in 2048-row pieces: feature buffer 32 MiB instead of `maxContext` rows (512 MiB at 64K, 768 at 98K) |
+| **Peak** | **16,003 MiB** | **14,413 MiB** | |
+
+All of it is exact. Outputs, acceptance and proposal counts are byte-identical to the previous build, because the bytes are the same, the shared buffers are used in stream order, and the catch-up pieces sit on the old chunk boundaries.
+
+The space went to the pool: 114,688 → 147,456 positions (+28.6%) at 98K context. 98K had OOMed before, because the feature buffer scaled with the context.
+
+Found on the way: at pool 150,528 the first request's prefill scratch no longer fits. The engine then silently used its per-position fallback, so a 32K prompt took minutes at 100% GPU. That now prints a warning. 147,456 is the largest pool that keeps the fast path.
+
+## 8. A long-context draft head: r15long (11-10, generation 800)
+
+**Cause.** Every earlier head was trained on records of at most 4,096 tokens (RoPE tables of 8,192), but the service drafts at up to 98K. Two checks:
+- Draft-KV width did not matter at long context.
+- Windowing r12's attention to its last 1,024 entries raised its long-record score from 1.792 to 2.034 tokens/round. The head did better seeing less of a context it had never trained on.
+
+**Data.** 520 agent-style prompts of 3K–48K tokens: related files from one directory under `// File:` headers, plus a task. Sources were Menagerie, Python packages, nixpkgs and this repo, with 40 held out by directory. Replies came from the live model through the API, with no downtime. K5:V4 features were dumped in 7 idle-gated windows of 5–9 min each (8.3M tokens).
+
+**Training.** Fine-tuned from r12 on its full mix plus the long shards, 35 min on the 5090. Long records train from the reply region only, which is exact (≤ 3e-6 vs the full unroll) and makes 48K records fit.
+
+| Depth-6 tokens/round (held out) | r12 | r15long |
+| --- | ---: | ---: |
+| Long records (3K–48K) | 1.792 | **2.273** (+27%) |
+| Long records, 40K+ | 1.598 | **2.291** (+43%) |
+| Chat | 2.186 | 2.202 |
+| Serving | 2.455 | 2.436 |
+
+| Live decode, real documents | 5.6K | 17K | 19K | 32K |
+| --- | ---: | ---: | ---: | ---: |
+| r12, tok/s | 113.1 | 76.1 | 78.6 | 49.7 |
+| r15long, tok/s | 118.2 | 85.2 | 89.7 | **67.5** (+36%) |
+
+Held-out families live: serving 133.6 → 139.3, long 38.8 → 41.3, chat and novel equal. Output equals plain greedy throughout.
+
+The window became an engine option (`G4_EAGLE_WINDOW`, tested in the split-KV and both prefill kernels). It helps short-trained heads but not r15long, so it is off.
+
+## 9. The full 128K window, and the prompt cache (11-10, generation 801)
+
+`maxContext = 131072`, the checkpoint's own window, with the pool kept at 147,456; the freed VRAM was already in it. One session can hold a 128K conversation, and the other two share the rest of the pool or wait for pages. Running sessions are never evicted.
+
+Live through the API:
+- A 124,059-token prompt with a needle at 50% depth was answered correctly in 139.8 s, prefill included.
+- GPU peak 15,913 of 16,376 MiB, with no fallback warning.
+- A 32K prompt plus 128 tokens takes 16.9 s, unchanged.
+
+The prompt cache (per-session exact-prefix resume) was checked on a fresh 25K-token prompt:
+
+| Request | Time |
+| --- | ---: |
+| Cold | 11.70 s |
+| Identical repeat | 0.99 s |
+| Same document, new question | 0.66 s |
+| Follow-up turn (turn 1 + reply + question) | 0.81 s |
+
+Limits of the cache:
+- It matches token prefixes exactly. A change anywhere earlier (timestamps, reordered tools, a new system prompt) means a full prefill.
+- It holds 3 conversations. An idle session can lose its cache when a long one needs pages.
+- The hit rate on real Menagerie traffic has not been measured.
+
 ## Where the time goes now (16K context, one verify step)
 
 GEMMs 15.2 ms (the weight pass, ~590 GB/s), attention 7.3 ms, lm_head 0.7 ms, norms 0.5 ms, RoPE 0.2 ms.
 
 Remaining levers, roughly in order:
-1. **EAGLE acceptance at long context.** Done for now: r15long (trained on 3K–48K records) lifts long-record acceptance 27% offline and 32K decode 36% live. More long data, and longer records (64K+), are the next steps.
+1. **EAGLE acceptance at long context.** r15long lifted it 27% offline and 32K decode 36% live. Next: more long data from real agent traffic, and 64K–128K training records now that the window allows them.
 2. **Decode / verify attention at very long context.** It is ~25-30% of the bytes floor with MMA. Running more query rows per block,
    or reading K5 codes directly, could help.
 3. **Heads.** Options are more self-distilled data (especially long-context and agent traffic), deeper heads, or
@@ -179,19 +260,24 @@ Remaining levers, roughly in order:
 
 ## Production today (gremlin-1, generation 801)
 
-- Engine 96d3459, flake input on `main`.
+- Engine 96d3459, flake input on `main`; host config committed to `nixos-k3s-configs` `dev` (2069eee).
 - K5:V4 KV (`kv5`), pool 147,456 positions, 3 sessions x 128K (the full checkpoint window; pool oversubscribed).
 - EAGLE r15long (r12 + long-context records), k=4, tree drafting, draft KV int4.
-- Tensor-core attention on (`G4_ATTN_MMA`), plus code-tile prefill attention (`G4_PREFILL_ATTN_CODES`). The parity gate runs at every start.
-- Rollback: the previous generation, or set either env flag to `0`.
-- Live, K5:V4 before the MMA change:
+- Tensor-core attention (`G4_ATTN_MMA`), code-tile prefill attention (`G4_PREFILL_ATTN_CODES`), embedding in host memory (`G4_EMBED_HOST`), shared attention scratch and RoPE tables (`G4_SHARE_ATTN_SCRATCH`, `G4_SHARE_ROPE`). Every flag defaults on, and `=0` restores the old path. The parity gate runs at every start.
+- Rollback: generation 800 (98K context), 799 (r12 head), or the env flags above.
+- Final live numbers (generation 800-801, through the API unless noted):
 
   | Measure | Result |
   | --- | ---: |
-  | Prefill at 1K / 16K / 56K | 3,342 / 2,177 / 987 tok/s |
-  | Decode at 545 / 7.9K ctx | 120.6 / 75.3 tok/s |
-  | 3-client aggregate | 211 tok/s |
-  | 56K prefix resume | 0.60 s, vs 58 s cold |
+  | Plain decode, short context | 68 tok/s |
+  | EAGLE decode, held-out chat / novel / serving | 134.5 / 134.6 / 139.3 tok/s |
+  | Decode on real documents at 5.6K / 17K / 32K | 118.2 / 85.2 / 67.5 tok/s |
+  | 32K-token prompt + 128 tokens | 16.9 s |
+  | 124K-token prompt (needle), end to end | 139.8 s, correct |
+  | Prompt-cache hit on 25K tokens | 0.66–0.99 s, vs 11.7 s cold |
+  | GPU memory peak | 15,913 of 16,376 MiB |
+
+  Earlier live baseline (K5:V4, before the MMA and prefill changes): prefill 3,342 / 2,177 / 987 tok/s at 1K / 16K / 56K, 3-client aggregate 211 tok/s.
 
 ## Lessons that generalized
 
@@ -204,3 +290,7 @@ Remaining levers, roughly in order:
 - **Small eval sets lie.** The 9-prompt serving set produced a −9% "regression". Check distinct-prompt counts before
   believing a delta.
 - **Hardware topology matters for data.** Features dumped on a different GPU are different features.
+- **Train on the traffic you serve.** Four heads trained on short chat could not be fixed by matching the KV format (r13k5, r14k5). Real long-context records fixed long-context drafting in one 35-minute run.
+- **Measure memory per stage before cutting it.** The cheapest 1.7 GiB came from buffers sized for the worst case (a feature buffer per `maxContext`, six identical scratches), not from the model.
+- **Silent fallbacks hide ceilings.** A pool 2% too big made long prompts minutes slow with no error. Fallbacks should say so loudly.
+- **Shared GPUs need a gate.** Stopping a live service under clients was a mistake. Waiting for 30 s with no outside client, and pausing our own generators, made every later window safe.
