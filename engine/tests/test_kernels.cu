@@ -174,7 +174,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const int* row_pos = nullptr, const int* const* row_pt = nullptr,
                const int* row_grp = nullptr, int ngroups = 0,
                const int* row_tbase = nullptr, const int* row_tail = nullptr,
-               int kv_hint = 0, bool k5 = false);
+               int kv_hint = 0, bool k5 = false, int window = 0);
 int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::uint16_t* cache_v, float scale, int Hq, int Hk, int d,
                       int base_pos, int rows, int stride, std::uint16_t* out,
@@ -183,7 +183,7 @@ int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const float* k_scale = nullptr, const float* v_scale = nullptr,
                       bool int8 = false, const std::uint8_t* cache_k4 = nullptr,
                       const std::uint8_t* cache_v4 = nullptr, bool int4 = false,
-                      const int* d_pt = nullptr, bool k5 = false);
+                      const int* d_pt = nullptr, bool k5 = false, int window = 0);
 int prefill_rope_split_append_int4(const std::uint16_t* qkv, const float* cos_tbl,
                                    const float* sin_tbl, int base_pos, int rows, int Hq, int Hk,
                                    int d, int stride, std::uint16_t* q_rot, std::uint8_t* cache_k,
@@ -2060,6 +2060,122 @@ static void test_attn_split_device() {
   cudaFree(dpos); cudaFree(scratch);
 }
 
+// Windowed attention (the draft head's G4_EAGLE_WINDOW): with window W, the row at position p
+// attends to keys (p - W, p] only. Reference: the same rows unwindowed over a cache that holds
+// only those W keys (a page table maps logical j -> physical p - W + 1 + j), so the expected
+// result needs no new arithmetic. Different split layouts round differently: bf16 tolerance.
+// Covers the split-KV kernel (bf16, KV4) and prefill attention (bf16, KV4; rows whose first
+// tile is fully masked), with W crossing tile and split boundaries.
+static void test_attn_window_device() {
+  // 16 rows (the verify-row limit); the window's first key, base + 1 - W = 818, sits 50 keys into
+  // a tile, so rows 14-15 have a fully masked first prefill tile (the -inf guard).
+  const int Hq = 8, Hk = 2, d = 128, stride = 1500, base = 1150, rows = 16, W = 333;
+  Xorshift64 rng(0x3d1f);
+  const std::size_t qn = static_cast<std::size_t>(rows) * Hq * d;
+  const std::size_t cn = static_cast<std::size_t>(Hk) * stride * d;
+  std::vector<std::uint16_t> q(qn), ck(cn), cv(cn);
+  for (auto& x : q) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : ck) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  for (auto& x : cv) x = f32_to_bf16_host(rng.next_float_range(2.0));
+  // KV4 twin of the cache (as test_kv4_attn_split_device).
+  std::vector<std::uint8_t> c4k(Hk * stride * (d / 2)), c4v(Hk * stride * (d / 2));
+  std::vector<float> sk(Hk * stride), sv(Hk * stride);
+  for (int h = 0; h < Hk; ++h)
+    for (int p = 0; p < stride; ++p) {
+      const std::size_t row = static_cast<std::size_t>(h) * stride + p, src = row * d;
+      float ak = 0.0f, av = 0.0f;
+      for (int i = 0; i < d; ++i) {
+        ak = std::max(ak, std::fabs(bf16_to_f32_host(ck[src + i])));
+        av = std::max(av, std::fabs(bf16_to_f32_host(cv[src + i])));
+      }
+      sk[row] = q4_scale_host(ak);
+      sv[row] = q4_scale_host(av);
+      for (int w = 0; w < d / 2; ++w) {
+        c4k[row * (d / 2) + w] = static_cast<std::uint8_t>(
+            (q4_quant_host(bf16_to_f32_host(ck[src + 2 * w]), sk[row]) & 0x0fu) |
+            (q4_quant_host(bf16_to_f32_host(ck[src + 2 * w + 1]), sk[row]) << 4));
+        c4v[row * (d / 2) + w] = static_cast<std::uint8_t>(
+            (q4_quant_host(bf16_to_f32_host(cv[src + 2 * w]), sv[row]) & 0x0fu) |
+            (q4_quant_host(bf16_to_f32_host(cv[src + 2 * w + 1]), sv[row]) << 4));
+      }
+    }
+  std::uint16_t *dq, *dk, *dv, *dwin, *dref, *dpre;
+  std::uint8_t *dc4k, *dc4v;
+  float *dsk, *dsv;
+  int* dpt;
+  void* scratch;
+  if (cudaMalloc(&dq, qn * 2) || cudaMalloc(&dk, cn * 2) || cudaMalloc(&dv, cn * 2) ||
+      cudaMalloc(&dwin, qn * 2) || cudaMalloc(&dref, qn * 2) || cudaMalloc(&dpre, qn * 2) ||
+      cudaMalloc(&dc4k, c4k.size()) || cudaMalloc(&dc4v, c4v.size()) ||
+      cudaMalloc(&dsk, sk.size() * 4) || cudaMalloc(&dsv, sv.size() * 4) ||
+      cudaMalloc(&dpt, sizeof(int) * stride) ||
+      cudaMalloc(&scratch, granite4::attn_split_scratch_bytes(Hq, rows, stride))) {
+    ++g_failures;
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(dq, q.data(), qn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dk, ck.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dv, cv.data(), cn * 2, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dc4k, c4k.data(), c4k.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dc4v, c4v.data(), c4v.size(), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsk, sk.data(), sk.size() * 4, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsv, sv.data(), sv.size() * 4, cudaMemcpyHostToDevice));
+  const float scale = 0.0078125f * 8.0f;
+  auto diff = [&](const std::uint16_t* a, const std::uint16_t* b) {
+    std::vector<std::uint16_t> x(qn), y(qn);
+    CUDA_CHECK(cudaMemcpy(x.data(), a, qn * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(y.data(), b, qn * 2, cudaMemcpyDeviceToHost));
+    double m = 0.0;
+    bool finite = true;
+    for (std::size_t i = 0; i < qn; ++i) {
+      const float u = bf16_to_f32_host(x[i]), v = bf16_to_f32_host(y[i]);
+      finite = finite && std::isfinite(u) && std::isfinite(v);
+      m = std::max(m, static_cast<double>(std::fabs(u - v)));
+    }
+    return finite ? m : 1e9;
+  };
+  for (int fmt = 0; fmt < 2; ++fmt) {
+    const bool i4 = fmt == 1;
+    const char* name = i4 ? "KV4" : "bf16";
+    const std::uint16_t* K = i4 ? nullptr : dk;
+    const std::uint16_t* V = i4 ? nullptr : dv;
+    // Windowed: rows at positions base .. base + rows - 1.
+    expect(granite4::attn_split(dq, K, V, scale, Hq, Hk, d, base, nullptr, rows, stride, scratch,
+                                dwin, nullptr, nullptr, i4 ? dsk : nullptr, i4 ? dsv : nullptr,
+                                false, i4 ? dc4k : nullptr, i4 ? dc4v : nullptr, i4, nullptr, 0,
+                                nullptr, nullptr, nullptr, 0, nullptr, nullptr, 0, false, W) == 0,
+           "attn window: windowed split launch");
+    // Reference, row by row: logical positions 0..W-1 = physical p - W + 1 .. p.
+    for (int r = 0; r < rows; ++r) {
+      const int p = base + r;
+      std::vector<int> pt(stride, 0);
+      for (int j = 0; j < W; ++j) pt[j] = p - W + 1 + j;
+      CUDA_CHECK(cudaMemcpy(dpt, pt.data(), sizeof(int) * stride, cudaMemcpyHostToDevice));
+      const std::size_t off = static_cast<std::size_t>(r) * Hq * d;
+      expect(granite4::attn_split(dq + off, K, V, scale, Hq, Hk, d, W - 1, nullptr, 1, stride,
+                                  scratch, dref + off, nullptr, nullptr, i4 ? dsk : nullptr,
+                                  i4 ? dsv : nullptr, false, i4 ? dc4k : nullptr,
+                                  i4 ? dc4v : nullptr, i4, dpt) == 0,
+             "attn window: reference launch");
+      CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    // Prefill attention, windowed, over the same rows.
+    expect(granite4::prefill_attention(dq, K, V, scale, Hq, Hk, d, base, rows, stride, dpre,
+                                       nullptr, nullptr, i4 ? dsk : nullptr, i4 ? dsv : nullptr,
+                                       false, i4 ? dc4k : nullptr, i4 ? dc4v : nullptr, i4,
+                                       nullptr, false, W) == 0,
+           "attn window: windowed prefill launch");
+    const double e1 = diff(dwin, dref), e2 = diff(dpre, dref);
+    std::printf("  attn window [%s W=%d]: split vs reference %.5f, prefill vs reference %.5f\n",
+                name, W, e1, e2);
+    expect(e1 < 0.03, "attn window: windowed split == attention over the window's keys");
+    expect(e2 < 0.03, "attn window: windowed prefill == attention over the window's keys");
+  }
+  cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dwin); cudaFree(dref); cudaFree(dpre);
+  cudaFree(dc4k); cudaFree(dc4v); cudaFree(dsk); cudaFree(dsv); cudaFree(dpt); cudaFree(scratch);
+}
+
+
 // Phase 4: paged decode attention. The KV arena need not be contiguous per
 // sequence - shared-prefix pages can sit anywhere in the arena, so the row
 // holding a logical position is gathered from a device position->row table
@@ -3684,6 +3800,12 @@ int main() {
   }
   // G4_TEST_ONLY=k5v4 runs just the K5:V4 tests. They need a few MB, so they can run next to a
   // live service without taking its GPU memory (the full suite allocates much more).
+  if (const char* only = std::getenv("G4_TEST_ONLY"); only != nullptr && std::strcmp(only, "window") == 0) {
+    test_attn_window_device();
+    cudaDeviceSynchronize();
+    if (g_failures == 0) std::printf("window device kernel tests passed\n");
+    return g_failures == 0 ? 0 : 1;
+  }
   if (const char* only = std::getenv("G4_TEST_ONLY"); only != nullptr && std::strcmp(only, "k5v4") == 0) {
     test_k5v4_append_device();
     test_k5v4_attn_split_device();
@@ -3721,6 +3843,7 @@ int main() {
   test_prefill_attention_device();
   test_paged_prefill_device();
   test_attn_split_device();
+  test_attn_window_device();
   test_paged_attn_split_device();
   test_paged_gqa_fused_device();
   test_paged_kv_append_batched_device();

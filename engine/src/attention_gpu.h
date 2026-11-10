@@ -65,7 +65,9 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const int* row_pos = nullptr, const int* const* row_pt = nullptr,
                const int* row_grp = nullptr, int ngroups = 0,
                const int* row_tbase = nullptr, const int* row_tail = nullptr,
-               int kv_hint = 0, bool k5 = false);
+               int kv_hint = 0, bool k5 = false, int window = 0);
+// window > 0: each row attends only to its last `window` keys, positions (pos - window, pos]
+// (the draft head's G4_EAGLE_WINDOW; tensor-core kernel only).
 
 }  // namespace granite4
 

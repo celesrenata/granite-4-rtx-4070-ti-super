@@ -30,24 +30,23 @@ PYTHONPATH=$S $PY prep_chat.py --data ds/long_r15/gen.jsonl --tokenizer $CK/toke
   --train-out ds/long_r15_train --eval-out ds/long_r15_eval --eval-from "$EVAL_FROM" --max-len 65536 \
   >> $LOG 2>&1 || { log "prep failed"; exit 1; }
 $PY - "$SHARDS" >> $LOG 2>&1 <<'EOF' || { log "shard failed"; exit 1; }
-import json, struct, sys
+import array, json, struct, sys
 from pathlib import Path
-import numpy as np
 shards = int(sys.argv[1])
 def records(d):
-    raw = np.fromfile(Path(d) / "tokens.bin", dtype=np.int32)
-    mask = np.fromfile(Path(d) / "mask.bin", dtype=np.uint8)
+    raw = array.array("i"); raw.frombytes((Path(d) / "tokens.bin").read_bytes())
+    mask = (Path(d) / "mask.bin").read_bytes()
     out, i, o = [], 0, 0
     while i < len(raw):
-        n = int(raw[i]); out.append((raw[i + 1:i + 1 + n], mask[o:o + n])); i += 1 + n; o += n
+        n = raw[i]; out.append((raw[i + 1:i + 1 + n], mask[o:o + n])); i += 1 + n; o += n
     return out
 def write(d, recs):
     d = Path(d); d.mkdir(parents=True, exist_ok=True)
     with open(d / "tokens.bin", "wb") as ft, open(d / "mask.bin", "wb") as fm:
         for t, m in recs:
-            ft.write(struct.pack("<i", len(t))); ft.write(t.astype("<i4").tobytes()); fm.write(m.tobytes())
-    meta = {"records": len(recs), "tokens": int(sum(len(t) for t, _ in recs)),
-            "loss_tokens": int(sum(int(m.sum()) for _, m in recs))}
+            ft.write(struct.pack("<i", len(t))); ft.write(t.tobytes()); fm.write(m)
+    meta = {"records": len(recs), "tokens": sum(len(t) for t, _ in recs),
+            "loss_tokens": sum(sum(m) for _, m in recs)}
     (d / "meta.json").write_text(json.dumps(meta)); print(d, meta)
     # styles: one per record (per_style_eval.py), by length bucket
     (d / "styles.json").write_text(json.dumps([f"len{min(len(t) // 8192, 6) * 8}k" for t, _ in recs]))

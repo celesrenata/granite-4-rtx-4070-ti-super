@@ -19,13 +19,15 @@ GE=/opt/granite4-rtx-4070-ti-super/eagle
 LOG=$W/train_r15long.log
 cd $W
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a $LOG; }
-log "== P pulling the long-context K5 dumps"
-until ssh $G "test -f $GE/ds/k5/R15_DONE"; do
-  if ssh $G "grep -q failed $GE/stage_r15_long.log 2>/dev/null"; then log "gremlin dump failed"; exit 1; fi
-  sleep 60
-done
-for s in $(ssh $G "cd $GE/ds/k5 && ls -d long_r15_*"); do
-  rsync -a "$G:$GE/ds/k5/$s" ds/k5/ || { log "pull $s failed"; exit 1; }
+log "== P pulling the long-context K5 dumps (each set as soon as gremlin marks it DONE)"
+until ssh $G "test -d $GE/ds/k5/long_r15_eval"; do sleep 60; done
+SETS=$(ssh $G "cd $GE/ds/k5 && ls -d long_r15_*")
+for s in $SETS; do
+  until ssh $G "test -f $GE/ds/k5/$s/DONE"; do
+    if ssh $G "grep -q -E 'dump .* failed|size mismatch' $GE/stage_r15_long.log 2>/dev/null"; then log "gremlin dump failed"; exit 1; fi
+    sleep 60
+  done
+  [ -f ds/k5/$s/DONE ] || rsync -a "$G:$GE/ds/k5/$s" ds/k5/ || { log "pull $s failed"; exit 1; }
   log "pulled $s ($(du -sh ds/k5/$s | cut -f1))"
 done
 log "== G taking the 5090 (stop qwen27b, hold GPU lock)"

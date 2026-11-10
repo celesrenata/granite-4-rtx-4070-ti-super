@@ -665,7 +665,7 @@ __global__ void __launch_bounds__(W * 32)
                              const float* __restrict__ v_scale,
                              const std::uint8_t* __restrict__ cache_k4,
                              const std::uint8_t* __restrict__ cache_v4,
-                             const int* __restrict__ d_pt) {
+                             const int* __restrict__ d_pt, int window) {
   constexpr int kPosPerWarp = 16 / G;
   // W warps share each K/V tile: the tile fill (load + dequant) is paid once
   // per W * kPosPerWarp query positions, so wider blocks amortize it.
@@ -734,7 +734,10 @@ __global__ void __launch_bounds__(W * 32)
   const float* const vsc = quantized ? v_scale + static_cast<std::size_t>(hkv) * stride : nullptr;
   const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
 
-  for (int j0 = 0; j0 < kv_end; j0 += KT) {
+  // Windowed (the draft head, G4_EAGLE_WINDOW): row p sees keys (p - window, p]; the block's
+  // first row has the lowest window start.
+  const int j_first = window > 0 ? (max(0, base_pos + p0 + 1 - window) / KT) * KT : 0;
+  for (int j0 = j_first; j0 < kv_end; j0 += KT) {
     __syncthreads();  // the previous tile's readers are done
     // K tile row-major (coalesced); V tile transposed, consecutive threads on
     // consecutive positions so the scalar transposed stores do not conflict.
@@ -877,7 +880,8 @@ __global__ void __launch_bounds__(W * 32)
       for (int e = 0; e < 4; ++e) {
         const int h = e >> 1;
         const int j = j0 + ni * 8 + 2 * t4 + (e & 1);
-        const float v = j <= pabs[h] ? bf16_round(scale * s[ni][e]) : -INFINITY;
+        const float v = j <= pabs[h] && (window <= 0 || j > pabs[h] - window)
+                            ? bf16_round(scale * s[ni][e]) : -INFINITY;
         s[ni][e] = v;
         mx[h] = fmaxf(mx[h], v);
       }
@@ -886,7 +890,8 @@ __global__ void __launch_bounds__(W * 32)
     for (int h = 0; h < 2; ++h) {
       mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffffu, mx[h], 1));
       mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffffu, mx[h], 2));
-      alpha[h] = expf(m[h] - mx[h]);  // 0 on the first tile (m = -inf)
+      // 0 on a row's first tile with a key (m = -inf); 1 while a windowed row has none yet.
+      alpha[h] = mx[h] == -INFINITY ? 1.0f : expf(m[h] - mx[h]);
       l[h] *= alpha[h];
       m[h] = mx[h];
     }
@@ -902,8 +907,10 @@ __global__ void __launch_bounds__(W * 32)
     std::uint32_t pf[KT / 16][4];
 #pragma unroll
     for (int ni = 0; ni < KT / 8; ++ni) {
-      const float e0 = expf(s[ni][0] - m[0]), e1 = expf(s[ni][1] - m[0]);
-      const float e2 = expf(s[ni][2] - m[1]), e3 = expf(s[ni][3] - m[1]);
+      const float e0 = m[0] == -INFINITY ? 0.0f : expf(s[ni][0] - m[0]);
+      const float e1 = m[0] == -INFINITY ? 0.0f : expf(s[ni][1] - m[0]);
+      const float e2 = m[1] == -INFINITY ? 0.0f : expf(s[ni][2] - m[1]);
+      const float e3 = m[1] == -INFINITY ? 0.0f : expf(s[ni][3] - m[1]);
       l[0] += e0 + e1;
       l[1] += e2 + e3;
       pf[ni / 2][(ni & 1) * 2] = pack_bf16x2(e0, e1);
@@ -1017,7 +1024,7 @@ __global__ void __launch_bounds__(W * 32)
                                const float* __restrict__ k_scale, const float* __restrict__ v_scale,
                                const std::uint8_t* __restrict__ cache_k4,
                                const std::uint8_t* __restrict__ cache_v4,
-                               const int* __restrict__ d_pt) {
+                               const int* __restrict__ d_pt, int window) {
   constexpr int D = 128, G = 4;
   constexpr int kPosPerWarp = 16 / G;
   constexpr int kPosPerBlock = W * kPosPerWarp;
@@ -1085,9 +1092,10 @@ __global__ void __launch_bounds__(W * 32)
       pq_load<Int8, K5>(raw[i], row, rv[i], it & 7, k8, v8, k4, v4, ksc, vsc);
     }
   };
-  load_tile(0);
+  const int j_first = window > 0 ? (max(0, base_pos + p0 + 1 - window) / KT) * KT : 0;
+  load_tile(j_first);
   const int mj = lane >> 3, mr = lane & 7;
-  for (int j0 = 0; j0 < kv_end; j0 += KT) {
+  for (int j0 = j_first; j0 < kv_end; j0 += KT) {
     __syncthreads();  // the previous tile's readers are done
 #pragma unroll
     for (int i = 0; i < kItems; ++i) {
@@ -1117,7 +1125,8 @@ __global__ void __launch_bounds__(W * 32)
         const int h = e >> 1;
         const int j = j0 + ni * 8 + 2 * t4 + (e & 1);
         const float dot = s[ni][e] * ((e & 1) ? skp.y : skp.x);
-        const float v = j <= pabs[h] ? bf16_round(scale * dot) : -INFINITY;
+        const float v = j <= pabs[h] && (window <= 0 || j > pabs[h] - window)
+                            ? bf16_round(scale * dot) : -INFINITY;
         s[ni][e] = v;
         mx[h] = fmaxf(mx[h], v);
       }
@@ -1127,7 +1136,8 @@ __global__ void __launch_bounds__(W * 32)
     for (int h = 0; h < 2; ++h) {
       mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffffu, mx[h], 1));
       mx[h] = fmaxf(mx[h], __shfl_xor_sync(0xffffffffu, mx[h], 2));
-      alpha[h] = expf(m[h] - mx[h]);  // 0 on the first tile (m = -inf)
+      // 0 on a row's first tile with a key (m = -inf); 1 while a windowed row has none yet.
+      alpha[h] = mx[h] == -INFINITY ? 1.0f : expf(m[h] - mx[h]);
       l[h] *= alpha[h];
       m[h] = mx[h];
     }
@@ -1141,8 +1151,10 @@ __global__ void __launch_bounds__(W * 32)
     std::uint32_t pf[KT / 16][4];
 #pragma unroll
     for (int ni = 0; ni < KT / 8; ++ni) {
-      const float e0 = expf(s[ni][0] - m[0]), e1 = expf(s[ni][1] - m[0]);
-      const float e2 = expf(s[ni][2] - m[1]), e3 = expf(s[ni][3] - m[1]);
+      const float e0 = m[0] == -INFINITY ? 0.0f : expf(s[ni][0] - m[0]);
+      const float e1 = m[0] == -INFINITY ? 0.0f : expf(s[ni][1] - m[0]);
+      const float e2 = m[1] == -INFINITY ? 0.0f : expf(s[ni][2] - m[1]);
+      const float e3 = m[1] == -INFINITY ? 0.0f : expf(s[ni][3] - m[1]);
       l[0] += e0 + e1;
       l[1] += e2 + e3;
       const float2 svp = *reinterpret_cast<const float2*>(&vsc_s[ni * 8 + 2 * t4]);
@@ -1383,7 +1395,7 @@ int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                       const std::int8_t* cache_k8, const std::int8_t* cache_v8,
                       const float* k_scale, const float* v_scale, bool int8,
                       const std::uint8_t* cache_k4, const std::uint8_t* cache_v4,
-                      bool int4, const int* d_pt, bool k5) {
+                      bool int4, const int* d_pt, bool k5, int window) {
   if (q_rot == nullptr || out == nullptr || !std::isfinite(scale) || Hk <= 0 ||
       Hq % Hk != 0 || rows <= 0 || base_pos < 0 || stride < base_pos + rows ||
       d != 128 || Hq / Hk != 4 ||
@@ -1419,31 +1431,31 @@ int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
     if (codes && int8)
       prefill_attention_q_kernel<true, false, Wn><<<grid, Wn * 32>>>(
           q_rot, scale, Hq, base_pos, rows, stride, out, cache_k8, cache_v8, k_scale, v_scale,
-          nullptr, nullptr, d_pt);
+          nullptr, nullptr, d_pt, window);
     else if (codes && int4 && k5)
       prefill_attention_q_kernel<false, true, Wn><<<grid, Wn * 32>>>(
           q_rot, scale, Hq, base_pos, rows, stride, out, nullptr, nullptr, k_scale, v_scale,
-          cache_k4, cache_v4, d_pt);
+          cache_k4, cache_v4, d_pt, window);
     else if (codes && int4)
       prefill_attention_q_kernel<false, false, Wn><<<grid, Wn * 32>>>(
           q_rot, scale, Hq, base_pos, rows, stride, out, nullptr, nullptr, k_scale, v_scale,
-          cache_k4, cache_v4, d_pt);
+          cache_k4, cache_v4, d_pt, window);
     else if (int8)
       prefill_attention_kernel<128, 4, true, false, Wn><<<grid, Wn * 32>>>(
           q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, cache_k8,
-          cache_v8, k_scale, v_scale, nullptr, nullptr, d_pt);
+          cache_v8, k_scale, v_scale, nullptr, nullptr, d_pt, window);
     else if (int4 && k5)
       prefill_attention_kernel<128, 4, false, true, Wn, true><<<grid, Wn * 32>>>(
           q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, nullptr,
-          nullptr, k_scale, v_scale, cache_k4, cache_v4, d_pt);
+          nullptr, k_scale, v_scale, cache_k4, cache_v4, d_pt, window);
     else if (int4)
       prefill_attention_kernel<128, 4, false, true, Wn><<<grid, Wn * 32>>>(
           q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, nullptr,
-          nullptr, k_scale, v_scale, cache_k4, cache_v4, d_pt);
+          nullptr, k_scale, v_scale, cache_k4, cache_v4, d_pt, window);
     else
       prefill_attention_kernel<128, 4, false, false, Wn><<<grid, Wn * 32>>>(
           q_rot, cache_k, cache_v, scale, Hq, base_pos, rows, stride, out, nullptr,
-          nullptr, nullptr, nullptr, nullptr, nullptr, d_pt);
+          nullptr, nullptr, nullptr, nullptr, nullptr, d_pt, window);
   };
   if (warps == 4)
     launch(std::integral_constant<int, 4>{});

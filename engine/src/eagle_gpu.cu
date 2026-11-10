@@ -212,6 +212,11 @@ struct EagleHead {
   // the 16-bit pool; the *_8/_4 pools hold the quantized ones. kv_bits is the
   // selected width (16/8/4).
   int kv_bits = 16;
+  // G4_EAGLE_WINDOW: the head attends only to its last `window` entries (0 = all). The deployed
+  // heads trained on <= 4K-token records; at long context a window drafts better (r12, held-out
+  // 3K-48K records: 1.792 -> 2.034 tokens/round at depth 6 with 1024). Drafts only: the verify
+  // keeps the output exact.
+  int window = 0;
   std::int8_t *kv8_k = nullptr, *kv8_v = nullptr;
   float *kv8_k_scale = nullptr, *kv8_v_scale = nullptr;
   std::uint8_t *kv4_k = nullptr, *kv4_v = nullptr;
@@ -441,6 +446,10 @@ EagleHead* eagle_load(const std::string& path, GpuCtx* target, const ModelConfig
         h->Hq == 4 * h->Hk)
       h->kv_bits = static_cast<int>(v);
   }
+  if (const char* we = std::getenv("G4_EAGLE_WINDOW")) {
+    const long w = std::strtol(we, nullptr, 10);
+    h->window = w > 0 && w < (1 << 30) ? static_cast<int>(w) : 0;
+  }
   const std::size_t kv = static_cast<std::size_t>(h->Hk) * h->kv_stride * h->d * 2;
   const std::size_t kv_quant = static_cast<std::size_t>(h->Hk) * h->kv_stride *
                                static_cast<std::size_t>(h->d);
@@ -612,7 +621,7 @@ int eagle_rows_prefill(EagleHead* h, const std::int32_t* d_tokens, int p, int R,
                         h->kv_stride, s.attn, h->kv8_k, h->kv8_v,
                         i8 ? h->kv8_k_scale : h->kv4_k_scale,
                         i8 ? h->kv8_v_scale : h->kv4_v_scale, i8, h->kv4_k, h->kv4_v, i4,
-                        d_pt) != 0)
+                        d_pt, false, h->window) != 0)
     return -1;
   // hh = x + att Wo  (into x, in place: residual may alias the output)
   GemmEpilogue eo;
@@ -719,7 +728,7 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
             attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
                        h->kv_stride, h->attn_scratch, att, h->kv8_k, h->kv8_v, h->kv8_k_scale,
                        h->kv8_v_scale, true, nullptr, nullptr, false, d_pt, h->max_pos,
-                       nullptr, nullptr, nullptr, 0, nullptr, nullptr, p + R) != 0)
+                       nullptr, nullptr, nullptr, 0, nullptr, nullptr, p + R, false, h->window) != 0)
           return -1;
       } else {
         if (granite4_kernel_kv_append_int4_batched(kr, v, h->kv4_k, h->kv4_v, h->kv4_k_scale,
@@ -728,7 +737,7 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
             attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
                        h->kv_stride, h->attn_scratch, att, nullptr, nullptr, h->kv4_k_scale,
                        h->kv4_v_scale, false, h->kv4_k, h->kv4_v, true, d_pt,
-                       h->max_pos, nullptr, nullptr, nullptr, 0, nullptr, nullptr, p + R) != 0)
+                       h->max_pos, nullptr, nullptr, nullptr, 0, nullptr, nullptr, p + R, false, h->window) != 0)
           return -1;
       }
     } else if (granite4_kernel_verify_qkv_stage(
@@ -738,7 +747,7 @@ int eagle_forward(EagleHead* h, const std::int32_t* d_tokens, int pos0, int rows
                attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, p, nullptr, R,
                           h->kv_stride, h->attn_scratch, att, nullptr, nullptr, nullptr,
                           nullptr, false, nullptr, nullptr, false, d_pt, h->max_pos, nullptr,
-                          nullptr, nullptr, 0, nullptr, nullptr, p + R) != 0) {
+                          nullptr, nullptr, 0, nullptr, nullptr, p + R, false, h->window) != 0) {
       return -1;
     }
     if (granite4_verify_gemv_resid(att, h->wo, h->sc[4], x, 1.0f, R, H, nq, hh) != 0 ||
@@ -883,7 +892,7 @@ int head_rows(EagleHead* h, GpuMultiRows* md, int R, bool tree, int kv_hint) {
       rc = attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
                       h->kv_stride, h->attn_scratch, att, h->kv8_k, h->kv8_v, h->kv8_k_scale,
                       h->kv8_v_scale, true, nullptr, nullptr, false, nullptr, h->max_pos,
-                      row_pos, row_pt, nullptr, 0, tb, tl, kv_hint);
+                      row_pos, row_pt, nullptr, 0, tb, tl, kv_hint, false, h->window);
   } else if (h->kv_bits == 4) {
     rc = fused ? 0 : gpu_multi_kv_append(kr, v, 4, h->kv4_k, h->kv4_v, h->kv4_k_scale,
                                          h->kv4_v_scale, md, R, h->kv_stride, h->Hk, h->d);
@@ -891,7 +900,7 @@ int head_rows(EagleHead* h, GpuMultiRows* md, int R, bool tree, int kv_hint) {
       rc = attn_split(qr, nullptr, nullptr, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
                       h->kv_stride, h->attn_scratch, att, nullptr, nullptr, h->kv4_k_scale,
                       h->kv4_v_scale, false, h->kv4_k, h->kv4_v, true, nullptr, h->max_pos,
-                      row_pos, row_pt, nullptr, 0, tb, tl, kv_hint);
+                      row_pos, row_pt, nullptr, 0, tb, tl, kv_hint, false, h->window);
   } else {
     rc = fused ? 0 : gpu_multi_kv_append(kr, v, 16, h->kv_k, h->kv_v, nullptr, nullptr, md, R,
                                          h->kv_stride, h->Hk, h->d);
@@ -899,7 +908,7 @@ int head_rows(EagleHead* h, GpuMultiRows* md, int R, bool tree, int kv_hint) {
       rc = attn_split(qr, h->kv_k, h->kv_v, h->att_scale, h->Hq, h->Hk, h->d, 0, nullptr, R,
                       h->kv_stride, h->attn_scratch, att, nullptr, nullptr, nullptr, nullptr,
                       false, nullptr, nullptr, false, nullptr, h->max_pos, row_pos, row_pt,
-                      nullptr, 0, tb, tl, kv_hint);
+                      nullptr, 0, tb, tl, kv_hint, false, h->window);
   }
   if (rc != 0 ||
       granite4_verify_gemv_resid(att, h->wo, h->sc[4], x, 1.0f, R, H, nq, hh) != 0 ||

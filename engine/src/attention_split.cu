@@ -799,7 +799,7 @@ __global__ void __launch_bounds__(kMmaThreads, 2)
                     const int* __restrict__ d_pt, const int* __restrict__ row_pos,
                     const int* const* __restrict__ row_pt, const int* __restrict__ row_grp,
                     const int* __restrict__ row_tbase, const int* __restrict__ row_tail,
-                    int group_rows) {
+                    int group_rows, int window) {
   const int hkv = blockIdx.x;
   const int split = blockIdx.y;
   // Row group: row_grp entry (r0 | nr << 8), else blocks of `group_rows` consecutive rows.
@@ -812,7 +812,13 @@ __global__ void __launch_bounds__(kMmaThreads, 2)
   for (int rr = 0; rr < nr; ++rr) kv_max = max(kv_max, row_len(rr));
   const int t_begin = split * tps * kTile;
   if (t_begin >= kv_max) return;
+  // Windowed attention (the draft head, G4_EAGLE_WINDOW): row rr sees keys [row_lo(rr), len).
+  auto row_lo = [&](int rr) { return window > 0 ? max(0, row_len(rr) - window) : 0; };
+  int lo_min = INT_MAX;
+  for (int rr = 0; rr < nr; ++rr) lo_min = min(lo_min, row_lo(rr));
   const int t_end_max = min(kv_max, t_begin + tps * kTile);
+  if (t_end_max <= lo_min) return;  // the whole split is below every row's window
+  const int t_first = max(t_begin, (lo_min / kTile) * kTile);
 
   __shared__ __align__(16) std::uint16_t Ks[kTile][kMmaP];
   __shared__ __align__(16) std::uint16_t Vs[kTile][kMmaP];
@@ -824,7 +830,7 @@ __global__ void __launch_bounds__(kMmaThreads, 2)
   // This compute warp's m16 tile = query rows 16 * warp .. 16 * warp + 15 = rows 4 * warp ..
   // 4 * warp + 3 of the group, 4 query heads each. Fragment rows g and g + 8.
   const bool compute = warp < 2 && 4 * warp < nr;
-  int rrow[2], head[2], rlen[2];
+  int rrow[2], head[2], rlen[2], rlo[2];
   bool ok[2];
 #pragma unroll
   for (int h = 0; h < 2; ++h) {
@@ -833,6 +839,7 @@ __global__ void __launch_bounds__(kMmaThreads, 2)
     head[h] = hkv * kG + qr % kG;
     ok[h] = compute && rrow[h] < nr;
     rlen[h] = ok[h] ? row_len(rrow[h]) : 0;
+    rlo[h] = ok[h] ? row_lo(rrow[h]) : 0;
   }
   std::uint32_t qf[kD / 16][4];
 #pragma unroll
@@ -890,7 +897,7 @@ __global__ void __launch_bounds__(kMmaThreads, 2)
         const int j = t0 + ni * 8 + 2 * t4 + (e & 1);
         // Quantized: S holds q . codes; the K scale makes it q . k (one f32 multiply).
         const float dot = Int8 || Int4 ? s[ni][e] * ksc_s[j - t0] : s[ni][e];
-        const float val = j < lim[h] ? mma_bf16_round(scale * dot) : -INFINITY;
+        const float val = j < lim[h] && j >= rlo[h] ? mma_bf16_round(scale * dot) : -INFINITY;
         s[ni][e] = val;
         mx[h] = fmaxf(mx[h], val);
       }
@@ -949,17 +956,17 @@ __global__ void __launch_bounds__(kMmaThreads, 2)
   const int tb = Tree ? row_tbase[r0] : INT_MAX;
   int t_sh = t_end_max;
   if (Tree) {
-    t_sh = t_begin;
+    t_sh = t_first;
     while (t_sh < t_end_max && min(t_sh + kTile, t_end_max) - 1 <= tb) t_sh += kTile;
   }
-  if (t_sh > t_begin) {
+  if (t_sh > t_first) {
     // The shared tiles' physical rows, staged once (one global round trip for the whole split
     // instead of a page-table load ahead of every tile's cache loads).
     __shared__ int Ps[kMmaPtMax];
-    const bool staged = t_sh - t_begin <= kMmaPtMax;
+    const bool staged = t_sh - t_first <= kMmaPtMax;
     if (staged) {
-      for (int i = threadIdx.x; i < t_sh - t_begin; i += kMmaThreads)
-        Ps[i] = pt != nullptr ? pt[t_begin + i] : t_begin + i;
+      for (int i = threadIdx.x; i < t_sh - t_first; i += kMmaThreads)
+        Ps[i] = pt != nullptr ? pt[t_first + i] : t_first + i;
       __syncthreads();
     }
     // Software pipeline: tile t + 1's cache loads are issued before tile t is attended.
@@ -971,12 +978,12 @@ __global__ void __launch_bounds__(kMmaThreads, 2)
         const int it = threadIdx.x + i * kMmaThreads;
         const int lp = t0 + (it >> 3);
         rv[i] = lp < t_sh;
-        const int prow = !rv[i] ? 0 : staged ? Ps[lp - t_begin] : (pt != nullptr ? pt[lp] : lp);
+        const int prow = !rv[i] ? 0 : staged ? Ps[lp - t_first] : (pt != nullptr ? pt[lp] : lp);
         mma_load_pos<Int8, Int4, K5>(raw[i], prow, rv[i], it & 7, kb, vb, k8, v8, k4, v4, ksc, vsc);
       }
     };
-    load_tile(t_begin);
-    for (int t0 = t_begin; t0 < t_sh; t0 += kTile) {
+    load_tile(t_first);
+    for (int t0 = t_first; t0 < t_sh; t0 += kTile) {
       __syncthreads();  // the previous tile's readers of Ks / Vs are done
 #pragma unroll
       for (int i = 0; i < kMmaItems; ++i) {
@@ -1028,7 +1035,7 @@ __global__ void __launch_bounds__(kMmaThreads, 2)
   }
 #pragma unroll
   for (int h = 0; h < 2; ++h) {
-    if (!ok[h] || t_begin >= rlen[h]) continue;
+    if (!ok[h] || t_begin >= rlen[h] || t_end_max <= rlo[h]) continue;
     const std::size_t slot = (static_cast<std::size_t>(r0 + rrow[h]) * Hq + head[h]) * splits + split;
     if (t4 == 0) part_ml[slot] = make_float2(m[h], l[h]);
 #pragma unroll
@@ -1043,17 +1050,19 @@ __global__ void __launch_bounds__(kD)
     attn_combine_kernel(const float2* __restrict__ part_ml, const float* __restrict__ part_o,
                         int Hq, int kv_base, const int* __restrict__ d_pos, int tps,
                         int splits, std::uint16_t* __restrict__ out,
-                        const int* __restrict__ row_pos) {
+                        const int* __restrict__ row_pos, int window) {
   const int h = blockIdx.x;
   const int row = blockIdx.y;
   const int kv_len = row_pos != nullptr ? row_pos[row] + 1
                                         : (d_pos != nullptr ? *d_pos : kv_base) + row + 1;
   const int used = (kv_len + tps * kTile - 1) / (tps * kTile);
+  // Windowed rows: the splits below the window's first key hold no partial for this row.
+  const int s0 = window > 0 ? max(0, kv_len - window) / (tps * kTile) : 0;
   const std::size_t base = (static_cast<std::size_t>(row) * Hq + h) * splits;
   float M = -INFINITY;
-  for (int s = 0; s < used; ++s) M = fmaxf(M, part_ml[base + s].x);
+  for (int s = s0; s < used; ++s) M = fmaxf(M, part_ml[base + s].x);
   float L = 0.0f, acc = 0.0f;
-  for (int s = 0; s < used; ++s) {
+  for (int s = s0; s < used; ++s) {
     const float2 ml = part_ml[base + s];
     const float w = expf(ml.x - M);
     L += ml.y * w;
@@ -1079,7 +1088,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
                const float* cache_v_scale, bool int8, const std::uint8_t* cache_k4,
                const std::uint8_t* cache_v4, bool int4, const int* d_pt, int max_len,
                const int* row_pos, const int* const* row_pt, const int* row_grp,
-               int ngroups, const int* row_tbase, const int* row_tail, int kv_hint, bool k5) {
+               int ngroups, const int* row_tbase, const int* row_tail, int kv_hint, bool k5,
+               int window) {
   // `stride` addresses the cache arena; the split layout follows the longest
   // logical sequence (== stride for a private, contiguous cache).
   const int ml = max_len > 0 ? max_len : stride;
@@ -1092,7 +1102,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
       ((row_tbase != nullptr) != (row_tail != nullptr)) ||
       (row_tbase != nullptr && row_pos == nullptr) ||
       (int8 && int4) ||
-      (k5 && !int4) ||
+      (k5 && !int4) || window < 0 ||
       (int8 && (cache_k8 == nullptr || cache_v8 == nullptr ||
                 cache_k_scale == nullptr || cache_v_scale == nullptr)) ||
       (int4 && (cache_k4 == nullptr || cache_v4 == nullptr ||
@@ -1197,7 +1207,8 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
     const char* e = std::getenv("G4_ATTN_MMA");
     return e == nullptr || e[0] != '0';
   }();
-  if (mma_on) {
+  // A window is implemented by the tensor-core kernel only.
+  if (mma_on || window > 0) {
     // Per-row positions without groups, or a short context (too few blocks to fill the card
     // otherwise): one row per block; else up to kMmaRows rows share the tiles.
     const int group_rows = row_pos != nullptr || short_ctx ? 1 : kMmaRows;
@@ -1209,22 +1220,22 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
       attn_mma_kernel<true, false, false, Tree><<<grid, kMmaThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
           cache_k8, cache_v8, cache_k_scale, cache_v_scale, nullptr, nullptr, d_pt, row_pos,
-          row_pt, row_grp, row_tbase, row_tail, group_rows);
+          row_pt, row_grp, row_tbase, row_tail, group_rows, window);
     else if (int4 && k5)
       attn_mma_kernel<false, true, true, Tree><<<grid, kMmaThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
           nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt, row_pos,
-          row_pt, row_grp, row_tbase, row_tail, group_rows);
+          row_pt, row_grp, row_tbase, row_tail, group_rows, window);
     else if (int4)
       attn_mma_kernel<false, true, false, Tree><<<grid, kMmaThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
           nullptr, nullptr, cache_k_scale, cache_v_scale, cache_k4, cache_v4, d_pt, row_pos,
-          row_pt, row_grp, row_tbase, row_tail, group_rows);
+          row_pt, row_grp, row_tbase, row_tail, group_rows, window);
     else
       attn_mma_kernel<false, false, false, Tree><<<grid, kMmaThreads>>>(
           q, cache_k, cache_v, scale, Hq, kv_base, d_pos, stride, tps, splits, rows, pml, po,
           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, d_pt, row_pos, row_pt, row_grp,
-          row_tbase, row_tail, group_rows);
+          row_tbase, row_tail, group_rows, window);
     };
     if (row_tail != nullptr)
       launch_mma(std::true_type{});
@@ -1239,7 +1250,7 @@ int attn_split(const std::uint16_t* q, const std::uint16_t* cache_k,
     if (!(rows_par && launch_rows(nullptr, nz))) launch(Many{}, nullptr, nz);
   }
   attn_combine_kernel<<<dim3(Hq, rows), kD>>>(pml, po, Hq, kv_base, d_pos, tps, splits, out,
-                                              row_pos);
+                                              row_pos, window);
   const cudaError_t e = cudaGetLastError();
   if (e != cudaSuccess) {
     std::fprintf(stderr, "granite4: attn_split: %s\n", cudaGetErrorString(e));

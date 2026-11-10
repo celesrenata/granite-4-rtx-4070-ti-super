@@ -97,7 +97,9 @@ int prefill_attention(const std::uint16_t* q_rot, const std::uint16_t* cache_k,
                        const std::int8_t* cache_k8, const std::int8_t* cache_v8,
                        const float* k_scale, const float* v_scale, bool int8,
                        const std::uint8_t* cache_k4, const std::uint8_t* cache_v4,
-                       bool int4, const int* d_pt = nullptr, bool k5 = false);
+                       bool int4, const int* d_pt = nullptr, bool k5 = false,
+                       int window = 0);
+// window > 0: row p attends only to keys (p - window, p] (the draft head, G4_EAGLE_WINDOW).
 
 // act[r][i] = bf16(silu(gu[r][i]) * gu[r][I + i]).
 int prefill_silu_mul(const float* gu, int I, int rows, std::uint16_t* act);
