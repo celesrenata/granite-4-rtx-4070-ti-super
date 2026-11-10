@@ -294,3 +294,5 @@ Remaining levers, roughly in order:
 - **Measure memory per stage before cutting it.** The cheapest 1.7 GiB came from buffers sized for the worst case (a feature buffer per `maxContext`, six identical scratches), not from the model.
 - **Silent fallbacks hide ceilings.** A pool 2% too big made long prompts minutes slow with no error. Fallbacks should say so loudly.
 - **Shared GPUs need a gate.** Stopping a live service under clients was a mistake. Waiting for 30 s with no outside client, and pausing our own generators, made every later window safe.
+
+For a plain-language explanation of the concepts behind these results (tokens, prefill vs decode, KV cache, quantization, speculative decoding, prompt caching), see `how-it-works.md`.
