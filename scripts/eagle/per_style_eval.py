@@ -27,6 +27,9 @@ def main():
     ap.add_argument("--vocab", required=True, help="draft_vocab.npy")
     ap.add_argument("--depth", type=int, default=6)
     ap.add_argument("--limit", type=int, default=0, help="run only the first N records (0=all)")
+    ap.add_argument("--rope-len", type=int, default=8192, help="at least the longest record")
+    ap.add_argument("--window", type=int, default=0,
+                    help="diagnostic: the head attends only to its last N step-1 entries (0 = all)")
     a = ap.parse_args()
 
     dev = "cuda"
@@ -40,7 +43,7 @@ def main():
     vt = torch.as_tensor(vocab, device=dev)
     lm_sub = fr["lm_head.weight"][vt]
     emb = fr["model.embed_tokens.weight"]
-    cos, sin = te.rope_tables(8192, dev)
+    cos, sin = te.rope_tables(a.rope_len, dev)
 
     rec = te.Records(Path(a.records))
     styles = json.load(open(a.styles))
@@ -55,15 +58,21 @@ def main():
         s = styles[r]
         with torch.no_grad():
             ex = rec.get_extra(r) if n_extra else None
+            start = int(mask.nonzero()[0]) - 1 if (mask is not None and mask.any()) else 0
+            # Long records: chains from the reply start only (te.unroll q0; exact for this loop).
+            q0 = max(start, 0) if n > te.LONG_RECORD else 0
+            te.ATTN_WINDOW = a.window
             preds = te.unroll(head, emb, toks, hid, a.depth, cos, sin,
-                              extra=ex.to(dev) if ex is not None else None)
+                              extra=ex.to(dev) if ex is not None else None, q0=q0)
             draft = [vt[(p.to(torch.bfloat16) @ lm_sub.t()).argmax(-1)] for p in preds]
             hit = []
             for d, dr in enumerate(draft, start=1):
                 m = n - 1 - d
-                hit.append((dr[:m] == toks[d + 1: d + 1 + m]).cpu().numpy()
-                           if m > 0 else np.zeros(0, bool))
-            start = int(mask.nonzero()[0]) - 1 if (mask is not None and mask.any()) else 0
+                if m - q0 <= 0:
+                    hit.append(np.zeros(max(m, 0), bool))
+                    continue
+                h = (dr[: m - q0] == toks[q0 + d + 1: d + 1 + m]).cpu().numpy()
+                hit.append(np.concatenate([np.zeros(q0, bool), h]))
             for K in range(1, a.depth + 1):
                 p = max(start, 0)
                 while p < n - 2:

@@ -41,6 +41,12 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
 
 H, HQ, HK, D, INTER = 4096, 32, 8, 128, 12800
+# Records longer than this run unroll() from the reply region only (q0 > 0): exact for the loss
+# and the eval, and what makes 16K-48K-token records trainable.
+LONG_RECORD = 4096
+# Diagnostic (per_style_eval --window): long-record chains attend only to the last ATTN_WINDOW
+# step-1 entries (0 = all). Not used in training.
+ATTN_WINDOW = 0
 ATTN_SCALE = 0.0078125  # Granite attention_multiplier (the target's layers)
 ROPE_THETA = 1e7
 EPS = 1e-5
@@ -200,10 +206,18 @@ def masked_attention(q, k, v, mask, scale, chunk=256):
     return torch.cat(outs, 1)
 
 
-def unroll(head, emb_w, toks, feats, depth, cos, sin, noise=0.0, grad_ckpt=False, extra=None):
+def unroll(head, emb_w, toks, feats, depth, cos, sin, noise=0.0, grad_ckpt=False, extra=None, q0=0):
     """Predicted features per step: preds[d-1][i] ~ feature i + d, for the
     chain started at entry i (i < n - d). toks [n], feats [n, H] (bf16),
-    extra [n, k, H] intermediate features (multi-layer heads) or None."""
+    extra [n, k, H] intermediate features (multi-layer heads) or None.
+
+    q0 > 0 (long records): only chains started at entries i >= q0 are computed - step 1 still
+    builds keys / values for every entry (the chains attend to the whole context), but queries,
+    attention, the layer tail and steps >= 2 run for entries [q0, n - d) only, and
+    preds[d-1][j] is entry q0 + j. Exact for every chain it computes; callers pass the first
+    entry any loss / eval reads (the reply region of a long-context record)."""
+    if q0 > 0:
+        return unroll_from(head, emb_w, toks, feats, depth, cos, sin, noise, grad_ckpt, extra, q0)
     n = toks.shape[0]
     keys, vals, preds = [], [], []
     feat_in = feats[: n - 1]
@@ -242,6 +256,64 @@ def unroll(head, emb_w, toks, feats, depth, cos, sin, noise=0.0, grad_ckpt=False
                                                  scale=scale)[0]
         else:
             att = masked_attention(q, kk, vv, mask, scale)
+        pred = ckpt.checkpoint(head.tail, x, att, use_reentrant=False) if grad_ckpt else head.tail(x, att)
+        preds.append(pred)
+    return preds
+
+
+def unroll_from(head, emb_w, toks, feats, depth, cos, sin, noise, grad_ckpt, extra, q0):
+    """unroll() for chains started at entries >= q0 only (see unroll)."""
+    n = toks.shape[0]
+    dev = toks.device
+    feat_in = feats[: n - 1]
+    if noise > 0:
+        feat_in = feat_in + (torch.rand_like(feat_in, dtype=torch.float32) * 2 - 1).to(feat_in.dtype) * noise
+    m1 = n - 1
+    scale = float(head.attn_scale)
+    # Step 1 entries: keys / values for all m1 entries, x for the queries [q0, m1).
+    pos1 = torch.arange(0, m1, device=dev)
+    g1 = head.feat1(feat_in, extra[:m1] if extra is not None else None)
+    x1 = head.fc(torch.cat([head.ln_e(F.embedding(toks[1: 1 + m1], emb_w)), g1], -1))
+    xn1 = head.ln1(x1)
+    k1 = apply_rope(head.k(xn1).view(m1, HK, D).transpose(0, 1), cos[pos1], sin[pos1])
+    v1 = head.v(xn1).view(m1, HK, D).transpose(0, 1)
+    keys, vals = [k1], [v1]
+    k1r = k1.repeat_interleave(HQ // HK, 0)
+    v1r = v1.repeat_interleave(HQ // HK, 0)
+    preds = []
+    for d in range(1, depth + 1):
+        m = n - d
+        nq = m - q0
+        if nq <= 0 or m <= 1:
+            break
+        i = torch.arange(q0, m, device=dev)
+        pos = i + (d - 1)
+        if d == 1:
+            x = x1[q0:m]
+            xn = xn1[q0:m]
+        else:
+            fin = preds[-1][:nq]
+            x = head.fc(torch.cat([head.ln_e(F.embedding(toks[q0 + d: m + d], emb_w)), head.ln_h(fin)], -1))
+            xn = head.ln1(x)
+            kd = apply_rope(head.k(xn).view(nq, HK, D).transpose(0, 1), cos[pos], sin[pos])
+            vd = head.v(xn).view(nq, HK, D).transpose(0, 1)
+            keys.append(kd)
+            vals.append(vd)
+        q = apply_rope(head.q(xn).view(nq, HQ, D).transpose(0, 1), cos[pos], sin[pos])
+        # Query i sees step-1 entries 0..i and its own chain's entries of steps 2..d.
+        c1 = torch.arange(m1, device=dev)[None, :]
+        vis = c1 <= i[:, None]
+        if ATTN_WINDOW > 0:
+            vis = vis & (c1 > i[:, None] - ATTN_WINDOW)
+        cols = [vis]
+        kk, vv = [k1r], [v1r]
+        for e in range(2, d + 1):
+            ne = n - e - q0
+            cols.append(torch.arange(ne, device=dev)[None, :] == torch.arange(nq, device=dev)[:, None])
+            kk.append(keys[e - 1].repeat_interleave(HQ // HK, 0))
+            vv.append(vals[e - 1].repeat_interleave(HQ // HK, 0))
+        mask = torch.cat(cols, 1)
+        att = masked_attention(q, torch.cat(kk, 1), torch.cat(vv, 1), mask, scale)
         pred = ckpt.checkpoint(head.tail, x, att, use_reentrant=False) if grad_ckpt else head.tail(x, att)
         preds.append(pred)
     return preds
@@ -334,15 +406,22 @@ def eval_acceptance(head, frozen, vocab, rec: Records, depth, cos, sin, device, 
         ex = rec.get_extra(r) if head.n_extra else None
         ex = ex.to(device) if ex is not None else None
         n = toks.shape[0]
+        start = int(mask.nonzero()[0]) - 1 if (reply_only and mask is not None and mask.any()) else 0
+        # Long records: only chains from the reply start are evaluated (see unroll's q0).
+        q0 = max(start, 0) if n > LONG_RECORD else 0
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            preds = unroll(head, emb_w, toks, hid, depth, cos, sin, extra=ex)
+            preds = unroll(head, emb_w, toks, hid, depth, cos, sin, extra=ex, q0=q0)
         draft = [vocab_t[(p.to(torch.bfloat16) @ lm_sub.t()).argmax(-1)] for p in preds]
         # hit[d-1][i]: step d of the chain at entry i predicts toks[i + d + 1]
+        # (padded with misses below q0, which the round loop never reads).
         hit = []
         for d, dr in enumerate(draft, start=1):
             m = n - 1 - d
-            hit.append((dr[:m] == toks[d + 1: d + 1 + m]).cpu().numpy() if m > 0 else np.zeros(0, bool))
-        start = int(mask.nonzero()[0]) - 1 if (reply_only and mask is not None and mask.any()) else 0
+            if m - q0 <= 0:
+                hit.append(np.zeros(max(m, 0), bool))
+                continue
+            h = (dr[: m - q0] == toks[q0 + d + 1: d + 1 + m]).cpu().numpy()
+            hit.append(np.concatenate([np.zeros(q0, bool), h]))
         for K in range(1, depth + 1):
             p = max(start, 0)  # entry p: tok_{p+1} known, drafts tok_{p+2}..
             while p < n - 2:
@@ -385,6 +464,8 @@ def main():
                     help="reuse an existing draft_vocab.npy instead of recomputing from --train")
     ap.add_argument("--extra-layers", type=int, default=0,
                     help="multi-layer head: number of intermediate features in feat.bin (0: final only)")
+    ap.add_argument("--rope-len", type=int, default=8192,
+                    help="RoPE table length: at least the longest training / eval record")
     ap.add_argument("--init-layer", type=int, default=-1,
                     help="initialize the head layer from this target layer (-1: random)")
     args = ap.parse_args()
@@ -404,7 +485,7 @@ def main():
     vocab_t = torch.as_tensor(vocab, device=device)
     lm_sub = frozen["lm_head.weight"][vocab_t]
     emb_w = frozen["model.embed_tokens.weight"]
-    cos, sin = rope_tables(8192, device)
+    cos, sin = rope_tables(args.rope_len, device)
 
     head = EagleHead(frozen["model.norm.weight"], n_extra=args.extra_layers)
     if args.init_layer >= 0:
@@ -455,20 +536,26 @@ def main():
             n = toks.shape[0]
             if n < 8:
                 continue
+            # Long records: chains from q0 on cover every position the loss weights (the step-d
+            # loss at entry i reads mask[i + d + 1], so i >= first_reply - 1 - depth).
+            q0 = 0
+            if n > LONG_RECORD and mask.any():
+                q0 = max(0, int(mask.nonzero()[0]) - 1 - args.depth)
             with torch.no_grad():
-                tgt_logits = (hid @ lm_sub.t()).float()  # [n, V'] target dist. over the draft vocab
+                # [n - q0, V'] target dist. over the draft vocab, rows q0.. (row r = position q0 + r)
+                tgt_logits = (hid[q0:] @ lm_sub.t()).float()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 preds = unroll(head, emb_w, toks, hid, args.depth, cos, sin, noise=noise,
-                               grad_ckpt=True, extra=ex)
+                               grad_ckpt=True, extra=ex, q0=q0)
                 loss = 0.0
                 for d, pred in enumerate(preds, start=1):
                     m = n - 1 - d  # entries with a next token to predict
-                    w = mask[d + 1: d + 1 + m].float()
-                    if w.sum() == 0:
+                    w = mask[q0 + d + 1: d + 1 + m].float()
+                    if m - q0 <= 0 or w.sum() == 0:
                         continue
-                    ce, cor = chunked_ce(pred[:m], tgt_logits[d: d + m], lm_sub, w,
+                    ce, cor = chunked_ce(pred[: m - q0], tgt_logits[d: d + m - q0], lm_sub, w,
                                          distill=args.distill)
-                    reg = (F.smooth_l1_loss(pred[:m].float(), hid[d: d + m].float(), reduction="none").mean(-1) * w).sum()
+                    reg = (F.smooth_l1_loss(pred[: m - q0].float(), hid[q0 + d: d + m].float(), reduction="none").mean(-1) * w).sum()
                     loss = loss + (args.step_decay ** (d - 1)) * (ce + args.reg_weight * reg) / w.sum()
                     acc_stats[d - 1] += (cor.item(), w.sum().item())
             (loss / args.accum).backward()
